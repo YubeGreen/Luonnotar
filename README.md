@@ -163,4 +163,4 @@ on two ADB-connected devices. Long-running conclusions should still combine a
 controlled send time, target-app notification-arrival time, VPN-routing
 evidence, and a real screen-off observation window.
 
-For the detailed Chinese technical manual, visual notes, tablet guidance, test coverage, and manual validation checklist, see [README_zh.md]().
+For the detailed Chinese technical manual, visual notes, tablet guidance, test coverage, and manual validation checklist, see [README_zh.md](README_zh.md).
