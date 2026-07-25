@@ -1,0 +1,7 @@
+<resources>
+    <string name="app_name">努昂诺塔</string>
+    <string name="developer_name">YubeGreen</string>
+    <string name="notification_listener_label">通知到达验证（隐私模式）</string>
+    <string name="channel_keeper">努昂诺塔守护服务</string>
+    <string name="channel_alerts">保活异常提醒</string>
+</resources>

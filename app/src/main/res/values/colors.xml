@@ -1,0 +1,9 @@
+<resources>
+    <color name="ink">#F4F2FF</color>
+    <color name="surface">#151221</color>
+    <color name="surface_2">#221C33</color>
+    <color name="violet">#8B74FF</color>
+    <color name="green">#4CD7A5</color>
+    <color name="amber">#FFCA6A</color>
+    <color name="red">#FF7B8B</color>
+</resources>
