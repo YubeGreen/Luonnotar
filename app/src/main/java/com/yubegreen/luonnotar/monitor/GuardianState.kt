@@ -20,7 +20,6 @@ enum class GuardianState {
 }
 
 object GuardianStateReducer {
-    @Suppress("UNUSED_PARAMETER")
     fun reduce(
         enabled: Boolean,
         paused: Boolean,
@@ -44,6 +43,7 @@ object GuardianStateReducer {
         lastHttpCode != 204 || failures != 0 || !hasRecentSuccess ->
             GuardianState.KEEPALIVE_DEGRADED
         bypassable == null -> GuardianState.LOCKDOWN_UNVERIFIED
+        !targetRoutingVerified -> GuardianState.TARGET_ROUTING_UNVERIFIED
         else -> GuardianState.VPN_PATH_HEALTHY
     }
 }

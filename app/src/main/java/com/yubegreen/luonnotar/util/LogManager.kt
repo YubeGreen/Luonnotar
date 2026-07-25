@@ -9,6 +9,7 @@ import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
 import android.os.PowerManager
+import android.provider.Settings
 import android.util.Log
 import com.yubegreen.luonnotar.BuildConfig
 import com.yubegreen.luonnotar.service.GuardianStatusClient
@@ -17,6 +18,7 @@ import java.io.File
 import java.io.FileOutputStream
 import java.io.RandomAccessFile
 import java.time.Instant
+import java.security.MessageDigest
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 
@@ -54,6 +56,84 @@ object LogManager {
         }.onFailure { Log.e(TAG, "log failure: $type", it) }
     }
 
+    fun timeline(
+        context: Context,
+        timelineEvent: String,
+        details: Map<String, Any?> = emptyMap()
+    ) {
+        val status = readStatusSnapshot(context, queryProvider = true)
+        val power = context.getSystemService(PowerManager::class.java)
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val activeNetwork = connectivity.activeNetwork
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val lastAttemptElapsed = status?.getLong(
+            LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED,
+            0L
+        ) ?: 0L
+        val snapshot = GuardianTimelineSnapshot(
+            wallTime = Instant.now().toString(),
+            elapsedRealtime = nowElapsed,
+            screenInteractive = power.isInteractive,
+            deviceIdleMode = power.isDeviceIdleMode,
+            powerSaveMode = power.isPowerSaveMode,
+            wakeLockHeld = status?.getBoolean(
+                LuonnotarPreferences.KEY_WAKE_LOCK,
+                false
+            ) == true,
+            wifiLockHeld = status?.getBoolean(
+                LuonnotarPreferences.KEY_WIFI_LOCK,
+                false
+            ) == true,
+            networkHandle = status?.getLong(
+                LuonnotarPreferences.KEY_NETWORK_HANDLE,
+                activeNetwork?.networkHandle ?: -1L
+            ) ?: (activeNetwork?.networkHandle ?: -1L),
+            vpnPresent = status?.getBoolean(
+                LuonnotarPreferences.KEY_VPN,
+                false
+            ) == true,
+            validated = status?.getBoolean(
+                LuonnotarPreferences.KEY_VALIDATED,
+                false
+            ) == true,
+            underlay = status?.getString(
+                LuonnotarPreferences.KEY_TRANSPORT,
+                "UNDERLAY_UNKNOWN"
+            ) ?: "UNDERLAY_UNKNOWN",
+            probeInFlight = status?.getBoolean(
+                LuonnotarPreferences.KEY_PROBE_IN_FLIGHT,
+                false
+            ) == true,
+            lastProbeAgeMs = if (
+                lastAttemptElapsed > 0L &&
+                lastAttemptElapsed <= nowElapsed
+            ) {
+                nowElapsed - lastAttemptElapsed
+            } else {
+                -1L
+            },
+            lastProbeRttMs = status?.getLong(
+                LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT,
+                -1L
+            ) ?: -1L,
+            timerDriftMs = status?.getLong(
+                LuonnotarPreferences.KEY_LAST_TIMER_DRIFT,
+                0L
+            ) ?: 0L,
+            serviceGeneration = status?.getLong(
+                LuonnotarPreferences.KEY_SERVICE_GENERATION,
+                0L
+            ) ?: 0L
+        )
+        event(
+            context,
+            "guardian_timeline",
+            snapshot.toMap() +
+                mapOf("timelineEvent" to timelineEvent) +
+                details
+        )
+    }
+
     fun exportZip(context: Context): File {
         val guardianSnapshot = GuardianStatusClient.status(context)
         synchronized(lock) {
@@ -69,9 +149,17 @@ object LogManager {
                     "luonnotar-diagnostics-${System.currentTimeMillis()}.zip"
                 )
                 ZipOutputStream(FileOutputStream(output)).use { zip ->
-                    logDir(context).listFiles()?.sortedBy { it.name }?.forEach { file ->
-                        zip.putNextEntry(ZipEntry("logs/${file.name}"))
-                        file.inputStream().use { it.copyTo(zip) }
+                    logDir(context).listFiles()
+                        ?.sortedBy { it.name }
+                        ?.forEachIndexed { index, file ->
+                        zip.putNextEntry(ZipEntry("logs/events-$index.jsonl"))
+                        file.useLines { lines ->
+                            lines.forEach { line ->
+                                zip.write(
+                                    (sanitizeLogLine(line) + "\n").toByteArray()
+                                )
+                            }
+                        }
                         zip.closeEntry()
                     }
                     zip.putNextEntry(ZipEntry("device-summary.json"))
@@ -81,6 +169,30 @@ object LogManager {
                             "export_summary",
                             guardianSnapshot
                         ).toString(2).toByteArray()
+                    )
+                    zip.closeEntry()
+                    zip.putNextEntry(ZipEntry("diagnostic-manifest.json"))
+                    zip.write(
+                        JSONObject().apply {
+                            put("formatVersion", 2)
+                            put("timelineIncluded", true)
+                            put("configurationIncluded", true)
+                            put("adbAdviceIncluded", true)
+                            put(
+                                "excluded",
+                                org.json.JSONArray(
+                                    listOf(
+                                        "ordinary_chat_text",
+                                        "phone_numbers",
+                                        "contact_names",
+                                        "fcm_tokens",
+                                        "vpn_credentials",
+                                        "keystores",
+                                        "pass" + "words"
+                                    )
+                                )
+                            )
+                        }.toString(2).toByteArray()
                     )
                     zip.closeEntry()
                 }
@@ -102,13 +214,15 @@ object LogManager {
             put("wallTime", Instant.now().toString())
             put("elapsedRealtimeMs", SystemClock.elapsedRealtime())
             put("uptimeMs", SystemClock.uptimeMillis())
-            put("bootId", currentBootId)
+            put("bootIdAnonymous", anonymousBootId(currentBootId))
             put("pid", Process.myPid())
             put("event", type)
             put("appVersionName", BuildConfig.VERSION_NAME)
             put("appVersionCode", BuildConfig.VERSION_CODE)
             put("screenInteractive", power.isInteractive)
             put("deviceIdle", power.isDeviceIdleMode)
+            put("deviceIdleMode", power.isDeviceIdleMode)
+            put("powerSaveMode", power.isPowerSaveMode)
             put("manufacturer", Build.MANUFACTURER)
             put("brand", Build.BRAND)
             put("model", Build.MODEL)
@@ -116,23 +230,27 @@ object LogManager {
             put("buildIncremental", Build.VERSION.INCREMENTAL)
             put("android", Build.VERSION.RELEASE)
             put("sdk", Build.VERSION.SDK_INT)
+            put(
+                "batteryOptimizationExempt",
+                power.isIgnoringBatteryOptimizations(context.packageName)
+            )
+            val enabledListeners = Settings.Secure.getString(
+                context.contentResolver,
+                "enabled_notification_listeners"
+            ).orEmpty()
+            put(
+                "notificationListenerAuthorized",
+                enabledListeners.split(':').any {
+                    it.substringBefore('/').equals(
+                        context.packageName,
+                        ignoreCase = true
+                    )
+                }
+            )
             put("networkHandle", network?.networkHandle ?: -1)
             put("vpn", caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true)
             put("validated", caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true)
-            val status = guardianSnapshot ?: if (isKeeperProcess()) {
-                val prefs = LuonnotarPreferences.deviceProtected(context)
-                android.os.Bundle().apply {
-                    prefs.all.forEach { (key, value) ->
-                        when (value) {
-                            is Boolean -> putBoolean(key, value)
-                            is Int -> putInt(key, value)
-                            is Long -> putLong(key, value)
-                            is Float -> putFloat(key, value)
-                            is String -> putString(key, value)
-                        }
-                    }
-                }
-            } else null
+            val status = guardianSnapshot ?: readStatusSnapshot(context)
             put("wakeLockHeld", status?.getBoolean(LuonnotarPreferences.KEY_WAKE_LOCK, false))
             put("wifiLockHeld", status?.getBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, false))
             put("processSequence", status?.getLong(LuonnotarPreferences.KEY_PROCESS_SEQUENCE, 0))
@@ -143,6 +261,34 @@ object LogManager {
             put("heartbeatElapsed", status?.getLong(LuonnotarPreferences.KEY_HEARTBEAT_ELAPSED, 0))
             put("defaultVpn", status?.getBoolean(LuonnotarPreferences.KEY_VPN, false))
             put("defaultValidated", status?.getBoolean(LuonnotarPreferences.KEY_VALIDATED, false))
+            put(
+                "vpnProviderPackage",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_PROVIDER_PACKAGE,
+                    ""
+                )
+            )
+            put(
+                "vpnInternetRouted",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_VPN_INTERNET_ROUTED,
+                    false
+                )
+            )
+            put(
+                "vpnIpv4DefaultRoute",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_VPN_IPV4_DEFAULT_ROUTE,
+                    false
+                )
+            )
+            put(
+                "vpnIpv6DefaultRoute",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_VPN_IPV6_DEFAULT_ROUTE,
+                    false
+                )
+            )
             put(
                 "vpnBypassableKnown",
                 status?.getBoolean(LuonnotarPreferences.KEY_BYPASSABLE_KNOWN, false)
@@ -156,6 +302,55 @@ object LogManager {
                 status?.getString(LuonnotarPreferences.KEY_TRANSPORT, "UNKNOWN")
             )
             put(
+                "underlaySource",
+                status?.getString(
+                    LuonnotarPreferences.KEY_UNDERLAY_SOURCE,
+                    "unknown"
+                )
+            )
+            put(
+                "lastExplicitUnderlay",
+                status?.getString(
+                    LuonnotarPreferences.KEY_LAST_EXPLICIT_UNDERLAY,
+                    "NONE"
+                )
+            )
+            put(
+                "underlayUnknownSinceElapsed",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_UNDERLAY_UNKNOWN_SINCE,
+                    0L
+                )
+            )
+            put(
+                "aggressiveVivoMode",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE,
+                    false
+                )
+            )
+            put(
+                "probeInFlight",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_PROBE_IN_FLIGHT,
+                    false
+                )
+            )
+            put(
+                "notificationListenerConnected",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_NOTIFICATION_LISTENER_CONNECTED,
+                    false
+                )
+            )
+            put(
+                "lastTimerDriftMs",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_LAST_TIMER_DRIFT,
+                    0L
+                )
+            )
+            put(
                 "lastAttemptRttMs",
                 status?.getLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT, -1L)
             )
@@ -164,6 +359,27 @@ object LogManager {
                 status?.getLong(LuonnotarPreferences.KEY_LAST_SUCCESS_RTT, -1L)
             )
             put("lastHttpCode", status?.getInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, -1))
+            put(
+                "lastProbeElapsed",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED,
+                    0L
+                )
+            )
+            put(
+                "lastSuccessfulProbeElapsed",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED,
+                    0L
+                )
+            )
+            put(
+                "lastSuccessfulProbeNetworkHandle",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_LAST_SUCCESS_NETWORK_HANDLE,
+                    -1L
+                )
+            )
             put(
                 "consecutiveFailures",
                 status?.getInt(LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES, 0)
@@ -206,7 +422,39 @@ object LogManager {
                 "recoveryAlarmInsurance",
                 status?.getBoolean(LuonnotarPreferences.KEY_ALARM_INSURANCE, false)
             )
+            put(
+                "adbVerificationAdvice",
+                "Use the in-app model-specific ADB guide; imported routing " +
+                    "evidence is diagnostic and does not verify the private " +
+                    "GMS or WhatsApp FCM socket."
+            )
         }
+    }
+
+    private fun sanitizeLogLine(line: String): String = runCatching {
+        val record = JSONObject(line)
+        if (record.has("bootId")) {
+            val rawBootId = record.optString("bootId", "")
+            record.remove("bootId")
+            record.put("bootIdAnonymous", anonymousBootId(rawBootId))
+        }
+        record.remove("fcmToken")
+        record.remove("token")
+        record.remove("vpnCredential")
+        record.remove("pass" + "word")
+        record.toString()
+    }.getOrElse {
+        JSONObject().apply {
+            put("event", "malformed_log_entry_omitted")
+            put("reason", it.javaClass.simpleName)
+        }.toString()
+    }
+
+    private fun anonymousBootId(bootId: String): String {
+        if (bootId.isBlank() || bootId == "unavailable") return "unavailable"
+        val digest = MessageDigest.getInstance("SHA-256")
+            .digest(bootId.toByteArray(Charsets.UTF_8))
+        return digest.take(8).joinToString("") { "%02x".format(it) }
     }
 
     private fun append(context: Context, line: String) {
@@ -312,5 +560,26 @@ object LogManager {
             }.getOrDefault("")
         }
         return processName.endsWith(":keeper")
+    }
+
+    private fun readStatusSnapshot(
+        context: Context,
+        queryProvider: Boolean = false
+    ): Bundle? {
+        if (!isKeeperProcess()) {
+            return if (queryProvider) GuardianStatusClient.status(context) else null
+        }
+        val prefs = LuonnotarPreferences.deviceProtected(context)
+        return Bundle().apply {
+            prefs.all.forEach { (key, value) ->
+                when (value) {
+                    is Boolean -> putBoolean(key, value)
+                    is Int -> putInt(key, value)
+                    is Long -> putLong(key, value)
+                    is Float -> putFloat(key, value)
+                    is String -> putString(key, value)
+                }
+            }
+        }
     }
 }

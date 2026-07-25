@@ -106,9 +106,9 @@ class GuardianStateReducerTest {
     }
 
     @Test
-    fun `target uid routing is an independent diagnostic dimension`() {
+    fun `healthy vpn path remains unverified without current target uid evidence`() {
         assertEquals(
-            GuardianState.VPN_PATH_HEALTHY,
+            GuardianState.TARGET_ROUTING_UNVERIFIED,
             GuardianStateReducer.reduce(
                 true, false, true, true, false, 204, 0, true, true, false, true
             )

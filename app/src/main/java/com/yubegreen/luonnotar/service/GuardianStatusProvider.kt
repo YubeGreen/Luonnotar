@@ -85,6 +85,15 @@ class GuardianStatusProvider : ContentProvider() {
                     LuonnotarPreferences.KEY_NOTIFICATION_PRIVACY_ACK,
                     true
                 ).commit()
+            METHOD_SET_AGGRESSIVE_MODE -> {
+                val enabled = extras?.getBoolean(EXTRA_VALUE) ?: return result(false)
+                prefs.edit()
+                    .putBoolean(
+                        LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE,
+                        enabled
+                    )
+                    .commit()
+            }
             METHOD_REJECT_POLICY -> {
                 val committed = prefs.edit()
                     .putBoolean(LuonnotarPreferences.KEY_ENABLED, false)
@@ -174,6 +183,7 @@ class GuardianStatusProvider : ContentProvider() {
         const val METHOD_STATUS = "guardian_status"
         const val METHOD_SET_ENABLED = "set_enabled"
         const val METHOD_ACK_NOTIFICATION_PRIVACY = "ack_notification_privacy"
+        const val METHOD_SET_AGGRESSIVE_MODE = "set_aggressive_mode"
         const val METHOD_REJECT_POLICY = "reject_policy"
         const val METHOD_SET_RECOVERY_FAILURE = "set_recovery_failure"
         const val METHOD_RECORD_BOOT = "record_boot"

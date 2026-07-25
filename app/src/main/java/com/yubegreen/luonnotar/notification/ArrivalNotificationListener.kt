@@ -3,6 +3,8 @@ package com.yubegreen.luonnotar.notification
 import android.content.ComponentName
 import android.app.Notification
 import android.os.Process
+import android.os.PowerManager
+import android.os.SystemClock
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
 import com.yubegreen.luonnotar.util.LogManager
@@ -48,6 +50,16 @@ class ArrivalNotificationListener : NotificationListenerService() {
         val groupHash = sbn.groupKey?.let(::sha256).orEmpty()
         val isGroupSummary =
             sbn.notification.flags and Notification.FLAG_GROUP_SUMMARY != 0
+        val listenerSeenTime = System.currentTimeMillis()
+        val listenerSeenElapsed = SystemClock.elapsedRealtime()
+        val pushTest = PushTestNotificationParser.parseFirst(
+            listOf(
+                sbn.notification.extras.getCharSequence(Notification.EXTRA_TEXT),
+                sbn.notification.extras.getCharSequence(Notification.EXTRA_BIG_TEXT),
+                sbn.notification.extras.getCharSequence(Notification.EXTRA_SUB_TEXT),
+                sbn.notification.extras.getCharSequence(Notification.EXTRA_TITLE)
+            )
+        )
         val decision = NotificationArrivalDeduper.classify(
             recent = readRecentFingerprints(
                 preferences.getString(
@@ -91,7 +103,7 @@ class ArrivalNotificationListener : NotificationListenerService() {
             )
             .putString(LuonnotarPreferences.KEY_LAST_NOTIFICATION_PACKAGE, sbn.packageName)
             .putLong(LuonnotarPreferences.KEY_LAST_NOTIFICATION_POST_WALL, sbn.postTime)
-            .putLong(LuonnotarPreferences.KEY_LAST_NOTIFICATION_SEEN_WALL, System.currentTimeMillis())
+            .putLong(LuonnotarPreferences.KEY_LAST_NOTIFICATION_SEEN_WALL, listenerSeenTime)
             .putString(LuonnotarPreferences.KEY_LAST_NOTIFICATION_GROUP_HASH, groupHash)
             .putBoolean(
                 LuonnotarPreferences.KEY_LAST_NOTIFICATION_IS_GROUP_SUMMARY,
@@ -115,6 +127,54 @@ class ArrivalNotificationListener : NotificationListenerService() {
                 "updateCount" to updateCount
             )
         )
+        if (
+            sbn.packageName == "com.whatsapp" ||
+            sbn.packageName == "com.whatsapp.w4b"
+        ) {
+            val lastSuccessElapsed = preferences.getLong(
+                LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED,
+                0L
+            )
+            val timelineDetails = linkedMapOf<String, Any?>(
+                "packageName" to sbn.packageName,
+                "notificationKind" to decision.kind.name,
+                "notificationPostTime" to sbn.postTime,
+                "listenerSeenTime" to listenerSeenTime,
+                "listenerDispatchDelayMs" to
+                    (listenerSeenTime - sbn.postTime).coerceAtLeast(0L),
+                "currentNetworkHandle" to preferences.getLong(
+                    LuonnotarPreferences.KEY_NETWORK_HANDLE,
+                    -1L
+                ),
+                "lastSuccessfulProbeAgeMs" to if (
+                    lastSuccessElapsed > 0L &&
+                    lastSuccessElapsed <= listenerSeenElapsed
+                ) {
+                    listenerSeenElapsed - lastSuccessElapsed
+                } else {
+                    -1L
+                },
+                "screenInteractive" to
+                    getSystemService(PowerManager::class.java).isInteractive,
+                "groupHash" to groupHash,
+                "isGroupSummary" to isGroupSummary
+            )
+            if (pushTest != null) {
+                timelineDetails["pushTestSequence"] = pushTest.sequence
+                timelineDetails["pushTestSenderLocalTime"] =
+                    pushTest.senderLocalTime
+                timelineDetails["pushTestSenderZone"] = pushTest.senderZoneId
+                timelineDetails["pushTestSenderEpochMs"] =
+                    pushTest.senderEpochMs
+                timelineDetails["pushTestEndToEndDelayMs"] =
+                    listenerSeenTime - pushTest.senderEpochMs
+            }
+            LogManager.timeline(
+                this,
+                "whatsapp_notification_observed",
+                timelineDetails
+            )
+        }
     }
 
     override fun onNotificationRemoved(sbn: StatusBarNotification) {

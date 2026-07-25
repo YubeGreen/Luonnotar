@@ -1,5 +1,7 @@
 # 努昂诺塔（Luonnotar）
 
+> 此文件保留旧版技术记录；请以项目根目录的 [`README.md`](README.md) 为当前版本说明。
+
 努昂诺塔是一个不占用 Android VPN 槽位的 Proton VPN / Tailscale 依赖链守护与诊断 APK。它用独立前台服务持有 CPU/Wi-Fi 锁，并且只在默认网络被系统证据确认含 `TRANSPORT_VPN` 时，通过该同一个 `Network` 发起低频 HTTPS 204 连通性验证。
 
 > 恢复边界：Android 12+ 在后台启动前台服务受系统限制。不精确闹钟触发后需要用户点按恢复通知；即使拥有精确闹钟权限，Doze 下 allow-while-idle 也受约 9 分钟频率限制。本项目不承诺一分钟恢复上限。

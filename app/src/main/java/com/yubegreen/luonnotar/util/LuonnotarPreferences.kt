@@ -13,6 +13,7 @@ object LuonnotarPreferences {
 
     const val KEY_ENABLED = "guardian_enabled"
     const val KEY_PAUSED = "guardian_paused"
+    const val KEY_AGGRESSIVE_VIVO_MODE = "aggressive_vivo_mode"
     const val KEY_RUNTIME_BOOT_ID = "runtime_boot_id"
     const val KEY_STATE = "guardian_state"
     const val KEY_PID = "guardian_pid"
@@ -28,12 +29,21 @@ object LuonnotarPreferences {
     const val KEY_VALIDATED = "default_validated"
     const val KEY_BYPASSABLE = "vpn_bypassable"
     const val KEY_BYPASSABLE_KNOWN = "vpn_bypassable_known"
+    const val KEY_VPN_PROVIDER_PACKAGE = "vpn_provider_package"
+    const val KEY_VPN_INTERNET_ROUTED = "vpn_internet_routed"
+    const val KEY_VPN_IPV4_DEFAULT_ROUTE = "vpn_ipv4_default_route"
+    const val KEY_VPN_IPV6_DEFAULT_ROUTE = "vpn_ipv6_default_route"
     const val KEY_LOCKDOWN = "lockdown_enabled"
     const val KEY_LOCKDOWN_KNOWN = "lockdown_known"
     const val KEY_ALWAYS_ON = "always_on_enabled"
     const val KEY_ALWAYS_ON_KNOWN = "always_on_known"
     const val KEY_NETWORK_HANDLE = "network_handle"
     const val KEY_TRANSPORT = "underlying_transport"
+    const val KEY_UNDERLAY_SOURCE = "underlay_source"
+    const val KEY_LAST_EXPLICIT_UNDERLAY = "last_explicit_underlay"
+    const val KEY_LAST_WIFI_SEEN_ELAPSED = "last_wifi_seen_elapsed"
+    const val KEY_UNDERLAY_UNKNOWN_SINCE = "underlay_unknown_since_elapsed"
+    const val KEY_UNDERLAY_HISTORY_BOOT_ID = "underlay_history_boot_id"
     const val KEY_WAKE_LOCK = "wake_lock_held"
     const val KEY_WIFI_LOCK = "wifi_lock_held"
     const val KEY_LAST_ATTEMPT_RTT = "last_attempt_rtt_ms"
@@ -47,6 +57,11 @@ object LuonnotarPreferences {
     const val KEY_LAST_ERROR = "last_error"
     const val KEY_LAST_START_REASON = "last_start_reason"
     const val KEY_LAST_BOOT_BROADCAST = "last_boot_broadcast"
+    const val KEY_BOOT_RECOVERY_CLAIM_BOOT_ID = "boot_recovery_claim_boot_id"
+    const val KEY_BOOT_RECOVERY_CLAIM_ACTION = "boot_recovery_claim_action"
+    const val KEY_BOOT_RECOVERY_CLAIM_ELAPSED = "boot_recovery_claim_elapsed"
+    const val KEY_BOOT_RECOVERY_DISPATCH_ACCEPTED =
+        "boot_recovery_dispatch_accepted"
     const val KEY_RECOVERY_FAILURE = "recovery_failure"
     const val KEY_RECOVERY_FAILURE_SERVICE = "recovery_failure_service"
     const val KEY_RECOVERY_FAILURE_SERVICE_ELAPSED = "recovery_failure_service_elapsed"
@@ -58,6 +73,7 @@ object LuonnotarPreferences {
     const val KEY_RECOVERY_FAILURE_BOOT_ELAPSED = "recovery_failure_boot_elapsed"
     const val KEY_FCM_TOKEN_REFRESH = "fcm_token_refresh"
     const val KEY_MAX_TIMER_DRIFT = "max_timer_drift_ms"
+    const val KEY_LAST_TIMER_DRIFT = "last_timer_drift_ms"
     const val KEY_LAST_TICK_UPTIME = "last_tick_uptime"
     const val KEY_LAST_TICK_ELAPSED = "last_tick_elapsed"
     const val KEY_NOTIFICATION_PRIVACY_ACK = "notification_privacy_ack"
@@ -92,6 +108,7 @@ object LuonnotarPreferences {
     const val KEY_LAST_NOTIFICATION_IS_GROUP_SUMMARY = "last_notification_is_group_summary"
     const val KEY_PROBE_STARTED_ELAPSED = "probe_started_elapsed"
     const val KEY_PROBE_DEADLINE_ELAPSED = "probe_deadline_elapsed"
+    const val KEY_PROBE_IN_FLIGHT = "probe_in_flight"
     const val KEY_RECOVERY_CONFIRMATION_PENDING = "recovery_confirmation_pending"
     const val KEY_RECOVERY_REQUESTED_ELAPSED = "recovery_requested_elapsed"
     const val KEY_LAST_RECOVERY_SUCCESS_ELAPSED = "last_recovery_success_elapsed"
@@ -131,6 +148,7 @@ object LuonnotarPreferences {
             .remove(KEY_LAST_TICK_ELAPSED)
             .remove(KEY_LAST_TICK_UPTIME)
             .remove(KEY_MAX_TIMER_DRIFT)
+            .remove(KEY_LAST_TIMER_DRIFT)
             .remove(KEY_LAST_ATTEMPT_RTT)
             .remove(KEY_LAST_ATTEMPT_ELAPSED)
             .remove(KEY_LAST_ATTEMPT_NETWORK_HANDLE)
@@ -148,9 +166,21 @@ object LuonnotarPreferences {
             .remove(KEY_VALIDATED)
             .remove(KEY_BYPASSABLE)
             .remove(KEY_BYPASSABLE_KNOWN)
+            .remove(KEY_VPN_PROVIDER_PACKAGE)
+            .remove(KEY_VPN_INTERNET_ROUTED)
+            .remove(KEY_VPN_IPV4_DEFAULT_ROUTE)
+            .remove(KEY_VPN_IPV6_DEFAULT_ROUTE)
             .remove(KEY_NETWORK_HANDLE)
             .remove(KEY_HAS_EVER_OBSERVED_VPN)
             .remove(KEY_TRANSPORT)
+            .remove(KEY_UNDERLAY_SOURCE)
+            .remove(KEY_LAST_EXPLICIT_UNDERLAY)
+            .remove(KEY_LAST_WIFI_SEEN_ELAPSED)
+            .remove(KEY_UNDERLAY_UNKNOWN_SINCE)
+            .remove(KEY_UNDERLAY_HISTORY_BOOT_ID)
+            .remove(KEY_PROBE_IN_FLIGHT)
+            .remove(KEY_PROBE_STARTED_ELAPSED)
+            .remove(KEY_PROBE_DEADLINE_ELAPSED)
             .remove(KEY_LOCKDOWN)
             .remove(KEY_LOCKDOWN_KNOWN)
             .remove(KEY_ALWAYS_ON)
@@ -158,6 +188,10 @@ object LuonnotarPreferences {
             .remove(KEY_ALARM_EXACT)
             .remove(KEY_ALARM_SCHEDULED_ELAPSED)
             .remove(KEY_LAST_BOOT_BROADCAST)
+            .remove(KEY_BOOT_RECOVERY_CLAIM_BOOT_ID)
+            .remove(KEY_BOOT_RECOVERY_CLAIM_ACTION)
+            .remove(KEY_BOOT_RECOVERY_CLAIM_ELAPSED)
+            .remove(KEY_BOOT_RECOVERY_DISPATCH_ACCEPTED)
             .remove(KEY_ADB_VERIFIED_WALL)
             .remove(KEY_ADB_VERIFIED_ELAPSED)
             .remove(KEY_ADB_VERIFIED_BOOT_ID)
@@ -217,6 +251,7 @@ object LuonnotarPreferences {
             .remove(KEY_LAST_TICK_ELAPSED)
             .remove(KEY_LAST_TICK_UPTIME)
             .remove(KEY_MAX_TIMER_DRIFT)
+            .remove(KEY_LAST_TIMER_DRIFT)
             .remove(KEY_LAST_ATTEMPT_RTT)
             .remove(KEY_LAST_ATTEMPT_ELAPSED)
             .remove(KEY_LAST_ATTEMPT_NETWORK_HANDLE)
@@ -233,8 +268,16 @@ object LuonnotarPreferences {
             .remove(KEY_VALIDATED)
             .remove(KEY_BYPASSABLE)
             .remove(KEY_BYPASSABLE_KNOWN)
+            .remove(KEY_VPN_PROVIDER_PACKAGE)
+            .remove(KEY_VPN_INTERNET_ROUTED)
+            .remove(KEY_VPN_IPV4_DEFAULT_ROUTE)
+            .remove(KEY_VPN_IPV6_DEFAULT_ROUTE)
             .remove(KEY_NETWORK_HANDLE)
             .remove(KEY_TRANSPORT)
+            .remove(KEY_UNDERLAY_SOURCE)
+            .remove(KEY_PROBE_IN_FLIGHT)
+            .remove(KEY_PROBE_STARTED_ELAPSED)
+            .remove(KEY_PROBE_DEADLINE_ELAPSED)
             .remove(KEY_LOCKDOWN)
             .remove(KEY_LOCKDOWN_KNOWN)
             .remove(KEY_ALWAYS_ON)

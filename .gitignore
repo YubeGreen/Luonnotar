@@ -18,3 +18,4 @@ captures/
 .kotlin/
 build-evidence/
 signing/
+tools/test-output/

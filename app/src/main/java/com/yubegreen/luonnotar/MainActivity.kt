@@ -2,6 +2,8 @@ package com.yubegreen.luonnotar
 
 import android.Manifest
 import android.animation.ValueAnimator
+import android.content.ClipData
+import android.content.ClipboardManager
 import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
@@ -27,6 +29,7 @@ import android.widget.ImageView
 import android.widget.GridLayout
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.NotificationManagerCompat
@@ -74,6 +77,7 @@ class MainActivity : AppCompatActivity() {
     private val backgroundExecutor = Executors.newSingleThreadExecutor()
     private lateinit var statusContainer: GridLayout
     private lateinit var serviceButton: Button
+    private lateinit var aggressiveModeButton: Button
     private lateinit var serviceActionHint: TextView
     private lateinit var scrollView: ElasticNestedScrollView
     private lateinit var rootContainer: FrameLayout
@@ -98,7 +102,7 @@ class MainActivity : AppCompatActivity() {
     private var entranceSequence = 0
     private val tabletLayout by lazy { AdaptiveLayout.isTablet(this) }
     private val twoColumnStatus by lazy { AdaptiveLayout.isWideTablet(this) }
-    private val backgroundPicker = registerForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+    private val backgroundPicker = registerForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
         uri?.let(::importBackground) ?: run { pendingBackgroundImport = null }
     }
     private val refresh = object : Runnable {
@@ -257,6 +261,10 @@ class MainActivity : AppCompatActivity() {
 
         root.addView(actionButton("重启守护服务") { restartGuardian() })
         root.addView(actionButton("执行 VPN-only 连通性检测") { manualCheck() })
+        aggressiveModeButton = actionButton("vivo/iQOO 激进保活模式") {
+            toggleAggressiveMode()
+        }
+        root.addView(aggressiveModeButton)
 
         root.addView(sectionTitle("外观"))
         visualSummary = TextView(this).apply {
@@ -276,7 +284,7 @@ class MainActivity : AppCompatActivity() {
         root.addView(actionButton("机型专用 ADB 稳定性与路由证据") { showAdvancedGuide(it) })
 
         root.addView(sectionTitle("诊断与隐私"))
-        root.addView(actionButton("导出诊断 ZIP") { exportLogs() })
+        root.addView(actionButton("一键导出诊断包") { exportLogs() })
         root.addView(actionButton("通知到达验证模式") { enableNotificationEvidence(it) })
         root.addView(actionButton("极限自检精确闹钟设置") { openExactAlarmSettings() })
         root.addView(actionButton("打开异常通知渠道设置") { openAlertChannelSettings() })
@@ -429,6 +437,18 @@ class MainActivity : AppCompatActivity() {
         if (enabled && !paused && !serviceAlive) recoverStaleGuardianFromVisibleActivity()
         val vpn = status.boolean(LuonnotarPreferences.KEY_VPN)
         val validated = status.boolean(LuonnotarPreferences.KEY_VALIDATED)
+        val nativeVpnProviderPackage = status.string(
+            LuonnotarPreferences.KEY_VPN_PROVIDER_PACKAGE,
+            ""
+        )
+        val nativeVpnProvider =
+            SupportedVpnProvider.fromPackage(nativeVpnProviderPackage)
+        val nativeInternetRouted =
+            status.boolean(LuonnotarPreferences.KEY_VPN_INTERNET_ROUTED)
+        val nativeIpv4Default =
+            status.boolean(LuonnotarPreferences.KEY_VPN_IPV4_DEFAULT_ROUTE)
+        val nativeIpv6Default =
+            status.boolean(LuonnotarPreferences.KEY_VPN_IPV6_DEFAULT_ROUTE)
         val adbVerification = readAdbVpnVerification(status)
         val activeProvider = adbVerification?.activePackage
             ?.let(SupportedVpnProvider::fromPackage)
@@ -547,6 +567,36 @@ class MainActivity : AppCompatActivity() {
             vpnProviders.isNotEmpty()
         )
         addStatus(
+            "当前 VPN Provider",
+            nativeVpnProvider?.let {
+                "${it.displayName} · Android VPN owner UID 证据"
+            } ?: if (vpn) {
+                "未知 · 当前 Android 版本未公开受支持 Provider 所有者"
+            } else {
+                "无活动 VPN"
+            },
+            serviceAlive && nativeVpnProvider != null
+        )
+        addStatus(
+            "VPN 公网默认路由",
+            if (nativeInternetRouted) {
+                "已检测 · IPv4 ${yesNo(nativeIpv4Default)} / IPv6 ${
+                    yesNo(nativeIpv6Default)
+                }${
+                    if (nativeVpnProvider == SupportedVpnProvider.TAILSCALE) {
+                        " · Tailscale Exit Node 路径存在"
+                    } else {
+                        ""
+                    }
+                }"
+            } else if (nativeVpnProvider == SupportedVpnProvider.TAILSCALE) {
+                "未检测到 0.0.0.0/0 或 ::/0 · 请检查 Exit Node"
+            } else {
+                "未检测到 VPN 公网默认路由"
+            },
+            serviceAlive && vpn && validated && nativeInternetRouted
+        )
+        addStatus(
             "默认网络是 VPN",
             "${yesNo(vpn)} · VALIDATED ${yesNo(validated)}",
             serviceAlive && vpn && validated
@@ -602,6 +652,21 @@ class MainActivity : AppCompatActivity() {
         val wakeLockHeld = serviceAlive && status.boolean(LuonnotarPreferences.KEY_WAKE_LOCK)
         val wifiLockHeld = serviceAlive && status.boolean(LuonnotarPreferences.KEY_WIFI_LOCK)
         val underlyingTransport = status.string(LuonnotarPreferences.KEY_TRANSPORT, "UNKNOWN")
+        val aggressiveMode =
+            status.boolean(LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE)
+        val vivoFamily = isVivoFamily()
+        addStatus(
+            "vivo/iQOO 激进保活",
+            when {
+                aggressiveMode ->
+                    "已开启 · 熄屏 30 秒 VPN-only 探测 · 亮屏 5 分钟"
+                vivoFamily ->
+                    "未开启 · 当前机型建议启用以保持 VPN 路径活跃"
+                else ->
+                    "未开启 · 仅建议在 vivo/iQOO 或明确需要时使用"
+            },
+            aggressiveMode || !vivoFamily
+        )
         val wifiRequired = underlyingTransport == "WIFI"
         val underlayKnown = underlyingTransport in
             setOf("WIFI", "CELLULAR", "ETHERNET")
@@ -759,6 +824,13 @@ class MainActivity : AppCompatActivity() {
             else -> "停止极限保活"
         }
         serviceButton.contentDescription = "${serviceButton.text}，核心操作"
+        aggressiveModeButton.text = when {
+            aggressiveMode -> "关闭 vivo/iQOO 激进保活"
+            vivoFamily -> "开启 vivo/iQOO 激进保活（建议）"
+            else -> "开启激进保活（仅 vivo/iQOO 建议）"
+        }
+        aggressiveModeButton.contentDescription =
+            "${aggressiveModeButton.text}，熄屏时每 30 秒执行 VPN-only HTTPS 探测"
         serviceButton.isEnabled = statusAvailable
         serviceButton.isSelected = statusAvailable && (!enabled || paused)
         (serviceButton.background as? LiquidGlassDrawable)?.setGood(enabled && !paused)
@@ -984,11 +1056,56 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun toggleAggressiveMode() {
+        val status = readGuardianStatus()
+        if (!status.containsKey(LuonnotarPreferences.KEY_KEEPER_PROCESS_PID)) {
+            showGlassNotice("Keeper 状态不可读，暂时无法修改激进模式", long = true)
+            return
+        }
+        val enabled =
+            !status.boolean(LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE)
+        if (!GuardianStatusClient.setAggressiveMode(this, enabled)) {
+            showGlassNotice("激进模式设置保存失败", long = true)
+            return
+        }
+        LogManager.event(
+            this,
+            "aggressive_vivo_mode_changed",
+            mapOf("enabled" to enabled, "vivoFamily" to isVivoFamily())
+        )
+        if (
+            enabled &&
+            status.boolean(LuonnotarPreferences.KEY_ENABLED) &&
+            !status.boolean(LuonnotarPreferences.KEY_PAUSED)
+        ) {
+            runCatching {
+                startService(
+                    Intent(this, FcmGuardianService::class.java)
+                        .setAction(FcmGuardianService.ACTION_CHECK)
+                )
+            }
+        }
+        showGlassNotice(
+            if (enabled) {
+                "激进模式已开启：熄屏后每 30 秒保持 VPN 路径活跃；FCM 真实交付仍需通知证据验证"
+            } else {
+                "激进模式已关闭：已恢复 5 分钟 VPN-only 探测周期"
+            },
+            long = true
+        )
+        renderStatus()
+    }
+
+    private fun isVivoFamily(): Boolean {
+        val vendor = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase()
+        return "vivo" in vendor || "iqoo" in vendor
+    }
+
     private fun showOemGuide(anchorView: View? = null) {
         val vendor = "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL}"
         val steps = when {
             vendor.contains("vivo", true) || vendor.contains("iqoo", true) ->
-                "检测到 vivo/iQOO：\n• 努昂诺塔和当前 VPN（Proton/Tailscale）：自启动、后台高耗电、电池不限制、最近任务锁定、常驻通知\n• i 管家不得自动清理\n• WhatsApp/GMS：后台数据与电池不限制，GMS 保持 Doze 白名单\n• 原生 Doze 关闭不代表 vivo PEM/后台冻结已关闭"
+                "检测到 vivo/iQOO：\n• 建议在主页开启“vivo/iQOO 激进保活”，熄屏后使用 30 秒 VPN-only 路径探测\n• 努昂诺塔和当前 VPN（Proton/Tailscale）：自启动、后台高耗电、电池不限制、最近任务锁定、常驻通知\n• i 管家不得自动清理\n• WhatsApp/GMS：后台数据与电池不限制，GMS 保持 Doze 白名单\n• 原生 Doze 关闭不代表 vivo PEM/后台冻结已关闭"
             vendor.contains("xiaomi", true) || vendor.contains("redmi", true) ->
                 "检测到小米/红米：\n• 努昂诺塔、当前 VPN（Proton/Tailscale）、WhatsApp、GMS 分别开启自启动\n• 电池策略设为“无限制”，允许后台数据，最近任务锁定\n• HyperOS 更新后重新检查\n• millet_white 仅作高级实验，不由本应用修改"
             vendor.contains("oppo", true) || vendor.contains("oneplus", true) || vendor.contains("realme", true) ->
@@ -1032,91 +1149,121 @@ class MainActivity : AppCompatActivity() {
 
     private fun showAdvancedGuide(anchorView: View? = null) {
         val vendor = "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL}"
-        val commands = """
+        val script = adbStabilityCommands()
+        val guide = """
             当前机型：$vendor
 
-            ADB 不是努昂诺塔运行的硬依赖。以下操作可减少原生 Doze、待机桶与后台 AppOps 对守护链的限制；厂商管家中的自启动、电池不限制、后台高耗电和任务锁定仍需人工确认。
+            此 PowerShell 脚本只处理实际已安装的目标包，并在执行后打印 Device Idle、待机桶、AppOps、netpolicy 与 connectivity 核验结果。
 
-            ${adbStabilityCommands()}
+            仍须在 vivo/iQOO 设置中人工确认：
+            • 自启动允许
+            • 关联启动允许
+            • 后台高耗电允许
+            • 电池策略不限制
+            • 后台网络允许
+            • 最近任务锁定
+            • GMS、WhatsApp、VPN 与努昂诺塔均加入厂商白名单
 
-            路由证据采集：
+            ADB 不能证明 GMS 私有 FCM socket 正常；HTTPS 204 只表示努昂诺塔自己的 VPN 路径活跃。
 
-            adb shell dumpsys vpn_management
-            adb shell cmd package list packages -U
-
-            拆分隧道模式建议确认：
-            • Active package 为 ch.protonvpn.android 或 com.tailscale.ipn
-            • alwaysOn=true
-            • lockdown=false（允许被排除应用直连）
-            • GMS、WhatsApp 的 UID 仍落在 VPN 的 Uids 覆盖范围
-            • 它们没有加入当前 VPN 的拆分隧道排除列表
-            • 使用 Tailscale 时必须启用可承载公网流量的 Exit Node，并显式导入 internet_routed=true；只连接 tailnet 不能证明 FCM 公网路径
-
-            电脑核验 dumpsys 后，可向努昂诺塔导入受 android.permission.DUMP 保护的声明与当前 VPN network handle。应用会重算导入指纹，但无法自主证明声明内容，因此界面只称“ADB 导入证据”。导入仅保留 5 分钟；VPN handle 变化或丢失会立即清除。
-
-            注意：关闭 Lockdown 后，VPN 完全断开时不存在系统级全局阻断；努昂诺塔只能保证自身不回落直连，无法代替系统约束其他应用。
+            $script
         """.trimIndent()
-            .lines()
-            .joinToString("\n") { it.removePrefix("            ") }
         GlassMessageDialog(
             context = this,
             preferences = VisualPreferences.load(this),
             visualBackground = visualBackground,
             title = "机型专用 ADB 建议",
-            message = commands,
+            message = guide,
             monospace = true,
-            primaryLabel = "打开 VPN 设置",
+            primaryLabel = "复制安全脚本",
+            secondaryLabel = "A/B 诊断命令",
             anchorView = anchorView,
-            onPrimary = ::openVpnSettings
+            onPrimary = { copyToClipboard("Luonnotar ADB PowerShell", script) },
+            onSecondary = { showDozeAbDiagnosticCommand(anchorView) }
         ).show()
     }
 
     private fun adbStabilityCommands(): String {
-        val targetPackages = buildList {
-            add(packageName)
-            add("com.google.android.gms")
-            if (isInstalled("com.whatsapp")) add("com.whatsapp")
-            if (isInstalled("com.whatsapp.w4b")) add("com.whatsapp.w4b")
-            SupportedVpnProvider.entries
-                .filter { isInstalled(it.packageName) }
-                .forEach { add(it.packageName) }
-        }.distinct()
-        val universal = targetPackages.joinToString("\n") { target ->
-            """
-            adb shell cmd deviceidle whitelist +$target
-            adb shell am set-standby-bucket $target active
-            adb shell cmd appops set $target RUN_IN_BACKGROUND allow
-            adb shell cmd appops set $target RUN_ANY_IN_BACKGROUND allow
-            """.trimIndent()
-        }
         val vendor = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase()
-        val vendorEntry = when {
+        val settingsCommands = when {
             "vivo" in vendor || "iqoo" in vendor -> """
-                # vivo / iQOO：打开自启动与后台高耗电管理
-                adb shell am start -n com.vivo.permissionmanager/.activity.BgStartUpManagerActivity
-                adb shell am start -n com.iqoo.secure/.ui.phoneoptimize.AddWhiteListActivity
+                ${'$'}vendorSettingsOpened = ${'$'}false
+                ${'$'}vendorResult = adb shell am start -n com.vivo.permissionmanager/.activity.BgStartUpManagerActivity 2>&1
+                if (${'$'}LASTEXITCODE -eq 0 -and ${'$'}vendorResult -notmatch "Error|Exception") { ${'$'}vendorSettingsOpened = ${'$'}true }
+                if (-not ${'$'}vendorSettingsOpened) {
+                  ${'$'}vendorResult = adb shell am start -n com.iqoo.secure/.ui.phoneoptimize.AddWhiteListActivity 2>&1
+                  if (${'$'}LASTEXITCODE -eq 0 -and ${'$'}vendorResult -notmatch "Error|Exception") { ${'$'}vendorSettingsOpened = ${'$'}true }
+                }
+                if (-not ${'$'}vendorSettingsOpened) {
+                  adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:com.yubegreen.luonnotar
+                }
             """.trimIndent()
             "xiaomi" in vendor || "redmi" in vendor -> """
-                # Xiaomi / Redmi：打开自启动管理
                 adb shell am start -n com.miui.securitycenter/com.miui.permcenter.autostart.AutoStartManagementActivity
-                adb shell am start -a android.settings.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS -d package:$packageName
-            """.trimIndent()
-            "oppo" in vendor || "oneplus" in vendor || "realme" in vendor -> """
-                # OPPO / OnePlus / realme：打开应用详情与电池优化
-                adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:$packageName
-                adb shell am start -a android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS
-            """.trimIndent()
-            "samsung" in vendor -> """
-                # Samsung：打开电池优化；同时从“深度睡眠应用”移除目标应用
-                adb shell am start -a android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS
+                if (${'$'}LASTEXITCODE -ne 0) {
+                  adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:com.yubegreen.luonnotar
+                }
             """.trimIndent()
             else -> """
-                # 通用系统入口
-                adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:$packageName
+                adb shell am start -a android.settings.APPLICATION_DETAILS_SETTINGS -d package:com.yubegreen.luonnotar
                 adb shell am start -a android.settings.IGNORE_BATTERY_OPTIMIZATION_SETTINGS
             """.trimIndent()
         }
-        return "$universal\n\n$vendorEntry"
+        return """
+            ${'$'}targets = @(
+              "com.yubegreen.luonnotar",
+              "com.google.android.gms",
+              "com.whatsapp",
+              "com.whatsapp.w4b",
+              "ch.protonvpn.android",
+              "com.tailscale.ipn"
+            )
+            ${'$'}installed = @()
+            foreach (${'$'}package in ${'$'}targets) {
+              ${'$'}path = adb shell pm path ${'$'}package 2>${'$'}null
+              if (${'$'}LASTEXITCODE -eq 0 -and ${'$'}path -match "^package:") {
+                ${'$'}installed += ${'$'}package
+                adb shell cmd deviceidle whitelist "+${'$'}package"
+                adb shell am set-standby-bucket ${'$'}package active
+                adb shell cmd appops set ${'$'}package RUN_IN_BACKGROUND allow
+                adb shell cmd appops set ${'$'}package RUN_ANY_IN_BACKGROUND allow
+                adb shell cmd appops set ${'$'}package WAKE_LOCK allow
+              }
+            }
+            adb shell cmd deviceidle whitelist
+            foreach (${'$'}package in ${'$'}installed) {
+              adb shell am get-standby-bucket ${'$'}package
+              adb shell cmd appops get ${'$'}package RUN_IN_BACKGROUND
+              adb shell cmd appops get ${'$'}package RUN_ANY_IN_BACKGROUND
+              adb shell cmd appops get ${'$'}package WAKE_LOCK
+            }
+            adb shell dumpsys netpolicy
+            adb shell dumpsys connectivity
+            $settingsCommands
+        """.trimIndent()
+    }
+
+    private fun showDozeAbDiagnosticCommand(anchorView: View? = null) {
+        val command = "adb shell dumpsys deviceidle disable"
+        GlassMessageDialog(
+            context = this,
+            preferences = VisualPreferences.load(this),
+            visualBackground = visualBackground,
+            title = "仅用于 A/B 故障诊断",
+            message =
+                "此命令会全局禁用 Android Device Idle，仅用于比较熄屏推送延迟。努昂诺塔不会自动执行，也不建议长期作为默认配置。\n\n$command",
+            monospace = true,
+            primaryLabel = "复制诊断命令",
+            anchorView = anchorView,
+            onPrimary = { copyToClipboard("Luonnotar Doze A/B", command) }
+        ).show()
+    }
+
+    private fun copyToClipboard(label: String, value: String) {
+        getSystemService(ClipboardManager::class.java).setPrimaryClip(
+            ClipData.newPlainText(label, value)
+        )
+        showGlassNotice("已复制到剪贴板")
     }
 
     private fun showVisualSettingsDialog(anchorView: View? = null) {
@@ -1128,7 +1275,9 @@ class MainActivity : AppCompatActivity() {
             anchorView = anchorView,
             onCustomRequested = { theme, scale ->
                 pendingBackgroundImport = PendingBackgroundImport(theme, scale)
-                backgroundPicker.launch("image/*")
+                backgroundPicker.launch(
+                    PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
+                )
             },
             onApply = ::applyVisualPreferences
         ).show()

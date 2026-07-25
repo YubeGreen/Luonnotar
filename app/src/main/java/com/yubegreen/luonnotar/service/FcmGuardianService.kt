@@ -4,8 +4,10 @@ import android.app.Notification
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
 import android.graphics.BitmapFactory
 import android.graphics.Bitmap
@@ -20,11 +22,13 @@ import android.os.SystemClock
 import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.yubegreen.luonnotar.ActionActivity
 import com.yubegreen.luonnotar.MainActivity
 import com.yubegreen.luonnotar.R
 import com.yubegreen.luonnotar.monitor.GuardianState
 import com.yubegreen.luonnotar.monitor.GuardianStateReducer
+import com.yubegreen.luonnotar.monitor.KeepaliveCadencePolicy
 import com.yubegreen.luonnotar.monitor.KeepaliveAlertPolicy
 import com.yubegreen.luonnotar.monitor.AdbVpnEvidencePolicy
 import com.yubegreen.luonnotar.monitor.NetworkEvidence
@@ -33,6 +37,8 @@ import com.yubegreen.luonnotar.monitor.SupportedVpnProvider
 import com.yubegreen.luonnotar.monitor.VpnConnectivityMonitor
 import com.yubegreen.luonnotar.monitor.VpnEvidence
 import com.yubegreen.luonnotar.monitor.VpnOnlyRoutingPolicy
+import com.yubegreen.luonnotar.monitor.WifiUnderlayHistory
+import com.yubegreen.luonnotar.monitor.WifiUnderlayLockPolicy
 import com.yubegreen.luonnotar.notification.NotificationChannelManager
 import com.yubegreen.luonnotar.receiver.GuardianCleanupReceiver
 import com.yubegreen.luonnotar.receiver.LabAlarmScheduler
@@ -60,17 +66,22 @@ class FcmGuardianService : Service() {
         const val KEEPALIVE_URL = "https://connectivitycheck.gstatic.com/generate_204"
         private const val TICK_SECONDS = 5L
         private const val LOCK_CHECK_MS = 30_000L
-        private const val KEEPALIVE_INTERVAL_MS = 5 * 60_000L
         private const val RECOVERY_PROBE_COOLDOWN_MS = 15_000L
         private const val PROBE_TIMEOUT_MS = 15_000L
-        private const val KEEPALIVE_STALE_MS = 2 * KEEPALIVE_INTERVAL_MS
+        private const val PROBE_HARD_TIMEOUT_MS = 45_000L
         private const val ALERT_COOLDOWN_MS = 10 * 60_000L
         private const val LEGACY_LAST_RTT_KEY = "last_rtt_ms"
+        private val PROCESS_ACTUAL_PROBE_PERMIT = ActualProbePermit()
+        private val SCREEN_ACTIONS = setOf(
+            Intent.ACTION_SCREEN_OFF,
+            Intent.ACTION_SCREEN_ON,
+            Intent.ACTION_USER_PRESENT
+        )
     }
 
-    private var scheduler = Executors.newSingleThreadScheduledExecutor()
-    private var probeExecutor = Executors.newSingleThreadExecutor()
-    private var scheduled: ScheduledFuture<*>? = null
+    @Volatile private var scheduler = Executors.newSingleThreadScheduledExecutor()
+    @Volatile private var probeExecutor = Executors.newSingleThreadExecutor()
+    @Volatile private var scheduled: ScheduledFuture<*>? = null
     private lateinit var wakeLock: PowerManager.WakeLock
     private lateinit var wifiLock: WifiManager.WifiLock
     private lateinit var vpnMonitor: VpnConnectivityMonitor
@@ -82,17 +93,45 @@ class FcmGuardianService : Service() {
     private var lastExpectedTickElapsed = 0L
     private var lastLockCheckElapsed = 0L
     private val lastKeepaliveAttemptElapsed = AtomicLong(0L)
-    private val probeInFlight = AtomicBoolean(false)
-    private val probeStartedElapsed = AtomicLong(0L)
-    private val pendingForcedProbe = AtomicBoolean(false)
     private val recoveryEpoch = AtomicLong(0L)
+    private val probeRequestGate = ProbeRequestGate(recoveryEpoch.get())
+    private val probeLifecycleLock = Any()
     private val destroyed = AtomicBoolean(false)
     private val stopping = AtomicBoolean(false)
+    private val processProbeRetryScheduled = AtomicBoolean(false)
+    private val hardProbeRestartRequested = AtomicBoolean(false)
     private var serviceGeneration = 0L
     @Volatile private var activeConnection: HttpsURLConnection? = null
     private var notificationLargeIcon: Bitmap? = null
     private var lastNotificationFingerprint = ""
     private var lastNotificationPostedElapsed = 0L
+    private var wifiUnderlayHistory = WifiUnderlayHistory()
+    private var lastUnderlayDiagnosticElapsed = 0L
+    private var lastDrainingActualDiagnosticElapsed = 0L
+    private var screenReceiverRegistered = false
+    private val screenEventReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context?, intent: Intent?) {
+            val action = intent?.action ?: return
+            if (action !in SCREEN_ACTIONS || destroyed.get() || stopping.get()) return
+            val timelineEvent = when (action) {
+                Intent.ACTION_SCREEN_OFF -> "screen_off"
+                Intent.ACTION_SCREEN_ON -> "screen_on"
+                Intent.ACTION_USER_PRESENT -> "user_present"
+                else -> return
+            }
+            LogManager.timeline(this@FcmGuardianService, timelineEvent)
+            val prefs = LuonnotarPreferences.deviceProtected(this@FcmGuardianService)
+            if (
+                prefs.getBoolean(
+                    LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE,
+                    false
+                ) &&
+                isActivelyEnabled(prefs)
+            ) {
+                requestRecoveryProbe(timelineEvent, force = true)
+            }
+        }
+    }
     private val bootId: String by lazy {
         runCatching { java.io.File("/proc/sys/kernel/random/boot_id").readText().trim() }
             .getOrDefault("unavailable")
@@ -106,6 +145,7 @@ class FcmGuardianService : Service() {
             .remove(LEGACY_LAST_RTT_KEY)
             .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
             .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
+            .putBoolean(LuonnotarPreferences.KEY_PROBE_IN_FLIGHT, false)
             .putString(LuonnotarPreferences.KEY_STATE, GuardianState.STARTING.name)
             .apply()
         bumpProcessSequence()
@@ -115,7 +155,9 @@ class FcmGuardianService : Service() {
         generationPrefs.edit()
             .putLong(LuonnotarPreferences.KEY_SERVICE_GENERATION, serviceGeneration)
             .apply()
+        wifiUnderlayHistory = restoreWifiUnderlayHistory(generationPrefs)
         createLocks()
+        registerScreenEventReceiver()
         val prefs = LuonnotarPreferences.deviceProtected(this)
         val active = prefs.getBoolean(LuonnotarPreferences.KEY_ENABLED, false) &&
             !prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
@@ -124,36 +166,150 @@ class FcmGuardianService : Service() {
             acquireWakeLock("service_create")
         }
         observeVpnPolicySettings()
-        vpnMonitor = VpnConnectivityMonitor(this) {
+        vpnMonitor = VpnConnectivityMonitor(this) vpnCallback@{
+            if (!isCurrentServiceInstance()) return@vpnCallback
             val previous = vpnEvidence
             vpnEvidence = it
             persistNetworkEvidence()
+            if (!isCurrentServiceInstance()) return@vpnCallback
             val handleChanged =
                 it.present && previous.present && it.networkHandle != previous.networkHandle
+            val recovered = it.present && !previous.present
+            val validationRegained =
+                it.present && it.validated && !previous.validated
+            val routeChanged =
+                it.internetRouted != previous.internetRouted ||
+                    it.ipv4DefaultRoute != previous.ipv4DefaultRoute ||
+                    it.ipv6DefaultRoute != previous.ipv6DefaultRoute
+            val providerChanged = it.providerPackage != previous.providerPackage
             if (handleChanged) {
-                activeConnection?.disconnect()
-                pendingForcedProbe.set(true)
+                disconnectActiveConnection()
             }
-            if (it.present && (!previous.present || handleChanged)) {
+            if (
+                it.present != previous.present ||
+                it.networkHandle != previous.networkHandle ||
+                it.validated != previous.validated ||
+                routeChanged ||
+                providerChanged
+            ) {
+                LogManager.timeline(
+                    this,
+                    "vpn_network_changed",
+                    mapOf(
+                        "previousNetworkHandle" to previous.networkHandle,
+                        "currentNetworkHandle" to it.networkHandle,
+                        "previousVpnPresent" to previous.present,
+                        "currentVpnPresent" to it.present,
+                        "previousValidated" to previous.validated,
+                        "currentValidated" to it.validated,
+                        "previousInternetRouted" to previous.internetRouted,
+                        "currentInternetRouted" to it.internetRouted,
+                        "previousProvider" to previous.providerPackage,
+                        "currentProvider" to it.providerPackage
+                    )
+                )
+            }
+            if (
+                it.present &&
+                it.internetRouted &&
+                (
+                    recovered ||
+                        handleChanged ||
+                        validationRegained ||
+                        routeChanged ||
+                        providerChanged
+                    )
+            ) {
                 requestRecoveryProbe(
-                    if (handleChanged) "vpn_handle_changed" else "vpn_recovered",
+                    when {
+                        handleChanged -> "vpn_handle_changed"
+                        recovered -> "vpn_recovered"
+                        routeChanged -> "vpn_default_route_changed"
+                        providerChanged -> "vpn_provider_changed"
+                        else -> "vpn_validated"
+                    },
                     force = true
                 )
             }
         }
-        networkMonitor = NetworkStateMonitor(this) {
+        networkMonitor = NetworkStateMonitor(this) networkCallback@{
+            if (!isCurrentServiceInstance()) return@networkCallback
             val previous = networkEvidence
             networkEvidence = it
-            reconcileWifiLock()
             persistNetworkEvidence()
+            if (!isCurrentServiceInstance()) return@networkCallback
+            reconcileWifiLock()
+            val handleChanged = previous.networkHandle != it.networkHandle
+            if (handleChanged) {
+                disconnectActiveConnection()
+            }
+            if (handleChanged) {
+                LogManager.timeline(
+                    this,
+                    "default_network_handle_changed",
+                    mapOf(
+                        "previousNetworkHandle" to previous.networkHandle,
+                        "currentNetworkHandle" to it.networkHandle
+                    )
+                )
+            }
+            if (previous.validated != it.validated) {
+                LogManager.timeline(
+                    this,
+                    "network_validation_changed",
+                    mapOf(
+                        "previousValidated" to previous.validated,
+                        "currentValidated" to it.validated
+                    )
+                )
+            }
+            if (
+                previous.transport != it.transport ||
+                previous.underlaySource != it.underlaySource
+            ) {
+                LogManager.timeline(
+                    this,
+                    "wifi_underlay_changed",
+                    mapOf(
+                        "previousUnderlay" to previous.transport,
+                        "currentUnderlay" to it.transport,
+                        "previousUnderlaySource" to previous.underlaySource,
+                        "underlaySource" to it.underlaySource
+                    )
+                )
+            }
+            if (handleChanged && vpnEvidence.present) {
+                requestRecoveryProbe("default_network_handle_changed", force = true)
+            }
             if (it.validated && !previous.validated && vpnEvidence.present) {
                 requestRecoveryProbe("network_validated", force = true)
             }
         }
-        vpnMonitor.start()
-        networkMonitor.start()
+        runCatching {
+            vpnMonitor.start()
+            networkMonitor.start()
+        }.onFailure {
+            runCatching { vpnMonitor.stop() }
+            runCatching { networkMonitor.stop() }
+            unregisterScreenEventReceiver()
+            releaseLocks("monitor_start_failed")
+            ServiceCompat.stopForeground(
+                this,
+                ServiceCompat.STOP_FOREGROUND_REMOVE
+            )
+            releaseNotificationLargeIcon()
+            scheduler.shutdownNow()
+            probeExecutor.shutdownNow()
+            LogManager.event(
+                this,
+                "guardian_monitor_start_failed",
+                mapOf("error" to it.toString())
+            )
+            throw it
+        }
         vpnEvidence = vpnMonitor.current()
         networkEvidence = networkMonitor.current()
+        persistNetworkEvidence()
         reconcileWifiLock()
         if (active) scheduleTicks()
         LogManager.event(this, "guardian_service_created")
@@ -179,6 +335,7 @@ class FcmGuardianService : Service() {
                 "guardian_start_ignored_disabled",
                 mapOf("reason" to reason, "action" to action, "nullIntent" to (intent == null))
             )
+            quiesceGuardianExecution("disabled_start_ignored")
             stopSelf()
             return START_NOT_STICKY
         }
@@ -204,7 +361,7 @@ class FcmGuardianService : Service() {
         when (action) {
             ACTION_STOP -> {
                 stopping.set(true)
-                activeConnection?.disconnect()
+                disconnectActiveConnection()
                 val stopped = prefs.edit()
                     .putBoolean(LuonnotarPreferences.KEY_ENABLED, false)
                     .putBoolean(LuonnotarPreferences.KEY_PAUSED, false)
@@ -228,6 +385,7 @@ class FcmGuardianService : Service() {
                     updateNotification()
                     return START_STICKY
                 }
+                quiesceGuardianExecution("user_stop")
                 LogManager.event(this, "guardian_stopped_by_user")
                 LabAlarmScheduler.cancel(this)
                 cancelTransientNotifications()
@@ -251,22 +409,7 @@ class FcmGuardianService : Service() {
                     return START_NOT_STICKY
                 }
             }
-            ACTION_CHECK -> scheduler.execute {
-                vpnEvidence = vpnMonitor.current()
-                networkEvidence = networkMonitor.current()
-                val paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
-                if (VpnOnlyRoutingPolicy.maySendHttps(vpnEvidence.present, paused)) {
-                    requestRecoveryProbe("manual_check", force = true)
-                } else {
-                    LogManager.event(
-                        this,
-                        "manual_check_blocked",
-                        mapOf("vpn" to vpnEvidence.present, "paused" to paused)
-                    )
-                }
-                updateStateAndAlerts()
-                updateNotification()
-            }
+            ACTION_CHECK -> submitManualCheck()
             ACTION_RECOVER -> recoverInternalSchedulers(reason)
             else -> {
                 prefs.edit()
@@ -295,21 +438,41 @@ class FcmGuardianService : Service() {
     override fun onDestroy() {
         stopping.set(true)
         destroyed.set(true)
-        scheduled?.cancel(true)
-        activeConnection?.disconnect()
-        activeConnection = null
+        var connectionToDisconnect: HttpsURLConnection? = null
+        val oldExecutors = synchronized(probeLifecycleLock) {
+            probeRequestGate.advanceGeneration(
+                recoveryEpoch.incrementAndGet()
+            )
+            scheduled?.cancel(true)
+            scheduled = null
+            connectionToDisconnect = activeConnection
+            activeConnection = null
+            processProbeRetryScheduled.set(false)
+            scheduler to probeExecutor
+        }
+        connectionToDisconnect?.disconnect()
         if (::vpnMonitor.isInitialized) vpnMonitor.stop()
         if (::networkMonitor.isInitialized) networkMonitor.stop()
-        releaseLocks()
+        unregisterScreenEventReceiver()
+        releaseLocks("service_destroyed")
         releaseNotificationLargeIcon()
-        scheduler.shutdownNow()
-        probeExecutor.shutdownNow()
+        oldExecutors.first.shutdownNow()
+        oldExecutors.second.shutdownNow()
+        val schedulerTerminated = runCatching {
+            oldExecutors.first.awaitTermination(1L, TimeUnit.SECONDS)
+        }.getOrDefault(false)
+        val probeExecutorTerminated = runCatching {
+            oldExecutors.second.awaitTermination(1L, TimeUnit.SECONDS)
+        }.getOrDefault(false)
         val prefs = LuonnotarPreferences.deviceProtected(this)
         val enabled = prefs.getBoolean(LuonnotarPreferences.KEY_ENABLED, false)
         val paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
         val editor = prefs.edit()
             .putBoolean(LuonnotarPreferences.KEY_WAKE_LOCK, false)
             .putBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, false)
+            .putBoolean(LuonnotarPreferences.KEY_PROBE_IN_FLIGHT, false)
+            .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
+            .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
                     .putInt(LuonnotarPreferences.KEY_PID, 0)
                     .remove(LuonnotarPreferences.KEY_HEARTBEAT_ELAPSED)
                     .remove(LuonnotarPreferences.KEY_SERVICE_STARTED_ELAPSED)
@@ -330,7 +493,14 @@ class FcmGuardianService : Service() {
             editor.putString(LuonnotarPreferences.KEY_LAST_SERVICE_EXIT, "onDestroy")
         }
         editor.commit()
-        LogManager.event(this, "guardian_service_destroyed")
+        LogManager.event(
+            this,
+            "guardian_service_destroyed",
+            mapOf(
+                "schedulerTerminated" to schedulerTerminated,
+                "probeExecutorTerminated" to probeExecutorTerminated
+            )
+        )
         super.onDestroy()
     }
 
@@ -341,23 +511,113 @@ class FcmGuardianService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun scheduleTicks() {
-        if (scheduled?.isCancelled == false && scheduled?.isDone == false) return
-        lastExpectedTickElapsed = SystemClock.elapsedRealtime()
-        val scheduledEpoch = recoveryEpoch.get()
-        scheduled = scheduler.scheduleWithFixedDelay({
-            runCatching {
-                if (scheduledEpoch == recoveryEpoch.get()) tick()
-            }.onFailure {
-                persistError("tick:${it.javaClass.simpleName}:${it.message}")
-                LogManager.event(this, "guardian_tick_failed", mapOf("error" to it.toString()))
-            }
-            lastExpectedTickElapsed = SystemClock.elapsedRealtime() + TICK_SECONDS * 1000
-        }, 0, TICK_SECONDS, TimeUnit.SECONDS)
+    private fun registerScreenEventReceiver() {
+        if (screenReceiverRegistered) return
+        val filter = IntentFilter().apply {
+            SCREEN_ACTIONS.forEach(::addAction)
+        }
+        ContextCompat.registerReceiver(
+            this,
+            screenEventReceiver,
+            filter,
+            ContextCompat.RECEIVER_NOT_EXPORTED
+        )
+        screenReceiverRegistered = true
     }
 
-    private fun tick() {
-        if (destroyed.get()) return
+    private fun unregisterScreenEventReceiver() {
+        if (!screenReceiverRegistered) return
+        runCatching { unregisterReceiver(screenEventReceiver) }
+        screenReceiverRegistered = false
+    }
+
+    private fun submitManualCheck() {
+        val submission = synchronized(probeLifecycleLock) {
+            recoveryEpoch.get() to scheduler
+        }
+        runCatching {
+            submission.second.execute {
+                if (!isEpochCurrent(submission.first)) return@execute
+                vpnEvidence = vpnMonitor.current()
+                networkEvidence = networkMonitor.current()
+                if (!isEpochCurrent(submission.first)) return@execute
+                val prefs = LuonnotarPreferences.deviceProtected(this)
+                val paused = prefs.getBoolean(
+                    LuonnotarPreferences.KEY_PAUSED,
+                    false
+                )
+                if (
+                    VpnOnlyRoutingPolicy.maySendHttps(
+                        vpnEvidence.present,
+                        paused
+                    )
+                ) {
+                    requestRecoveryProbe("manual_check", force = true)
+                } else {
+                    LogManager.event(
+                        this,
+                        "manual_check_blocked",
+                        mapOf(
+                            "vpn" to vpnEvidence.present,
+                            "paused" to paused
+                        )
+                    )
+                }
+                if (!isEpochCurrent(submission.first)) return@execute
+                updateStateAndAlerts()
+                updateNotification()
+            }
+        }.onFailure {
+            if (isEpochCurrent(submission.first)) {
+                persistError(
+                    "manual_check_submit:" +
+                        "${it.javaClass.simpleName}:${it.message}"
+                )
+                LogManager.event(
+                    this,
+                    "manual_check_submit_failed",
+                    mapOf("error" to it.toString())
+                )
+            }
+        }
+    }
+
+    private fun scheduleTicks() {
+        synchronized(probeLifecycleLock) {
+            if (
+                scheduled?.isCancelled == false &&
+                scheduled?.isDone == false
+            ) return
+            lastExpectedTickElapsed = SystemClock.elapsedRealtime()
+            val scheduledEpoch = recoveryEpoch.get()
+            val executor = scheduler
+            scheduled = executor.scheduleWithFixedDelay({
+                runCatching {
+                    if (isEpochCurrent(scheduledEpoch)) {
+                        tick(scheduledEpoch)
+                    }
+                }.onFailure {
+                    if (isEpochCurrent(scheduledEpoch)) {
+                        persistError(
+                            "tick:${it.javaClass.simpleName}:${it.message}"
+                        )
+                        LogManager.event(
+                            this,
+                            "guardian_tick_failed",
+                            mapOf("error" to it.toString())
+                        )
+                    }
+                }
+                if (isEpochCurrent(scheduledEpoch)) {
+                    lastExpectedTickElapsed =
+                        SystemClock.elapsedRealtime() + TICK_SECONDS * 1000
+                }
+            }, 0, TICK_SECONDS, TimeUnit.SECONDS)
+        }
+    }
+
+    private fun tick(expectedEpoch: Long) {
+        if (!isEpochCurrent(expectedEpoch)) return
         val nowElapsed = SystemClock.elapsedRealtime()
         val nowUptime = SystemClock.uptimeMillis()
         val drift = max(0L, nowElapsed - lastExpectedTickElapsed)
@@ -373,40 +633,83 @@ class FcmGuardianService : Service() {
             (nowElapsed - previousElapsed) - (nowUptime - previousUptime)
         } else 0
         val maximum = max(prefs.getLong(LuonnotarPreferences.KEY_MAX_TIMER_DRIFT, 0), drift)
-        prefs.edit()
-            .putLong(LuonnotarPreferences.KEY_HEARTBEAT_ELAPSED, nowElapsed)
-            .putLong(LuonnotarPreferences.KEY_LAST_TICK_ELAPSED, nowElapsed)
-            .putLong(LuonnotarPreferences.KEY_LAST_TICK_UPTIME, nowUptime)
-            .putLong(LuonnotarPreferences.KEY_MAX_TIMER_DRIFT, maximum)
-            .remove(LuonnotarPreferences.KEY_RECOVERY_FAILURE_BOOT)
-            .remove(LuonnotarPreferences.KEY_RECOVERY_FAILURE_BOOT_ELAPSED)
-            .apply()
-        if (
-            prefs.getBoolean(
-                LuonnotarPreferences.KEY_RECOVERY_CONFIRMATION_PENDING,
+        val heartbeatCommitted = synchronized(probeLifecycleLock) {
+            if (!isEpochCurrent(expectedEpoch)) {
                 false
-            ) &&
-            prefs.getInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, -1) ==
-                HttpURLConnection.HTTP_NO_CONTENT &&
-            prefs.getInt(LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES, 0) == 0 &&
-            prefs.getLong(
-                LuonnotarPreferences.KEY_SUCCESS_EVIDENCE_GENERATION,
-                -1L
-            ) == serviceGeneration
-        ) {
-            confirmRecoveryIfPending(
-                prefs,
-                prefs.getLong(
-                    LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED,
-                    0L
-                )
-            )
+            } else {
+                prefs.edit()
+                    .putLong(
+                        LuonnotarPreferences.KEY_HEARTBEAT_ELAPSED,
+                        nowElapsed
+                    )
+                    .putLong(
+                        LuonnotarPreferences.KEY_LAST_TICK_ELAPSED,
+                        nowElapsed
+                    )
+                    .putLong(
+                        LuonnotarPreferences.KEY_LAST_TICK_UPTIME,
+                        nowUptime
+                    )
+                    .putLong(
+                        LuonnotarPreferences.KEY_MAX_TIMER_DRIFT,
+                        maximum
+                    )
+                    .putLong(
+                        LuonnotarPreferences.KEY_LAST_TIMER_DRIFT,
+                        drift
+                    )
+                    .remove(LuonnotarPreferences.KEY_RECOVERY_FAILURE_BOOT)
+                    .remove(
+                        LuonnotarPreferences.KEY_RECOVERY_FAILURE_BOOT_ELAPSED
+                    )
+                    .commit()
+            }
         }
-        val probeStarted = probeStartedElapsed.get()
+        if (!heartbeatCommitted || !isEpochCurrent(expectedEpoch)) return
+        synchronized(probeLifecycleLock) {
+            if (
+                isEpochCurrent(expectedEpoch) &&
+                prefs.getBoolean(
+                    LuonnotarPreferences.KEY_RECOVERY_CONFIRMATION_PENDING,
+                    false
+                ) &&
+                prefs.getInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, -1) ==
+                    HttpURLConnection.HTTP_NO_CONTENT &&
+                prefs.getInt(
+                    LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES,
+                    0
+                ) == 0 &&
+                prefs.getLong(
+                    LuonnotarPreferences.KEY_SUCCESS_EVIDENCE_GENERATION,
+                    -1L
+                ) == serviceGeneration
+            ) {
+                confirmRecoveryIfPending(
+                    prefs,
+                    prefs.getLong(
+                        LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED,
+                        0L
+                    )
+                )
+            }
+        }
+        val probeSnapshot = probeRequestGate.snapshot()
+        val probeStarted = probeSnapshot.effectiveStartedElapsed
+        val probeAge = if (probeStarted > 0L) {
+            nowElapsed - probeStarted
+        } else {
+            0L
+        }
+        val watchdogAction = ProbeWatchdogPolicy.action(
+            logicalInFlight = probeSnapshot.inFlight,
+            actualInFlight = probeSnapshot.actualInFlight,
+            ageMs = probeAge,
+            softTimeoutMs = PROBE_TIMEOUT_MS,
+            hardTimeoutMs = PROBE_HARD_TIMEOUT_MS
+        )
         if (
-            probeInFlight.get() &&
             probeStarted > 0L &&
-            nowElapsed - probeStarted >= PROBE_TIMEOUT_MS
+            watchdogAction == ProbeWatchdogAction.REBUILD_EXECUTOR
         ) {
             prefs.edit()
                 .putString(
@@ -421,16 +724,68 @@ class FcmGuardianService : Service() {
             LogManager.event(
                 this,
                 "probe_watchdog_timeout",
-                mapOf("ageMs" to (nowElapsed - probeStarted))
+                mapOf("ageMs" to probeAge)
             )
-            recoverInternalSchedulers("probe_watchdog_timeout")
+            LogManager.timeline(
+                this,
+                "https_probe_timeout",
+                mapOf("probeAgeMs" to probeAge)
+            )
+            recoverInternalSchedulers(
+                "probe_watchdog_timeout",
+                expectedEpoch
+            )
             return
         }
+        if (
+            probeStarted > 0L &&
+            watchdogAction == ProbeWatchdogAction.RESTART_KEEPER_PROCESS
+        ) {
+            restartKeeperForHardProbeTimeout(
+                probeAge,
+                probeSnapshot
+            )
+            return
+        }
+        if (
+            probeSnapshot.actualInFlight &&
+            !probeSnapshot.inFlight &&
+            probeStarted > 0L &&
+            nowElapsed - probeStarted >= PROBE_TIMEOUT_MS &&
+            (
+                lastDrainingActualDiagnosticElapsed == 0L ||
+                    nowElapsed - lastDrainingActualDiagnosticElapsed >=
+                    30_000L
+                )
+        ) {
+            lastDrainingActualDiagnosticElapsed = nowElapsed
+            disconnectActiveConnection()
+            LogManager.timeline(
+                this,
+                "https_probe_old_actual_draining",
+                mapOf(
+                    "probeAgeMs" to (nowElapsed - probeStarted),
+                    "actualOwnerGeneration" to
+                        probeSnapshot.actualOwner?.generation
+                )
+            )
+        } else if (!probeSnapshot.actualInFlight) {
+            lastDrainingActualDiagnosticElapsed = 0L
+        }
+        if (!isEpochCurrent(expectedEpoch)) return
         if (drift > 2_000 || suspendGap > 2_000) {
             LogManager.event(
                 this,
                 "timer_drift",
                 mapOf("driftMs" to drift, "cpuSuspendEstimateMs" to suspendGap)
+            )
+            LogManager.timeline(
+                this,
+                "guardian_timer_drift",
+                mapOf(
+                    "timerDriftMs" to drift,
+                    "cpuSuspendEstimateMs" to suspendGap
+                )
             )
         }
         if (nowElapsed - lastLockCheckElapsed >= LOCK_CHECK_MS) {
@@ -438,33 +793,81 @@ class FcmGuardianService : Service() {
             if (!wakeLock.isHeld) acquireWakeLock("self_check_reacquire")
             vpnEvidence = vpnMonitor.current()
             networkEvidence = networkMonitor.current()
+            persistNetworkEvidence()
             reconcileWifiLock()
             observeVpnPolicySettings()
-            persistNetworkEvidence()
         }
+        if (!isEpochCurrent(expectedEpoch)) return
+        val aggressiveMode = prefs.getBoolean(
+            LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE,
+            false
+        )
+        val interactive =
+            getSystemService(PowerManager::class.java).isInteractive
+        val keepaliveInterval = KeepaliveCadencePolicy.intervalMs(
+            aggressiveMode = aggressiveMode,
+            screenInteractive = interactive
+        )
         if (
-            VpnOnlyRoutingPolicy.maySendHttps(
-                vpnEvidence.present,
-                prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
+            KeepaliveCadencePolicy.mayProbe(
+                vpnPresent = vpnEvidence.present,
+                paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
             ) &&
-            (lastKeepaliveAttemptElapsed.get() == 0L ||
-                nowElapsed - lastKeepaliveAttemptElapsed.get() >= KEEPALIVE_INTERVAL_MS)
+            (
+                lastKeepaliveAttemptElapsed.get() == 0L ||
+                    nowElapsed - lastKeepaliveAttemptElapsed.get() >=
+                    keepaliveInterval
+                )
         ) {
-            requestRecoveryProbe("periodic_keepalive")
+            if (isEpochCurrent(expectedEpoch)) {
+                requestRecoveryProbe(
+                    if (aggressiveMode && !interactive) {
+                        "screen_off_aggressive_periodic"
+                    } else {
+                        "periodic_keepalive"
+                    }
+                )
+            }
         }
+        if (!isEpochCurrent(expectedEpoch)) return
         updateStateAndAlerts()
         updateNotification()
     }
 
-    private fun executeKeepalive(expectedEpoch: Long) {
+    private fun executeKeepalive(
+        ownerToken: ProbeOwnerToken,
+        expectedEpoch: Long,
+        reason: String
+    ) {
         if (!isActivelyEnabled() || expectedEpoch != recoveryEpoch.get()) return
         val connectivity = getSystemService(ConnectivityManager::class.java)
         val network = connectivity.activeNetwork ?: return
         val capturedHandle = network.networkHandle
         val before = connectivity.getNetworkCapabilities(network)
         if (before?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) != true) return
-        lastKeepaliveAttemptElapsed.set(SystemClock.elapsedRealtime())
         val start = SystemClock.elapsedRealtime()
+        val mayStart = synchronized(probeLifecycleLock) {
+            if (
+                !probeRequestGate.owns(ownerToken) ||
+                expectedEpoch != recoveryEpoch.get() ||
+                !isActivelyEnabled() ||
+                !probeNetworkIsCurrent(connectivity, capturedHandle)
+            ) {
+                false
+            } else {
+                lastKeepaliveAttemptElapsed.set(start)
+                true
+            }
+        }
+        if (!mayStart) return
+        LogManager.timeline(
+            this,
+            "https_probe_started",
+            mapOf(
+                "probeReason" to reason,
+                "capturedNetworkHandle" to capturedHandle
+            )
+        )
         var connection: HttpsURLConnection? = null
         try {
             if (!isActivelyEnabled() || expectedEpoch != recoveryEpoch.get()) return
@@ -477,72 +880,132 @@ class FcmGuardianService : Service() {
             connection.setRequestProperty("Cache-Control", "no-cache, no-store")
             connection.setRequestProperty("Pragma", "no-cache")
             connection.requestMethod = "GET"
-            activeConnection = connection
-            if (!isActivelyEnabled() || expectedEpoch != recoveryEpoch.get()) return
+            val prepared = synchronized(probeLifecycleLock) {
+                if (
+                    !probeRequestGate.owns(ownerToken) ||
+                    !isActivelyEnabled() ||
+                    expectedEpoch != recoveryEpoch.get() ||
+                    !probeNetworkIsCurrent(connectivity, capturedHandle)
+                ) {
+                    false
+                } else {
+                    activeConnection = connection
+                    true
+                }
+            }
+            if (!prepared) return
             connection.connect()
-            val code = connection.responseCode
-            val rtt = SystemClock.elapsedRealtime() - start
-            val prefs = LuonnotarPreferences.deviceProtected(this)
-            if (
-                !isActivelyEnabled(prefs) ||
-                expectedEpoch != recoveryEpoch.get() ||
-                !probeNetworkIsCurrent(connectivity, capturedHandle)
-            ) {
-                LogManager.event(
-                    this,
-                    "https_keepalive_cancelled",
-                    mapOf("reason" to "guardian_inactive")
+            val stillCurrent = synchronized(probeLifecycleLock) {
+                activeConnection === connection &&
+                    probeRequestGate.owns(ownerToken) &&
+                    isActivelyEnabled() &&
+                    expectedEpoch == recoveryEpoch.get() &&
+                    probeNetworkIsCurrent(connectivity, capturedHandle)
+            }
+            if (!stillCurrent) {
+                logDiscardedProbeResult(
+                    reason,
+                    capturedHandle,
+                    "stale_after_connect"
                 )
                 return
             }
+            val code = connection.responseCode
+            val rtt = SystemClock.elapsedRealtime() - start
+            val prefs = LuonnotarPreferences.deviceProtected(this)
             if (code == HttpURLConnection.HTTP_NO_CONTENT) {
                 val completedElapsed = SystemClock.elapsedRealtime()
-                prefs.edit()
-                    .putLong(
-                        LuonnotarPreferences.KEY_SUCCESS_EVIDENCE_GENERATION,
-                        serviceGeneration
+                val accepted = synchronized(probeLifecycleLock) {
+                    if (
+                        !probeRequestGate.owns(ownerToken) ||
+                        !isActivelyEnabled(prefs) ||
+                        expectedEpoch != recoveryEpoch.get() ||
+                        !isCurrentServiceInstance() ||
+                        !probeNetworkIsCurrent(connectivity, capturedHandle)
+                    ) {
+                        false
+                    } else {
+                        val committed = prefs.edit()
+                            .putLong(
+                                LuonnotarPreferences.KEY_SUCCESS_EVIDENCE_GENERATION,
+                                serviceGeneration
+                            )
+                            .putLong(
+                                LuonnotarPreferences.KEY_ATTEMPT_EVIDENCE_GENERATION,
+                                serviceGeneration
+                            )
+                            .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT, rtt)
+                            .putLong(
+                                LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED,
+                                completedElapsed
+                            )
+                            .putLong(
+                                LuonnotarPreferences.KEY_LAST_ATTEMPT_NETWORK_HANDLE,
+                                capturedHandle
+                            )
+                            .putLong(LuonnotarPreferences.KEY_LAST_SUCCESS_RTT, rtt)
+                            .putInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, code)
+                            .putLong(
+                                LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED,
+                                completedElapsed
+                            )
+                            .putLong(
+                                LuonnotarPreferences.KEY_LAST_SUCCESS_NETWORK_HANDLE,
+                                capturedHandle
+                            )
+                            .putInt(
+                                LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES,
+                                0
+                            )
+                            .putString(LuonnotarPreferences.KEY_LAST_ERROR, "")
+                            .commit()
+                        if (committed) {
+                            confirmRecoveryIfPending(prefs, completedElapsed)
+                        }
+                        committed
+                    }
+                }
+                if (!accepted) {
+                    logDiscardedProbeResult(
+                        reason,
+                        capturedHandle,
+                        "stale_owner_epoch_or_vpn"
                     )
-                    .putLong(
-                        LuonnotarPreferences.KEY_ATTEMPT_EVIDENCE_GENERATION,
-                        serviceGeneration
-                    )
-                    .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT, rtt)
-                    .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED, completedElapsed)
-                    .putLong(
-                        LuonnotarPreferences.KEY_LAST_ATTEMPT_NETWORK_HANDLE,
-                        capturedHandle
-                    )
-                    .putLong(LuonnotarPreferences.KEY_LAST_SUCCESS_RTT, rtt)
-                    .putInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, code)
-                    .putLong(LuonnotarPreferences.KEY_LAST_SUCCESS_ELAPSED, completedElapsed)
-                    .putLong(
-                        LuonnotarPreferences.KEY_LAST_SUCCESS_NETWORK_HANDLE,
-                        capturedHandle
-                    )
-                    .putInt(LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES, 0)
-                    .putString(LuonnotarPreferences.KEY_LAST_ERROR, "")
-                    .apply()
-                confirmRecoveryIfPending(prefs, completedElapsed)
+                    return
+                }
                 LogManager.event(this, "https_keepalive_ok", mapOf("rttMs" to rtt, "code" to code, "networkHandle" to capturedHandle))
+                LogManager.timeline(
+                    this,
+                    "https_probe_succeeded",
+                    mapOf(
+                        "probeReason" to reason,
+                        "rttMs" to rtt,
+                        "httpCode" to code,
+                        "capturedNetworkHandle" to capturedHandle
+                    )
+                )
             } else {
                 recordKeepaliveFailure(
                     "HTTP_$code",
                     rtt,
                     code,
                     capturedHandle,
-                    expectedEpoch
+                    expectedEpoch,
+                    reason,
+                    ownerToken
                 )
             }
         } catch (error: Exception) {
             if (
                 !isActivelyEnabled() ||
                 expectedEpoch != recoveryEpoch.get() ||
+                !probeRequestGate.owns(ownerToken) ||
                 !probeNetworkIsCurrent(connectivity, capturedHandle)
             ) {
-                LogManager.event(
-                    this,
-                    "https_keepalive_cancelled",
-                    mapOf("reason" to "guardian_inactive_or_vpn_changed")
+                logDiscardedProbeResult(
+                    reason,
+                    capturedHandle,
+                    "guardian_inactive_owner_epoch_or_vpn_changed"
                 )
             } else {
                 recordKeepaliveFailure(
@@ -550,36 +1013,110 @@ class FcmGuardianService : Service() {
                     SystemClock.elapsedRealtime() - start,
                     -1,
                     capturedHandle,
-                    expectedEpoch
+                    expectedEpoch,
+                    reason,
+                    ownerToken
                 )
             }
         } finally {
             connection?.disconnect()
-            if (activeConnection === connection) activeConnection = null
+            synchronized(probeLifecycleLock) {
+                if (activeConnection === connection) activeConnection = null
+            }
         }
+    }
+
+    private fun disconnectActiveConnection() {
+        val connection = synchronized(probeLifecycleLock) {
+            activeConnection.also { activeConnection = null }
+        }
+        connection?.disconnect()
+    }
+
+    private fun restartKeeperForHardProbeTimeout(
+        probeAgeMs: Long,
+        snapshot: ProbeGateSnapshot
+    ) {
+        if (!hardProbeRestartRequested.compareAndSet(false, true)) return
+        val now = SystemClock.elapsedRealtime()
+        val preferences = LuonnotarPreferences.deviceProtected(this)
+        val recoveryScheduled = runCatching {
+            LabAlarmScheduler.scheduleNext(this)
+        }.getOrDefault(false)
+        preferences.edit()
+            .putString(
+                LuonnotarPreferences.KEY_RECOVERY_FAILURE_SERVICE,
+                "HTTPS 探测已卡死 ${probeAgeMs / 1000} 秒；Keeper 正在受控重启"
+            )
+            .putLong(
+                LuonnotarPreferences.KEY_RECOVERY_FAILURE_SERVICE_ELAPSED,
+                now
+            )
+            .putBoolean(
+                LuonnotarPreferences.KEY_RECOVERY_CONFIRMATION_PENDING,
+                true
+            )
+            .putLong(
+                LuonnotarPreferences.KEY_RECOVERY_REQUESTED_ELAPSED,
+                now
+            )
+            .putString(
+                LuonnotarPreferences.KEY_LAST_SERVICE_EXIT,
+                "probe_hard_timeout_restart"
+            )
+            .commit()
+        LogManager.timeline(
+            this,
+            "https_probe_hard_timeout_process_restart",
+            mapOf(
+                "probeAgeMs" to probeAgeMs,
+                "logicalGeneration" to snapshot.generation,
+                "actualOwnerGeneration" to snapshot.actualOwner?.generation,
+                "recoveryAlarmScheduled" to recoveryScheduled
+            )
+        )
+        disconnectActiveConnection()
+        Process.killProcess(Process.myPid())
     }
 
     private fun requestRecoveryProbe(reason: String, force: Boolean = false) {
         if (!isActivelyEnabled()) return
+        val prefs = LuonnotarPreferences.deviceProtected(this)
+        if (
+            !KeepaliveCadencePolicy.mayProbe(
+                vpnPresent = vpnEvidence.present,
+                paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
+            )
+        ) {
+            LogManager.timeline(
+                this,
+                "https_probe_blocked",
+                mapOf("probeReason" to reason, "blockReason" to "vpn_not_present")
+            )
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val lastAttempt = lastKeepaliveAttemptElapsed.get()
         if (!force && lastAttempt != 0L && now - lastAttempt < RECOVERY_PROBE_COOLDOWN_MS) return
-        if (!probeInFlight.compareAndSet(false, true)) {
-            if (force) pendingForcedProbe.set(true)
-            return
-        }
-        if (force) pendingForcedProbe.set(false)
         val taskEpoch = recoveryEpoch.get()
-        probeStartedElapsed.set(now)
-        LuonnotarPreferences.deviceProtected(this).edit()
-            .putLong(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED, now)
-            .putLong(
-                LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED,
-                now + PROBE_TIMEOUT_MS
-            )
-            .apply()
+        val submission = synchronized(probeLifecycleLock) {
+            val token = probeRequestGate.begin(
+                generation = taskEpoch,
+                force = force,
+                startedElapsed = now
+            ) ?: return
+            val committed = persistProbeGateSnapshotLocked(prefs)
+            if (!committed) {
+                probeRequestGate.reset(token)
+                persistError("probe_begin:SharedPreferencesCommitFailed")
+                return
+            }
+            token to probeExecutor
+        }
+        val ownerToken = submission.first
+        val executorSnapshot = submission.second
         runCatching {
-            probeExecutor.execute {
+            executorSnapshot.execute {
                 try {
                     if (
                         !isActivelyEnabled() ||
@@ -587,37 +1124,174 @@ class FcmGuardianService : Service() {
                         !vpnEvidence.present
                     ) return@execute
                     LogManager.event(this, "recovery_probe_requested", mapOf("reason" to reason))
-                    executeKeepalive(taskEpoch)
-                    if (isActivelyEnabled() && taskEpoch == recoveryEpoch.get()) {
-                        updateStateAndAlerts()
-                        updateNotification()
+                    if (!probeRequestGate.beginActual(ownerToken)) {
+                        LogManager.timeline(
+                            this,
+                            "https_probe_serialized",
+                            mapOf(
+                                "probeReason" to reason,
+                                "ownerToken" to ownerToken.value,
+                                "generation" to ownerToken.generation
+                            )
+                        )
+                        return@execute
+                    }
+                    if (!PROCESS_ACTUAL_PROBE_PERMIT.tryAcquire(ownerToken)) {
+                        synchronized(probeLifecycleLock) {
+                            probeRequestGate.finishActual(ownerToken)
+                            if (!destroyed.get() && !stopping.get()) {
+                                persistProbeGateSnapshotLocked()
+                            }
+                        }
+                        LogManager.timeline(
+                            this,
+                            "https_probe_process_serialized",
+                            mapOf(
+                                "probeReason" to reason,
+                                "ownerToken" to ownerToken.value,
+                                "generation" to ownerToken.generation
+                            )
+                        )
+                        scheduleProcessProbePermitRetry()
+                        return@execute
+                    }
+                    try {
+                        executeKeepalive(ownerToken, taskEpoch, reason)
+                        if (isActivelyEnabled() && taskEpoch == recoveryEpoch.get()) {
+                            updateStateAndAlerts()
+                            updateNotification()
+                        }
+                    } finally {
+                        PROCESS_ACTUAL_PROBE_PERMIT.release(ownerToken)
+                        val actualFinish = synchronized(probeLifecycleLock) {
+                            val result =
+                                probeRequestGate.finishActual(ownerToken)
+                            if (
+                                result.accepted &&
+                                !destroyed.get() &&
+                                !stopping.get()
+                            ) {
+                                persistProbeGateSnapshotLocked()
+                            }
+                            result
+                        }
+                        if (
+                            actualFinish.accepted &&
+                            actualFinish.runPendingForced &&
+                            isActivelyEnabled()
+                        ) {
+                            requestRecoveryProbe(
+                                "serialized_actual_probe_followup",
+                                force = true
+                            )
+                        }
                     }
                 } finally {
-                    if (taskEpoch == recoveryEpoch.get()) {
-                        probeInFlight.set(false)
-                        probeStartedElapsed.set(0L)
-                        LuonnotarPreferences.deviceProtected(this).edit()
-                            .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
-                            .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
-                            .apply()
-                        if (pendingForcedProbe.getAndSet(false) && isActivelyEnabled()) {
-                            requestRecoveryProbe("pending_forced_probe", force = true)
+                    val finishResult = synchronized(probeLifecycleLock) {
+                        val result = probeRequestGate.finish(ownerToken)
+                        if (result.accepted) {
+                            val cleared = persistProbeGateSnapshotLocked()
+                            if (!cleared) {
+                                persistError(
+                                    "probe_finish:SharedPreferencesCommitFailed"
+                                )
+                            }
                         }
+                        result
+                    }
+                    if (
+                        finishResult.accepted &&
+                        finishResult.runPendingForced &&
+                        isActivelyEnabled()
+                    ) {
+                        requestRecoveryProbe(
+                            "pending_forced_probe",
+                            force = true
+                        )
                     }
                 }
             }
         }.onFailure {
-            probeInFlight.set(false)
-            probeStartedElapsed.set(0L)
-            LuonnotarPreferences.deviceProtected(this).edit()
-                .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
-                .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
-                .apply()
-            if (!destroyed.get() && !stopping.get()) {
+            val cancelled = synchronized(probeLifecycleLock) {
+                val accepted = probeRequestGate.reset(ownerToken)
+                if (accepted) {
+                    persistProbeGateSnapshotLocked()
+                }
+                accepted
+            }
+            if (
+                cancelled &&
+                !destroyed.get() &&
+                !stopping.get()
+            ) {
                 persistError("probe_submit:${it.javaClass.simpleName}:${it.message}")
                 LogManager.event(
                     this,
                     "recovery_probe_submit_failed",
+                    mapOf("error" to it.toString())
+                )
+            }
+        }
+    }
+
+    private fun persistProbeGateSnapshotLocked(
+        prefs: android.content.SharedPreferences =
+            LuonnotarPreferences.deviceProtected(this)
+    ): Boolean {
+        if (
+            serviceGeneration <= 0L ||
+            prefs.getLong(
+                LuonnotarPreferences.KEY_SERVICE_GENERATION,
+                -1L
+            ) != serviceGeneration
+        ) return false
+        val snapshot = probeRequestGate.snapshot()
+        val editor = prefs.edit()
+            .putBoolean(
+                LuonnotarPreferences.KEY_PROBE_IN_FLIGHT,
+                snapshot.anyInFlight
+            )
+        if (snapshot.anyInFlight && snapshot.effectiveStartedElapsed > 0L) {
+            editor
+                .putLong(
+                    LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED,
+                    snapshot.effectiveStartedElapsed
+                )
+                .putLong(
+                    LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED,
+                    snapshot.effectiveStartedElapsed + PROBE_TIMEOUT_MS
+                )
+        } else {
+            editor
+                .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
+                .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
+        }
+        return editor.commit()
+    }
+
+    private fun scheduleProcessProbePermitRetry() {
+        if (!processProbeRetryScheduled.compareAndSet(false, true)) return
+        val expectedEpoch = recoveryEpoch.get()
+        val executor = scheduler
+        runCatching {
+            executor.schedule({
+                processProbeRetryScheduled.set(false)
+                if (
+                    expectedEpoch == recoveryEpoch.get() &&
+                    isActivelyEnabled()
+                ) {
+                    requestRecoveryProbe(
+                        "process_probe_permit_retry",
+                        force = true
+                    )
+                }
+            }, 5L, TimeUnit.SECONDS)
+        }.onFailure {
+            processProbeRetryScheduled.set(false)
+            if (isCurrentServiceInstance()) {
+                LogManager.event(
+                    this,
+                    "process_probe_permit_retry_schedule_failed",
                     mapOf("error" to it.toString())
                 )
             }
@@ -629,39 +1303,99 @@ class FcmGuardianService : Service() {
         rtt: Long,
         code: Int,
         capturedHandle: Long,
-        expectedEpoch: Long
+        expectedEpoch: Long,
+        reason: String,
+        ownerToken: ProbeOwnerToken
     ) {
         val connectivity = getSystemService(ConnectivityManager::class.java)
-        if (
-            !isActivelyEnabled() ||
-            expectedEpoch != recoveryEpoch.get() ||
-            !probeNetworkIsCurrent(connectivity, capturedHandle)
-        ) {
-            LogManager.event(
-                this,
-                "https_keepalive_failure_discarded",
-                mapOf("reason" to "vpn_changed", "networkHandle" to capturedHandle)
+        val prefs = LuonnotarPreferences.deviceProtected(this)
+        var count = 0
+        val accepted = synchronized(probeLifecycleLock) {
+            if (
+                !probeRequestGate.owns(ownerToken) ||
+                !isActivelyEnabled(prefs) ||
+                expectedEpoch != recoveryEpoch.get() ||
+                !isCurrentServiceInstance() ||
+                !probeNetworkIsCurrent(connectivity, capturedHandle)
+            ) {
+                false
+            } else {
+                count = prefs.getInt(
+                    LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES,
+                    0
+                ) + 1
+                prefs.edit()
+                    .putLong(
+                        LuonnotarPreferences.KEY_ATTEMPT_EVIDENCE_GENERATION,
+                        serviceGeneration
+                    )
+                    .putInt(
+                        LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES,
+                        count
+                    )
+                    .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT, rtt)
+                    .putLong(
+                        LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED,
+                        SystemClock.elapsedRealtime()
+                    )
+                    .putLong(
+                        LuonnotarPreferences.KEY_LAST_ATTEMPT_NETWORK_HANDLE,
+                        capturedHandle
+                    )
+                    .putInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, code)
+                    .putString(LuonnotarPreferences.KEY_LAST_ERROR, error)
+                    .commit()
+            }
+        }
+        if (!accepted) {
+            logDiscardedProbeResult(
+                reason,
+                capturedHandle,
+                "stale_owner_epoch_or_vpn"
             )
             return
         }
-        val prefs = LuonnotarPreferences.deviceProtected(this)
-        val count = prefs.getInt(LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES, 0) + 1
-        prefs.edit()
-            .putLong(
-                LuonnotarPreferences.KEY_ATTEMPT_EVIDENCE_GENERATION,
-                serviceGeneration
-            )
-            .putInt(LuonnotarPreferences.KEY_CONSECUTIVE_FAILURES, count)
-            .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_RTT, rtt)
-            .putLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED, SystemClock.elapsedRealtime())
-            .putLong(
-                LuonnotarPreferences.KEY_LAST_ATTEMPT_NETWORK_HANDLE,
-                capturedHandle
-            )
-            .putInt(LuonnotarPreferences.KEY_LAST_HTTP_CODE, code)
-            .putString(LuonnotarPreferences.KEY_LAST_ERROR, error)
-            .apply()
         LogManager.event(this, "https_keepalive_failed", mapOf("error" to error, "rttMs" to rtt, "failures" to count))
+        LogManager.timeline(
+            this,
+            if (error.contains("Timeout", ignoreCase = true)) {
+                "https_probe_timeout"
+            } else {
+                "https_probe_failed"
+            },
+            mapOf(
+                "probeReason" to reason,
+                "error" to error,
+                "rttMs" to rtt,
+                "httpCode" to code,
+                "capturedNetworkHandle" to capturedHandle,
+                "failures" to count
+            )
+        )
+    }
+
+    private fun logDiscardedProbeResult(
+        reason: String,
+        capturedHandle: Long,
+        discardReason: String
+    ) {
+        LogManager.event(
+            this,
+            "https_keepalive_cancelled",
+            mapOf(
+                "reason" to discardReason,
+                "networkHandle" to capturedHandle
+            )
+        )
+        LogManager.timeline(
+            this,
+            "https_probe_result_discarded",
+            mapOf(
+                "probeReason" to reason,
+                "capturedNetworkHandle" to capturedHandle,
+                "discardReason" to discardReason
+            )
+        )
     }
 
     private fun updateStateAndAlerts() {
@@ -689,7 +1423,16 @@ class FcmGuardianService : Service() {
         val lastAttempt = prefs.getLong(LuonnotarPreferences.KEY_LAST_ATTEMPT_ELAPSED, 0)
         val now = SystemClock.elapsedRealtime()
         val hasAnySuccess = successEvidenceIsCurrent && lastSuccess > 0L && lastSuccess <= now
-        val recentEnough = hasAnySuccess && now - lastSuccess <= KEEPALIVE_STALE_MS
+        val currentInterval = KeepaliveCadencePolicy.intervalMs(
+            aggressiveMode = prefs.getBoolean(
+                LuonnotarPreferences.KEY_AGGRESSIVE_VIVO_MODE,
+                false
+            ),
+            screenInteractive =
+                getSystemService(PowerManager::class.java).isInteractive
+        )
+        val recentEnough =
+            hasAnySuccess && now - lastSuccess <= 2 * currentInterval
         val state = GuardianStateReducer.reduce(
             enabled = prefs.getBoolean(LuonnotarPreferences.KEY_ENABLED, false),
             paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false),
@@ -769,21 +1512,47 @@ class FcmGuardianService : Service() {
     }
 
     private fun persistNetworkEvidence() {
+        if (!isCurrentServiceInstance()) return
         val prefs = LuonnotarPreferences.deviceProtected(this)
         val previousHandle = prefs.getLong(LuonnotarPreferences.KEY_NETWORK_HANDLE, -1)
+        val previousInternetRouted = prefs.getBoolean(
+            LuonnotarPreferences.KEY_VPN_INTERNET_ROUTED,
+            false
+        )
         val editor = prefs.edit()
             .putBoolean(LuonnotarPreferences.KEY_VPN, vpnEvidence.present)
             .putBoolean(LuonnotarPreferences.KEY_VALIDATED, vpnEvidence.validated)
             .putBoolean(LuonnotarPreferences.KEY_BYPASSABLE_KNOWN, vpnEvidence.bypassable != null)
             .putBoolean(LuonnotarPreferences.KEY_BYPASSABLE, vpnEvidence.bypassable ?: true)
+            .putString(
+                LuonnotarPreferences.KEY_VPN_PROVIDER_PACKAGE,
+                vpnEvidence.providerPackage
+            )
+            .putBoolean(
+                LuonnotarPreferences.KEY_VPN_INTERNET_ROUTED,
+                vpnEvidence.internetRouted
+            )
+            .putBoolean(
+                LuonnotarPreferences.KEY_VPN_IPV4_DEFAULT_ROUTE,
+                vpnEvidence.ipv4DefaultRoute
+            )
+            .putBoolean(
+                LuonnotarPreferences.KEY_VPN_IPV6_DEFAULT_ROUTE,
+                vpnEvidence.ipv6DefaultRoute
+            )
             .putLong(LuonnotarPreferences.KEY_NETWORK_HANDLE, vpnEvidence.networkHandle)
             .putString(LuonnotarPreferences.KEY_TRANSPORT, networkEvidence.transport)
+            .putString(
+                LuonnotarPreferences.KEY_UNDERLAY_SOURCE,
+                networkEvidence.underlaySource
+            )
         if (vpnEvidence.present) {
             editor.putBoolean(LuonnotarPreferences.KEY_HAS_EVER_OBSERVED_VPN, true)
         }
         if (
             !vpnEvidence.present ||
-            (previousHandle >= 0 && previousHandle != vpnEvidence.networkHandle)
+            (previousHandle >= 0 && previousHandle != vpnEvidence.networkHandle) ||
+            previousInternetRouted != vpnEvidence.internetRouted
         ) {
             editor
                 .remove(LuonnotarPreferences.KEY_HTTP_EVIDENCE_GENERATION)
@@ -817,11 +1586,13 @@ class FcmGuardianService : Service() {
     private fun probeNetworkIsCurrent(
         connectivity: ConnectivityManager,
         capturedHandle: Long
-    ): Boolean =
-        capturedHandle >= 0L &&
-            vpnEvidence.present &&
-            vpnEvidence.networkHandle == capturedHandle &&
-            connectivity.activeNetwork?.networkHandle == capturedHandle
+    ): Boolean = VpnProbeResultPolicy.accepts(
+        capturedNetworkHandle = capturedHandle,
+        currentVpnNetworkHandle = vpnEvidence.networkHandle,
+        activeNetworkHandle =
+            connectivity.activeNetwork?.networkHandle ?: -1L,
+        vpnPresent = vpnEvidence.present
+    )
 
     private fun effectiveBypassability(
         prefs: android.content.SharedPreferences,
@@ -924,6 +1695,48 @@ class FcmGuardianService : Service() {
 
     private fun readBootId(): String = bootId
 
+    private fun restoreWifiUnderlayHistory(
+        prefs: android.content.SharedPreferences
+    ): WifiUnderlayHistory {
+        val restored = WifiUnderlayLockPolicy.restoreHistory(
+            storedHistory = WifiUnderlayHistory(
+                lastExplicitUnderlay = prefs.getString(
+                    LuonnotarPreferences.KEY_LAST_EXPLICIT_UNDERLAY,
+                    "NONE"
+                ) ?: "NONE",
+                lastWifiSeenElapsed = prefs.getLong(
+                    LuonnotarPreferences.KEY_LAST_WIFI_SEEN_ELAPSED,
+                    0L
+                ),
+                unknownSinceElapsed = prefs.getLong(
+                    LuonnotarPreferences.KEY_UNDERLAY_UNKNOWN_SINCE,
+                    0L
+                )
+            ),
+            storedBootId = prefs.getString(
+                LuonnotarPreferences.KEY_UNDERLAY_HISTORY_BOOT_ID,
+                ""
+            ),
+            runtimeBootId = prefs.getString(
+                LuonnotarPreferences.KEY_RUNTIME_BOOT_ID,
+                ""
+            ),
+            currentBootId = readBootId(),
+            nowElapsed = SystemClock.elapsedRealtime()
+        )
+        LogManager.event(
+            this,
+            "wifi_underlay_history_restored",
+            mapOf(
+                "restored" to (restored != WifiUnderlayHistory()),
+                "lastExplicitUnderlay" to restored.lastExplicitUnderlay,
+                "lastWifiSeenElapsed" to restored.lastWifiSeenElapsed,
+                "unknownSinceElapsed" to restored.unknownSinceElapsed
+            )
+        )
+        return restored
+    }
+
     private fun createLocks() {
         val power = getSystemService(PowerManager::class.java)
         wakeLock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "$packageName:guardian_cpu").apply {
@@ -939,52 +1752,194 @@ class FcmGuardianService : Service() {
     @android.annotation.SuppressLint("WakelockTimeout")
     @Synchronized
     private fun acquireWakeLock(reason: String) {
-        if (!isActivelyEnabled()) return
+        if (!isActivelyEnabled() || !isCurrentServiceInstance()) return
         if (!wakeLock.isHeld) {
             wakeLock.acquire()
             LuonnotarPreferences.deviceProtected(this).edit()
                 .putBoolean(LuonnotarPreferences.KEY_WAKE_LOCK, true).apply()
             LogManager.event(this, "wake_lock_acquired", mapOf("reason" to reason))
+            LogManager.timeline(
+                this,
+                "wake_lock_state_changed",
+                mapOf("wakeLockHeld" to true, "lockChangeReason" to reason)
+            )
         }
     }
 
     @Synchronized
     private fun reconcileWifiLock() {
+        if (!isCurrentServiceInstance()) return
         val prefs = LuonnotarPreferences.deviceProtected(this)
         val active = isActivelyEnabled(prefs)
-        if (active && networkEvidence.wifiUnderlying && !wifiLock.isHeld) {
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val decision = WifiUnderlayLockPolicy.decide(
+            guardianActive = active,
+            observedUnderlay = networkEvidence.transport,
+            nowElapsed = nowElapsed,
+            lockCurrentlyHeld = wifiLock.isHeld,
+            history = wifiUnderlayHistory
+        )
+        wifiUnderlayHistory = decision.history
+        if (decision.shouldHoldLock && !wifiLock.isHeld) {
             wifiLock.acquire()
-            LogManager.event(this, "wifi_lock_acquired")
-        } else if ((!active || !networkEvidence.wifiUnderlying) && wifiLock.isHeld) {
+            LogManager.event(
+                this,
+                "wifi_lock_acquired",
+                mapOf(
+                    "reason" to decision.reason,
+                    "underlay" to networkEvidence.transport,
+                    "underlaySource" to networkEvidence.underlaySource
+                )
+            )
+            LogManager.timeline(
+                this,
+                "wifi_lock_state_changed",
+                mapOf(
+                    "wifiLockHeld" to true,
+                    "lockChangeReason" to decision.reason,
+                    "underlaySource" to networkEvidence.underlaySource,
+                    "lastExplicitUnderlay" to
+                        wifiUnderlayHistory.lastExplicitUnderlay,
+                    "unknownDurationMs" to decision.unknownDurationMs
+                )
+            )
+        } else if (!decision.shouldHoldLock && wifiLock.isHeld) {
             wifiLock.release()
             LogManager.event(
                 this,
                 "wifi_lock_released",
-                mapOf("reason" to if (!active) "guardian_inactive" else "no_wifi_underlay")
+                mapOf(
+                    "reason" to decision.reason,
+                    "underlay" to networkEvidence.transport,
+                    "underlaySource" to networkEvidence.underlaySource
+                )
+            )
+            LogManager.timeline(
+                this,
+                "wifi_lock_state_changed",
+                mapOf(
+                    "wifiLockHeld" to false,
+                    "lockChangeReason" to decision.reason,
+                    "underlaySource" to networkEvidence.underlaySource,
+                    "lastExplicitUnderlay" to
+                        wifiUnderlayHistory.lastExplicitUnderlay,
+                    "unknownDurationMs" to decision.unknownDurationMs
+                )
             )
         }
-        prefs.edit()
-            .putBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, wifiLock.isHeld).apply()
+        if (
+            networkEvidence.transport == "UNDERLAY_UNKNOWN" &&
+            (
+                lastUnderlayDiagnosticElapsed == 0L ||
+                    nowElapsed - lastUnderlayDiagnosticElapsed >= 30_000L
+                )
+        ) {
+            lastUnderlayDiagnosticElapsed = nowElapsed
+            LogManager.event(
+                this,
+                "wifi_underlay_unknown_hysteresis",
+                mapOf(
+                    "underlaySource" to networkEvidence.underlaySource,
+                    "lastExplicitUnderlay" to
+                        wifiUnderlayHistory.lastExplicitUnderlay,
+                    "unknownDurationMs" to decision.unknownDurationMs,
+                    "wifiLockHeld" to wifiLock.isHeld,
+                    "decisionReason" to decision.reason
+                )
+            )
+        } else if (networkEvidence.transport != "UNDERLAY_UNKNOWN") {
+            lastUnderlayDiagnosticElapsed = 0L
+        }
+        val historyEditor = prefs.edit()
+            .putBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, wifiLock.isHeld)
+            .putString(
+                LuonnotarPreferences.KEY_LAST_EXPLICIT_UNDERLAY,
+                wifiUnderlayHistory.lastExplicitUnderlay
+            )
+            .putLong(
+                LuonnotarPreferences.KEY_LAST_WIFI_SEEN_ELAPSED,
+                wifiUnderlayHistory.lastWifiSeenElapsed
+            )
+            .putLong(
+                LuonnotarPreferences.KEY_UNDERLAY_UNKNOWN_SINCE,
+                wifiUnderlayHistory.unknownSinceElapsed
+            )
+        val currentBootId = readBootId()
+        if (currentBootId.isNotBlank() && currentBootId != "unavailable") {
+            historyEditor.putString(
+                LuonnotarPreferences.KEY_UNDERLAY_HISTORY_BOOT_ID,
+                currentBootId
+            )
+        } else {
+            historyEditor
+                .remove(LuonnotarPreferences.KEY_LAST_EXPLICIT_UNDERLAY)
+                .remove(LuonnotarPreferences.KEY_LAST_WIFI_SEEN_ELAPSED)
+                .remove(LuonnotarPreferences.KEY_UNDERLAY_UNKNOWN_SINCE)
+                .remove(LuonnotarPreferences.KEY_UNDERLAY_HISTORY_BOOT_ID)
+        }
+        if (!historyEditor.commit()) {
+            LogManager.event(
+                this,
+                "wifi_underlay_history_commit_failed"
+            )
+        }
     }
 
     @Synchronized
-    private fun releaseLocks() {
-        if (::wifiLock.isInitialized && wifiLock.isHeld) wifiLock.release()
-        if (::wakeLock.isInitialized && wakeLock.isHeld) wakeLock.release()
+    private fun releaseLocks(reason: String) {
+        val wifiWasHeld = ::wifiLock.isInitialized && wifiLock.isHeld
+        val wakeWasHeld = ::wakeLock.isInitialized && wakeLock.isHeld
+        if (wifiWasHeld) wifiLock.release()
+        if (wakeWasHeld) wakeLock.release()
         LuonnotarPreferences.deviceProtected(this).edit()
             .putBoolean(LuonnotarPreferences.KEY_WAKE_LOCK, false)
             .putBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, false)
             .apply()
+        if (wifiWasHeld || wakeWasHeld) {
+            LogManager.timeline(
+                this,
+                "guardian_locks_released",
+                mapOf(
+                    "wakeLockHeld" to false,
+                    "wifiLockHeld" to false,
+                    "previousWakeLockHeld" to wakeWasHeld,
+                    "previousWifiLockHeld" to wifiWasHeld,
+                    "lockChangeReason" to reason
+                )
+            )
+        }
+    }
+
+    private fun quiesceGuardianExecution(reason: String) {
+        var connectionToDisconnect: HttpsURLConnection? = null
+        synchronized(probeLifecycleLock) {
+            probeRequestGate.advanceGeneration(
+                recoveryEpoch.incrementAndGet()
+            )
+            scheduled?.cancel(true)
+            scheduled = null
+            connectionToDisconnect = activeConnection
+            activeConnection = null
+            processProbeRetryScheduled.set(false)
+            persistProbeGateSnapshotLocked()
+        }
+        connectionToDisconnect?.disconnect()
+        wifiUnderlayHistory = wifiUnderlayHistory.copy(
+            unknownSinceElapsed = 0L
+        )
+        LuonnotarPreferences.deviceProtected(this).edit()
+            .putLong(
+                LuonnotarPreferences.KEY_UNDERLAY_UNKNOWN_SINCE,
+                0L
+            )
+            .commit()
+        releaseLocks(reason)
     }
 
     private fun stopForAuthoritativeDisable() {
         stopping.set(true)
         LogManager.event(this, "guardian_self_stop_disabled_state")
-        scheduled?.cancel(false)
-        scheduled = null
-        activeConnection?.disconnect()
-        activeConnection = null
-        releaseLocks()
+        quiesceGuardianExecution("authoritative_disable")
         LabAlarmScheduler.cancel(this)
         cancelTransientNotifications()
         LuonnotarPreferences.deviceProtected(this).edit()
@@ -1004,33 +1959,55 @@ class FcmGuardianService : Service() {
     }
 
     @Synchronized
-    private fun recoverInternalSchedulers(reason: String) {
+    private fun recoverInternalSchedulers(
+        reason: String,
+        expectedEpoch: Long? = null
+    ) {
+        if (
+            expectedEpoch != null &&
+            !isEpochCurrent(expectedEpoch)
+        ) return
         if (!isActivelyEnabled()) return
         val requestedElapsed = SystemClock.elapsedRealtime()
-        LuonnotarPreferences.deviceProtected(this).edit()
-            .putBoolean(LuonnotarPreferences.KEY_RECOVERY_CONFIRMATION_PENDING, true)
-            .putLong(
-                LuonnotarPreferences.KEY_RECOVERY_REQUESTED_ELAPSED,
-                requestedElapsed
-            )
-            .apply()
-        LogManager.event(this, "guardian_internal_recovery_started", mapOf("reason" to reason))
-        scheduled?.cancel(true)
-        scheduled = null
-        activeConnection?.disconnect()
-        activeConnection = null
-        recoveryEpoch.incrementAndGet()
-        scheduler.shutdownNow()
-        probeExecutor.shutdownNow()
-        scheduler = Executors.newSingleThreadScheduledExecutor()
-        probeExecutor = Executors.newSingleThreadExecutor()
-        probeInFlight.set(false)
-        probeStartedElapsed.set(0L)
-        LuonnotarPreferences.deviceProtected(this).edit()
-            .remove(LuonnotarPreferences.KEY_PROBE_STARTED_ELAPSED)
-            .remove(LuonnotarPreferences.KEY_PROBE_DEADLINE_ELAPSED)
-            .apply()
-        pendingForcedProbe.set(true)
+        var connectionToDisconnect: HttpsURLConnection? = null
+        val oldExecutors = synchronized(probeLifecycleLock) {
+            if (
+                expectedEpoch != null &&
+                !isEpochCurrent(expectedEpoch)
+            ) return
+            LuonnotarPreferences.deviceProtected(this).edit()
+                .putBoolean(
+                    LuonnotarPreferences.KEY_RECOVERY_CONFIRMATION_PENDING,
+                    true
+                )
+                .putLong(
+                    LuonnotarPreferences.KEY_RECOVERY_REQUESTED_ELAPSED,
+                    requestedElapsed
+                )
+                .commit()
+            scheduled?.cancel(true)
+            scheduled = null
+            connectionToDisconnect = activeConnection
+            activeConnection = null
+            val oldScheduler = scheduler
+            val oldProbeExecutor = probeExecutor
+            val newEpoch = recoveryEpoch.incrementAndGet()
+            scheduler = Executors.newSingleThreadScheduledExecutor()
+            probeExecutor = Executors.newSingleThreadExecutor()
+            probeRequestGate.advanceGeneration(newEpoch)
+            lastKeepaliveAttemptElapsed.set(0L)
+            processProbeRetryScheduled.set(false)
+            persistProbeGateSnapshotLocked()
+            oldScheduler to oldProbeExecutor
+        }
+        connectionToDisconnect?.disconnect()
+        LogManager.event(
+            this,
+            "guardian_internal_recovery_started",
+            mapOf("reason" to reason)
+        )
+        oldExecutors.first.shutdownNow()
+        oldExecutors.second.shutdownNow()
         lastExpectedTickElapsed = SystemClock.elapsedRealtime()
         scheduleTicks()
         requestRecoveryProbe("internal_recovery", force = true)
@@ -1077,7 +2054,7 @@ class FcmGuardianService : Service() {
 
     private fun pauseGuardian(): Boolean {
         stopping.set(true)
-        activeConnection?.disconnect()
+        disconnectActiveConnection()
         val prefs = LuonnotarPreferences.deviceProtected(this)
         val committed = prefs.edit()
                 .putBoolean(LuonnotarPreferences.KEY_PAUSED, true)
@@ -1106,10 +2083,7 @@ class FcmGuardianService : Service() {
             return false
         }
         activeMonitoringStartedElapsed = 0L
-        scheduled?.cancel(false)
-        scheduled = null
-        activeConnection?.disconnect()
-        releaseLocks()
+        quiesceGuardianExecution("guardian_paused")
         LabAlarmScheduler.cancel(this)
         cancelTransientNotifications()
         sendBroadcast(
@@ -1137,6 +2111,7 @@ class FcmGuardianService : Service() {
             return false
         }
         activeMonitoringStartedElapsed = SystemClock.elapsedRealtime()
+        showForeground(GuardianState.STARTING, "正在恢复守护…")
         acquireWakeLock("resume")
         reconcileWifiLock()
         scheduleTicks()
@@ -1331,6 +2306,20 @@ class FcmGuardianService : Service() {
             prefs.getBoolean(LuonnotarPreferences.KEY_ENABLED, false) &&
             !prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
 
+    private fun isCurrentServiceInstance(): Boolean {
+        if (destroyed.get() || stopping.get() || serviceGeneration <= 0L) {
+            return false
+        }
+        return LuonnotarPreferences.deviceProtected(this).getLong(
+            LuonnotarPreferences.KEY_SERVICE_GENERATION,
+            -1L
+        ) == serviceGeneration
+    }
+
+    private fun isEpochCurrent(expectedEpoch: Long): Boolean =
+        expectedEpoch == recoveryEpoch.get() &&
+            isCurrentServiceInstance()
+
     private fun showAlert(title: String, body: String) {
         val notification = NotificationCompat.Builder(this, NotificationChannelManager.ALERT_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_guardian)
@@ -1373,6 +2362,7 @@ class FcmGuardianService : Service() {
     }
 
     private fun persistError(error: String) {
+        if (!isCurrentServiceInstance()) return
         LuonnotarPreferences.deviceProtected(this).edit()
             .putString(LuonnotarPreferences.KEY_LAST_ERROR, error).apply()
     }

@@ -18,6 +18,13 @@ object GuardianStatusClient {
         call(context, GuardianStatusProvider.METHOD_ACK_NOTIFICATION_PRIVACY)
             ?.getBoolean(GuardianStatusProvider.RESULT_OK) == true
 
+    fun setAggressiveMode(context: Context, enabled: Boolean): Boolean =
+        call(
+            context,
+            GuardianStatusProvider.METHOD_SET_AGGRESSIVE_MODE,
+            Bundle().apply { putBoolean(GuardianStatusProvider.EXTRA_VALUE, enabled) }
+        )?.getBoolean(GuardianStatusProvider.RESULT_OK) == true
+
     fun rejectPolicy(context: Context): Boolean =
         call(context, GuardianStatusProvider.METHOD_REJECT_POLICY)
             ?.getBoolean(GuardianStatusProvider.RESULT_OK) == true
