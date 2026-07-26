@@ -1,7 +1,5 @@
 # Luonnotar
 
-> Android VPN-path guardian and diagnostics tool. Current release identity: **YubeGreen**.  
-> Current local version: **1.5.1 (versionCode 14)** — package: `com.yubegreen.luonnotar`.
 
 Luonnotar observes and guards the VPN network path, foreground guardian service,
 system recovery chain, and local notification-arrival evidence on Android. It is
