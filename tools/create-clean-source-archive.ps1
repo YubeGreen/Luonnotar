@@ -44,13 +44,39 @@ function Test-ExcludedArchivePath {
         "exports"
     )
     foreach ($part in $parts) {
-        if ($excludedDirectories -contains $part.ToLowerInvariant()) {
+        $lowerPart = $part.ToLowerInvariant()
+        if ($excludedDirectories -contains $lowerPart) {
+            return $true
+        }
+        if (
+            $lowerPart -eq "ab-test-logs" -or
+            $lowerPart.StartsWith("manual-backup-")
+        ) {
             return $true
         }
     }
 
     $name = $parts[-1]
     $lowerName = $name.ToLowerInvariant()
+    if (
+        $lowerName -match "\.before-" -or
+        $lowerName.EndsWith(".bak") -or
+        $lowerName.EndsWith(".orig") -or
+        $lowerName.EndsWith(".rej") -or
+        $lowerName.EndsWith("~")
+    ) {
+        return $true
+    }
+    if (
+        $parts.Count -eq 1 -and
+        (
+            $lowerName -eq "assemble-result.txt" -or
+            $lowerName -match "^(test|lint|release)-.+\.txt$" -or
+            $lowerName -match "source-snapshot.*\.txt$"
+        )
+    ) {
+        return $true
+    }
     $explicitNames = @(
         "keystore.properties",
         "local.properties",

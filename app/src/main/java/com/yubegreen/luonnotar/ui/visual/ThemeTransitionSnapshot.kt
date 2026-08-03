@@ -6,9 +6,11 @@ import android.view.View
 
 object ThemeTransitionSnapshot {
     private var snapshot: Bitmap? = null
+    private var scrollY: Int? = null
 
     @Synchronized
-    fun capture(view: View) {
+    fun capture(view: View, currentScrollY: Int) {
+        scrollY = currentScrollY.coerceAtLeast(0)
         if (view.width <= 0 || view.height <= 0) return
         val next = runCatching {
             Bitmap.createBitmap(view.width, view.height, Bitmap.Config.ARGB_8888).also {
@@ -21,4 +23,7 @@ object ThemeTransitionSnapshot {
 
     @Synchronized
     fun take(): Bitmap? = snapshot.also { snapshot = null }
+
+    @Synchronized
+    fun takeScrollY(): Int? = scrollY.also { scrollY = null }
 }

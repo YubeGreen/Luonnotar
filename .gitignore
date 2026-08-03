@@ -19,3 +19,32 @@ captures/
 build-evidence/
 signing/
 tools/test-output/
+
+/AB-test-logs/
+/manual-backup-*/
+/*-result.txt
+/test-*.txt
+/lint-*.txt
+/release-*.txt
+/*source-snapshot*.txt
+*.before-*
+*.bak
+*.orig
+*.rej
+*~# Local backups and generated test artefacts
+/.guardian-patch-backup/
+/.luonnotar-patch-backups/
+/.manual-patch-backup/
+/.patch-backup/
+/AB-Test-*/
+/iqoo-probe-*/
+/Luonnotar-*-patch/
+/Luonnotar-watcher-*/
+/Luonnotar-*.zip
+/iqoo-readonly-*.zip
+/*.log
+*.bak-*
+/SOURCE-FILES-SHA256.txt
+*.backup-*
+/努昂诺塔1.0-gpt.txt
+/新建 文本文档.txt

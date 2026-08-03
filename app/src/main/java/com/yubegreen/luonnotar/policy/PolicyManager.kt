@@ -6,7 +6,7 @@ import java.security.MessageDigest
 import java.time.Instant
 
 object PolicyManager {
-    const val VERSION = "1.1"
+    const val VERSION = "1.3"
     private const val PREFS = "luonnotar_policy"
     private const val KEY_VERSION = "accepted_version"
     private const val KEY_HASH = "accepted_hash"

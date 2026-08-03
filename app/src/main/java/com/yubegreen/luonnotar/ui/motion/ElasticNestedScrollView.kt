@@ -8,8 +8,7 @@ import android.util.AttributeSet
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
-import android.view.animation.DecelerateInterpolator
-import android.view.animation.OvershootInterpolator
+import android.view.animation.PathInterpolator
 import androidx.core.widget.NestedScrollView
 import com.yubegreen.luonnotar.ui.visual.LiquidGlassPanel
 import kotlin.math.abs
@@ -25,7 +24,7 @@ class ElasticNestedScrollView @JvmOverloads constructor(
     private var elasticFrameListener: (() -> Unit)? = null
     private var activeGlassPanel: LiquidGlassPanel? = null
     private val hitRect = Rect()
-    private val maxElasticOffset by lazy { resources.displayMetrics.density * 76f }
+    private val maxElasticOffset by lazy { resources.displayMetrics.density * 28f }
     private val edgeFeatherLength = (resources.displayMetrics.density * 18f).toInt().coerceAtLeast(1)
 
     init {
@@ -117,7 +116,7 @@ class ElasticNestedScrollView @JvmOverloads constructor(
         val pullTop = atTop && (deltaY > 0f || current > 0f)
         val pullBottom = atBottom && (deltaY < 0f || current < 0f)
         if (!pullTop && !pullBottom) return
-        val resistance = 0.46f * (1f - (abs(current) / maxElasticOffset).coerceIn(0f, 0.72f))
+        val resistance = ElasticOverscrollMath.pullResistance(current, maxElasticOffset)
         var next = (current + deltaY * resistance).coerceIn(-maxElasticOffset, maxElasticOffset)
         if (pullTop) next = next.coerceAtLeast(0f)
         if (pullBottom) next = next.coerceAtMost(0f)
@@ -129,14 +128,12 @@ class ElasticNestedScrollView @JvmOverloads constructor(
         val content = getChildAt(0) ?: return
         if (content.translationY == 0f) return
         val density = resources.displayMetrics.density
-        val duration = if (flingVelocityY == 0) 300L
+        val duration = if (flingVelocityY == 0) 210L
         else ElasticOverscrollMath.settleDurationMs(flingVelocityY, density)
-        val tension = if (flingVelocityY == 0) 0.68f
-        else ElasticOverscrollMath.settleTension(flingVelocityY, density)
         content.animate()
             .translationY(0f)
             .setDuration(duration)
-            .setInterpolator(OvershootInterpolator(tension))
+            .setInterpolator(SETTLE_CURVE)
             .setUpdateListener { elasticFrameListener?.invoke() }
             .withEndAction {
                 content.animate().setUpdateListener(null)
@@ -169,7 +166,7 @@ class ElasticNestedScrollView @JvmOverloads constructor(
         content.animate()
             .translationY(target)
             .setDuration(ElasticOverscrollMath.outwardDurationMs(velocityY, resources.displayMetrics.density))
-            .setInterpolator(DecelerateInterpolator(1.8f))
+            .setInterpolator(OUTWARD_CURVE)
             .setUpdateListener { elasticFrameListener?.invoke() }
             .withEndAction { releaseElasticPull(velocityY) }
             .start()
@@ -234,4 +231,9 @@ class ElasticNestedScrollView @JvmOverloads constructor(
         activeGlassPanel?.clearTouchFeedbackFromParent()
         activeGlassPanel = null
     }
+    private companion object {
+        val OUTWARD_CURVE = PathInterpolator(0.12f, 0.72f, 0.2f, 1f)
+        val SETTLE_CURVE = PathInterpolator(0.2f, 0.82f, 0.24f, 1f)
+    }
+
 }

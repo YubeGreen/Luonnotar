@@ -2,25 +2,20 @@ package com.yubegreen.luonnotar.ui.visual
 
 import android.animation.ValueAnimator
 import android.content.Context
-import android.graphics.Rect
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.animation.DecelerateInterpolator
 import android.widget.FrameLayout
+import android.widget.TextView
 
 class LiquidGlassPanel(
     context: Context,
     private val radius: Float,
-    imageContrast: Boolean,
+    private val imageContrast: Boolean,
     private val enableBackdropBlur: Boolean = true
-) : FrameLayout(context) {
-    private val backdrop = LiquidGlassBackdropView(context)
-    private val surfaceDrawable = LiquidGlassDrawable(context, radius, imageContrast)
-    private val surface = View(context).apply {
-        importantForAccessibility = IMPORTANT_FOR_ACCESSIBILITY_NO
-        background = surfaceDrawable
-    }
+) : FrameLayout(context), GlassSceneContrastTarget {
+    private val backdrop = LiquidGlassBackdropView(context, radius, imageContrast)
     private val contentLayer = FrameLayout(context).apply {
         clipChildren = false
         clipToPadding = false
@@ -34,21 +29,20 @@ class LiquidGlassPanel(
     private var touchY = 0f
     private var touchProgress = 0f
     private var touchTarget = 0f
-    private val visibleRect = Rect()
     private val screenLocation = IntArray(2)
+    private var contrastBucket = -1
 
     init {
         clipChildren = false
         clipToPadding = false
         elevation = context.resources.displayMetrics.density * 2f
         super.addView(backdrop, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
-        super.addView(surface, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         super.addView(contentLayer, LayoutParams(LayoutParams.MATCH_PARENT, LayoutParams.MATCH_PARENT))
         internalsReady = true
     }
 
     override fun addView(child: View, index: Int, params: ViewGroup.LayoutParams) {
-        if (internalsReady && child !== backdrop && child !== surface && child !== contentLayer) {
+        if (internalsReady && child !== backdrop && child !== contentLayer) {
             contentLayer.addView(child, index.coerceAtMost(contentLayer.childCount), params)
         } else {
             super.addView(child, index, params)
@@ -63,7 +57,6 @@ class LiquidGlassPanel(
         val exactWidth = MeasureSpec.makeMeasureSpec(measuredWidth, MeasureSpec.EXACTLY)
         val exactHeight = MeasureSpec.makeMeasureSpec(measuredHeight, MeasureSpec.EXACTLY)
         backdrop.measure(exactWidth, exactHeight)
-        surface.measure(exactWidth, exactHeight)
         contentLayer.measure(exactWidth, exactHeight)
     }
 
@@ -76,25 +69,18 @@ class LiquidGlassPanel(
         val background = visualBackground ?: return
         if (!enableBackdropBlur) {
             backdrop.release()
-            surfaceDrawable.setBackdropAvailable(false)
             return
         }
-        if (!getGlobalVisibleRect(visibleRect) || visibleRect.isEmpty) {
-            backdrop.release()
-            surfaceDrawable.setBackdropAvailable(false)
-            return
-        }
-        val available = background.bindBackdrop(backdrop, this, radius)
-        surfaceDrawable.setBackdropAvailable(available)
+        backdrop.bind(background, this)
     }
 
     fun invalidateBackdropPosition() {
         if (!enableBackdropBlur) return
-        if (backdrop.visibility == VISIBLE) backdrop.invalidate()
+        visualBackground?.invalidateSurfacePositions()
     }
 
     fun setGood(good: Boolean) {
-        surfaceDrawable.setGood(good)
+        backdrop.setGood(good)
     }
 
     fun setTouchFeedbackEnabled(enabled: Boolean) {
@@ -189,7 +175,7 @@ class LiquidGlassPanel(
         animate().cancel()
         scaleX = 1f
         scaleY = 1f
-        surfaceDrawable.setTouchHighlight(0f, 0f, 0f)
+        backdrop.setTouchInteraction(0f, 0f, 0f)
     }
 
     private fun beginTouchFeedback(x: Float, y: Float) {
@@ -218,7 +204,7 @@ class LiquidGlassPanel(
         } else if (touchTarget != TOUCH_TARGET) {
             animateTouchHighlight(TOUCH_TARGET, TOUCH_ENTER_MS)
         } else {
-            surfaceDrawable.setTouchHighlight(touchX, touchY, touchProgress)
+            backdrop.setTouchInteraction(touchX, touchY, touchProgress)
         }
     }
 
@@ -228,7 +214,7 @@ class LiquidGlassPanel(
         if (touchTarget != TOUCH_TARGET) {
             showTouchHighlight(x, y)
         } else {
-            surfaceDrawable.setTouchHighlight(touchX, touchY, touchProgress)
+            backdrop.setTouchInteraction(touchX, touchY, touchProgress)
         }
     }
 
@@ -254,7 +240,44 @@ class LiquidGlassPanel(
 
     private fun setTouchProgress(progress: Float) {
         touchProgress = progress.coerceIn(0f, 1f)
-        surfaceDrawable.setTouchHighlight(touchX, touchY, touchProgress)
+        backdrop.setTouchInteraction(touchX, touchY, touchProgress)
+    }
+
+    override fun onGlassSceneLuminanceChanged(luminance: Float) {
+        val bucket = when {
+            luminance < 0.34f -> 0
+            luminance > 0.72f -> 2
+            else -> 1
+        }
+        if (bucket == contrastBucket) return
+        contrastBucket = bucket
+        val shadowColor = if (imageContrast) {
+            0xA8000000.toInt()
+        } else if (luminance > 0.52f) {
+            0x52000000
+        } else {
+            0x42FFFFFF
+        }
+        applyTextContrast(contentLayer, shadowColor, imageContrast)
+    }
+
+    override fun onAttachedToWindow() {
+        super.onAttachedToWindow()
+        if (visualBackground != null) post(::refreshBackdrop)
+    }
+
+    private fun applyTextContrast(view: View, shadowColor: Int, strong: Boolean) {
+        when (view) {
+            is TextView -> view.setShadowLayer(
+                context.resources.displayMetrics.density * if (strong) 1.05f else 0.72f,
+                0f,
+                context.resources.displayMetrics.density * if (strong) 0.45f else 0.35f,
+                shadowColor
+            )
+            is ViewGroup -> for (index in 0 until view.childCount) {
+                applyTextContrast(view.getChildAt(index), shadowColor, strong)
+            }
+        }
     }
 
     private companion object {

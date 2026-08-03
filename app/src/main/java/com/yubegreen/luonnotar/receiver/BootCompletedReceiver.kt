@@ -8,7 +8,6 @@ import androidx.core.content.ContextCompat
 import com.yubegreen.luonnotar.service.FcmGuardianService
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
-import com.yubegreen.luonnotar.worker.FcmRecoveryWorker
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -180,9 +179,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
                     )
                     if (!enabled || paused) {
                         if (action != Intent.ACTION_LOCKED_BOOT_COMPLETED) {
-                            runCatching {
-                                FcmRecoveryWorker.cancelPeriodic(appContext)
-                            }
+                            sendMainProcessMaintenance(
+                                appContext,
+                                GuardianCleanupReceiver.ACTION_CLEANUP_DISABLED,
+                                action
+                            )
                         }
                         return@execute
                     }
@@ -193,18 +194,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
                             mapOf("error" to serviceStartError.toString())
                         )
                         if (action != Intent.ACTION_LOCKED_BOOT_COMPLETED) {
-                            runCatching {
-                                FcmRecoveryWorker.enqueue(
-                                    appContext,
-                                    "boot_fallback"
-                                )
-                            }.onFailure {
-                                LogManager.event(
-                                    appContext,
-                                    "boot_work_fallback_failed",
-                                    mapOf("error" to it.toString())
-                                )
-                            }
+                            sendMainProcessMaintenance(
+                                appContext,
+                                GuardianCleanupReceiver.ACTION_ENQUEUE_RECOVERY,
+                                "boot_fallback"
+                            )
                         }
                     }
                     if (!decision.deduplicated) {
@@ -223,15 +217,11 @@ class BootCompletedReceiver : BroadcastReceiver() {
                         }
                     }
                     if (BootRecoveryDedupPolicy.requiresUnlockedMaintenance(action)) {
-                        runCatching {
-                            FcmRecoveryWorker.ensurePeriodic(appContext)
-                        }.onFailure {
-                            LogManager.event(
-                                appContext,
-                                "periodic_recovery_schedule_failed",
-                                mapOf("error" to it.toString())
-                            )
-                        }
+                        sendMainProcessMaintenance(
+                            appContext,
+                            GuardianCleanupReceiver.ACTION_ENSURE_ENABLED,
+                            action
+                        )
                     }
                     LogManager.event(
                         appContext,
@@ -263,6 +253,46 @@ class BootCompletedReceiver : BroadcastReceiver() {
                 timeout.cancel(false)
                 pendingResult.finish()
             }
+        }
+    }
+
+    private fun sendMainProcessMaintenance(
+        context: Context,
+        action: String,
+        reason: String
+    ) {
+        runCatching {
+            context.sendBroadcast(
+                Intent(context, GuardianCleanupReceiver::class.java)
+                    .setAction(action)
+                    .putExtra(GuardianCleanupReceiver.EXTRA_REASON, reason)
+                    .putExtra(
+                        GuardianCleanupReceiver.EXTRA_EXPECTED_GENERATION,
+                        LuonnotarPreferences.deviceProtected(context)
+                            .getLong(
+                                LuonnotarPreferences.KEY_SERVICE_GENERATION,
+                                -1L
+                            )
+                    )
+                    .putExtra(
+                        GuardianCleanupReceiver.EXTRA_EXPECTED_BOOT_ID,
+                        LuonnotarPreferences.deviceProtected(context)
+                            .getString(
+                                LuonnotarPreferences.KEY_RUNTIME_BOOT_ID,
+                                ""
+                            )
+                    )
+            )
+        }.onFailure {
+            LogManager.event(
+                context,
+                "main_process_recovery_dispatch_failed",
+                mapOf(
+                    "action" to action,
+                    "reason" to reason,
+                    "error" to it.toString()
+                )
+            )
         }
     }
 

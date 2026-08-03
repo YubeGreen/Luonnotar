@@ -46,6 +46,8 @@ class FcmRecoveryWorker(
             heartbeatElapsed = heartbeat,
             servicePid = status.getInt(LuonnotarPreferences.KEY_PID, 0),
             keeperProcessPid = status.getInt(LuonnotarPreferences.KEY_KEEPER_PROCESS_PID, 0),
+            nowUptime = SystemClock.uptimeMillis(),
+            lastTickUptime = status.getLong(LuonnotarPreferences.KEY_LAST_TICK_UPTIME, 0L),
             serviceStartedElapsed =
                 status.getLong(LuonnotarPreferences.KEY_SERVICE_STARTED_ELAPSED, 0)
         )
@@ -92,7 +94,7 @@ class FcmRecoveryWorker(
                 .build()
             WorkManager.getInstance(context).enqueueUniqueWork(
                 UNIQUE_WORK_NAME,
-                ExistingWorkPolicy.REPLACE,
+                ExistingWorkPolicy.KEEP,
                 request
             )
         }

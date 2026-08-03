@@ -2,16 +2,69 @@ package com.yubegreen.luonnotar.service
 
 import java.util.concurrent.atomic.AtomicReference
 
+data class ActualProbeLease(
+    val owner: ProbeOwnerToken,
+    val acquiredElapsed: Long,
+    val networkHandle: Long,
+    val stage: String
+)
+
+data class ActualProbePermitSnapshot(
+    val owner: ProbeOwnerToken?,
+    val acquiredElapsed: Long,
+    val networkHandle: Long,
+    val stage: String = ""
+) {
+    val isHeld: Boolean
+        get() = owner != null
+}
+
 class ActualProbePermit {
-    private val owner = AtomicReference<ProbeOwnerToken?>(null)
+    private val lease = AtomicReference<ActualProbeLease?>(null)
 
-    fun tryAcquire(token: ProbeOwnerToken): Boolean =
-        owner.compareAndSet(null, token)
+    fun tryAcquire(
+        token: ProbeOwnerToken,
+        acquiredElapsed: Long,
+        networkHandle: Long,
+        stage: String = ""
+    ): Boolean =
+        lease.compareAndSet(
+            null,
+            ActualProbeLease(token, acquiredElapsed, networkHandle, stage)
+        )
 
-    fun release(token: ProbeOwnerToken): Boolean =
-        owner.compareAndSet(token, null)
+    fun updateStage(token: ProbeOwnerToken, stage: String): Boolean {
+        while (true) {
+            val current = lease.get() ?: return false
+            if (current.owner !== token) return false
+            if (
+                lease.compareAndSet(
+                    current,
+                    current.copy(stage = stage)
+                )
+            ) return true
+        }
+    }
 
-    fun isHeld(): Boolean = owner.get() != null
+    fun release(token: ProbeOwnerToken): Boolean {
+        while (true) {
+            val current = lease.get() ?: return false
+            if (current.owner !== token) return false
+            if (lease.compareAndSet(current, null)) return true
+        }
+    }
+
+    fun snapshot(): ActualProbePermitSnapshot {
+        val current = lease.get()
+        return ActualProbePermitSnapshot(
+            owner = current?.owner,
+            acquiredElapsed = current?.acquiredElapsed ?: 0L,
+            networkHandle = current?.networkHandle ?: -1L,
+            stage = current?.stage.orEmpty()
+        )
+    }
+
+    fun isHeld(): Boolean = lease.get() != null
 }
 
 class ProbeOwnerToken internal constructor(

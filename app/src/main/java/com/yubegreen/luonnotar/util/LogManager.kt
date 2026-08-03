@@ -174,9 +174,10 @@ object LogManager {
                     zip.putNextEntry(ZipEntry("diagnostic-manifest.json"))
                     zip.write(
                         JSONObject().apply {
-                            put("formatVersion", 2)
+                            put("formatVersion", 3)
                             put("timelineIncluded", true)
                             put("configurationIncluded", true)
+                            put("experimentSessionIncluded", true)
                             put("adbAdviceIncluded", true)
                             put(
                                 "excluded",
@@ -253,10 +254,86 @@ object LogManager {
             val status = guardianSnapshot ?: readStatusSnapshot(context)
             put("wakeLockHeld", status?.getBoolean(LuonnotarPreferences.KEY_WAKE_LOCK, false))
             put("wifiLockHeld", status?.getBoolean(LuonnotarPreferences.KEY_WIFI_LOCK, false))
+            put(
+                "screenOffCpuGuardEnabled",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_EXPERIMENT_SCREEN_OFF_CPU_GUARD,
+                    false
+                ) == true
+            )
+            put(
+                "continuousWakeLockHeld",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_CONTINUOUS_WAKE_LOCK,
+                    false
+                ) == true
+            )
+            put(
+                "gmsPreventivePulseCount",
+                status?.getInt(
+                    LuonnotarPreferences.KEY_GMS_PREVENTIVE_PULSE_COUNT,
+                    0
+                ) ?: 0
+            )
+            put(
+                "gmsPreventivePulseLastAttemptElapsed",
+                status?.getLong(
+                    LuonnotarPreferences
+                        .KEY_GMS_PREVENTIVE_PULSE_LAST_ATTEMPT_ELAPSED,
+                    0L
+                ) ?: 0L
+            )
+            put(
+                "gmsPreventivePulseLastReason",
+                status?.getString(
+                    LuonnotarPreferences.KEY_GMS_PREVENTIVE_PULSE_LAST_REASON,
+                    ""
+                ) ?: ""
+            )
             put("processSequence", status?.getLong(LuonnotarPreferences.KEY_PROCESS_SEQUENCE, 0))
             put("guardianEnabled", status?.getBoolean(LuonnotarPreferences.KEY_ENABLED, false))
             put("guardianPaused", status?.getBoolean(LuonnotarPreferences.KEY_PAUSED, false))
             put("guardianState", status?.getString(LuonnotarPreferences.KEY_STATE, "UNKNOWN"))
+            put(
+                "experimentSessionActive",
+                status?.getBoolean(
+                    LuonnotarPreferences.KEY_EXPERIMENT_SESSION_ACTIVE,
+                    false
+                ) == true
+            )
+            put(
+                "experimentSessionId",
+                status?.getString(
+                    LuonnotarPreferences.KEY_EXPERIMENT_SESSION_ID,
+                    ""
+                ).orEmpty()
+            )
+            put(
+                "experimentSessionName",
+                status?.getString(
+                    LuonnotarPreferences.KEY_EXPERIMENT_SESSION_NAME,
+                    ""
+                ).orEmpty()
+            )
+            val experimentStartedElapsed = status?.getLong(
+                LuonnotarPreferences.KEY_EXPERIMENT_SESSION_STARTED_ELAPSED,
+                0L
+            ) ?: 0L
+            put(
+                "experimentSessionAgeMs",
+                if (
+                    status?.getBoolean(
+                        LuonnotarPreferences.KEY_EXPERIMENT_SESSION_ACTIVE,
+                        false
+                    ) == true &&
+                    experimentStartedElapsed > 0L &&
+                    experimentStartedElapsed <= SystemClock.elapsedRealtime()
+                ) {
+                    SystemClock.elapsedRealtime() - experimentStartedElapsed
+                } else {
+                    -1L
+                }
+            )
             put("guardianPid", status?.getInt(LuonnotarPreferences.KEY_PID, 0))
             put("heartbeatElapsed", status?.getLong(LuonnotarPreferences.KEY_HEARTBEAT_ELAPSED, 0))
             put("defaultVpn", status?.getBoolean(LuonnotarPreferences.KEY_VPN, false))
@@ -273,6 +350,69 @@ object LogManager {
                 status?.getBoolean(
                     LuonnotarPreferences.KEY_VPN_INTERNET_ROUTED,
                     false
+                )
+            )
+            put(
+                "vpnRouteState",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_ROUTE_STATE,
+                    "UNKNOWN"
+                )
+            )
+            put(
+                "vpnSessionFingerprint",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_SESSION_FINGERPRINT,
+                    ""
+                )
+            )
+            put(
+                "vpnSessionGeneration",
+                status?.getLong(
+                    LuonnotarPreferences.KEY_VPN_SESSION_GENERATION,
+                    0L
+                )
+            )
+            put(
+                "vpnSessionHealth",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_SESSION_HEALTH,
+                    "UNKNOWN"
+                )
+            )
+            put(
+                "vpnDnsHealth",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_DNS_HEALTH,
+                    "UNKNOWN"
+                )
+            )
+            put(
+                "vpnHttpsHealth",
+                status?.getString(
+                    LuonnotarPreferences.KEY_VPN_HTTPS_HEALTH,
+                    "UNKNOWN"
+                )
+            )
+            put(
+                "fcmHealth",
+                status?.getString(
+                    LuonnotarPreferences.KEY_FCM_HEALTH,
+                    "UNKNOWN_NOT_MEASURED"
+                )
+            )
+            put(
+                "mtalkResultSummary",
+                status?.getString(
+                    LuonnotarPreferences.KEY_MTALK_RESULT_SUMMARY,
+                    ""
+                )
+            )
+            put(
+                "targetUidHealthSnapshot",
+                status?.getString(
+                    LuonnotarPreferences.KEY_TARGET_UID_HEALTH_SNAPSHOT,
+                    ""
                 )
             )
             put(
@@ -343,6 +483,51 @@ object LogManager {
                     false
                 )
             )
+            put("controlledPushTest", JSONObject().apply {
+                put(
+                    "sequence",
+                    status?.getLong(
+                        LuonnotarPreferences.KEY_PUSH_TEST_LAST_SEQUENCE,
+                        0L
+                    )
+                )
+                put(
+                    "senderEpochMs",
+                    status?.getLong(
+                        LuonnotarPreferences
+                            .KEY_PUSH_TEST_LAST_SENDER_EPOCH_MS,
+                        0L
+                    )
+                )
+                put(
+                    "seenWall",
+                    status?.getLong(
+                        LuonnotarPreferences.KEY_PUSH_TEST_LAST_SEEN_WALL,
+                        0L
+                    )
+                )
+                put(
+                    "seenElapsed",
+                    status?.getLong(
+                        LuonnotarPreferences.KEY_PUSH_TEST_LAST_SEEN_ELAPSED,
+                        0L
+                    )
+                )
+                put(
+                    "approximateDelayMs",
+                    status?.getLong(
+                        LuonnotarPreferences.KEY_PUSH_TEST_LAST_DELAY_MS,
+                        -1L
+                    )
+                )
+                put(
+                    "packageName",
+                    status?.getString(
+                        LuonnotarPreferences.KEY_PUSH_TEST_LAST_PACKAGE,
+                        ""
+                    )
+                )
+            })
             put(
                 "lastTimerDriftMs",
                 status?.getLong(

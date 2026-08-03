@@ -42,4 +42,14 @@ class ElasticOverscrollMathTest {
                 abs(ElasticOverscrollMath.flingOffset(initial, 3f, 264f))
         )
     }
+    @Test
+    fun `pull becomes progressively stiffer near the limit`() {
+        val atRest = ElasticOverscrollMath.pullResistance(0f, 200f)
+        val halfway = ElasticOverscrollMath.pullResistance(100f, 200f)
+        val nearLimit = ElasticOverscrollMath.pullResistance(190f, 200f)
+        assertTrue(atRest > halfway)
+        assertTrue(halfway > nearLimit)
+        assertTrue(nearLimit > 0f)
+    }
+
 }

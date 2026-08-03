@@ -78,4 +78,61 @@ class VpnDefaultRoutePolicyTest {
         assertFalse(evidence.ipv4DefaultRoute)
         assertFalse(evidence.ipv6DefaultRoute)
     }
+
+    @Test
+    fun transientUnknownPreservesSameHandleRouteEvidence() {
+        val routed = VpnRouteObservation(
+            VpnRouteState.ROUTED,
+            ipv4DefaultRoute = true,
+            ipv6DefaultRoute = true
+        )
+        val decision = VpnRouteStabilityPolicy.decide(
+            previous = routed,
+            observed = VpnRouteObservation(
+                VpnRouteState.UNKNOWN,
+                false,
+                false
+            ),
+            sameVpnHandle = true,
+            nowElapsed = 10_000L,
+            routeLossCandidateElapsed = 0L
+        )
+
+        assertTrue(decision.evidence == routed)
+        assertFalse(decision.scheduleRefresh)
+    }
+
+    @Test
+    fun explicitRouteLossRequiresStableDebounce() {
+        val routed = VpnRouteObservation(
+            VpnRouteState.ROUTED,
+            ipv4DefaultRoute = true,
+            ipv6DefaultRoute = false
+        )
+        val lost = VpnRouteObservation(
+            VpnRouteState.NOT_ROUTED,
+            ipv4DefaultRoute = false,
+            ipv6DefaultRoute = false
+        )
+        val first = VpnRouteStabilityPolicy.decide(
+            routed,
+            lost,
+            sameVpnHandle = true,
+            nowElapsed = 20_000L,
+            routeLossCandidateElapsed = 0L
+        )
+        val confirmed = VpnRouteStabilityPolicy.decide(
+            routed,
+            lost,
+            sameVpnHandle = true,
+            nowElapsed =
+                20_000L + VpnRouteStabilityPolicy.ROUTE_LOSS_DEBOUNCE_MS,
+            routeLossCandidateElapsed = first.routeLossCandidateElapsed
+        )
+
+        assertTrue(first.evidence == routed)
+        assertTrue(first.scheduleRefresh)
+        assertTrue(confirmed.evidence == lost)
+        assertFalse(confirmed.scheduleRefresh)
+    }
 }

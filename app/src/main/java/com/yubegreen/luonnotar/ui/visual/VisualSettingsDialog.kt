@@ -3,6 +3,7 @@ package com.yubegreen.luonnotar.ui.visual
 import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
+import android.graphics.Typeface
 import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
@@ -19,15 +20,14 @@ class VisualSettingsDialog(
     private val tabletDialog = AdaptiveLayout.isTablet(context)
     private val dark = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
         Configuration.UI_MODE_NIGHT_YES
-    private val imageContrast = !dark && current.background != BackgroundPreference.SOLID
-    private val effectiveDark = dark || imageContrast
-    private val foreground = if (effectiveDark) 0xFFF7F7F9.toInt() else 0xFF142128.toInt()
-    private val secondary = if (effectiveDark) 0xFFE8E8ED.toInt() else 0xFF465B66.toInt()
+    private val foreground = palette.foreground
+    private val secondary = palette.secondary
     private val themeButtons = linkedMapOf<ThemePreference, GuardianActionButton>()
     private val backgroundButtons = linkedMapOf<BackgroundPreference, GuardianActionButton>()
     private val scaleButtons = linkedMapOf<BackgroundScale, GuardianActionButton>()
     private lateinit var customHint: TextView
-    private var selectedTheme = current.theme
+    private var selectedTheme =
+        if (current.background == BackgroundPreference.SHAO_OU) ThemePreference.DARK else current.theme
     private var selectedBackground = current.background
     private var selectedScale = current.backgroundScale
 
@@ -61,7 +61,10 @@ class VisualSettingsDialog(
             backgroundButtons
         ) {
             selectedBackground = it
-            if (it == BackgroundPreference.SHAO_OU) selectedScale = BackgroundScale.FILL_CROP
+            if (it == BackgroundPreference.SHAO_OU) {
+                selectedTheme = ThemePreference.DARK
+                selectedScale = BackgroundScale.FILL_CROP
+            }
             refreshSelection()
             if (it == BackgroundPreference.CUSTOM_IMAGE) {
                 val theme = selectedTheme
@@ -107,6 +110,7 @@ class VisualSettingsDialog(
         orientation = LinearLayout.HORIZONTAL
         options.forEachIndexed { index, (value, title) ->
             val option = optionButton(title).apply { setOnClickListener { onSelect(value) } }
+            option.tag = title
             target[value] = option
             addView(option, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 if (index > 0) marginStart = dp(4)
@@ -116,7 +120,16 @@ class VisualSettingsDialog(
     }
 
     private fun refreshSelection() {
-        themeButtons.forEach { (value, button) -> styleButton(button, value == selectedTheme) }
+        val themeEnabled = selectedBackground != BackgroundPreference.SHAO_OU
+        themeButtons.forEach { (value, button) ->
+            styleButton(button, value == selectedTheme)
+            button.isEnabled = themeEnabled
+            if (!themeEnabled) {
+                button.contentDescription =
+                    if (value == ThemePreference.DARK) "深色，已选择，少偶背景固定主题"
+                    else "${button.tag}，少偶背景下不可用"
+            }
+        }
         backgroundButtons.forEach { (value, button) -> styleButton(button, value == selectedBackground) }
         val scaleEnabled = selectedBackground == BackgroundPreference.CUSTOM_IMAGE
         scaleButtons.forEach { (value, button) ->
@@ -133,21 +146,18 @@ class VisualSettingsDialog(
     }
 
     private fun styleButton(button: GuardianActionButton, selected: Boolean) {
+        val baseLabel = button.tag?.toString() ?: button.text.toString().removePrefix("✓ ")
         button.isSelected = selected
         button.contentDescription =
-            "${button.text}，${if (selected) "已选择" else "未选择"}"
+            "$baseLabel，${if (selected) "已选择" else "未选择"}"
+        button.text = if (selected) "✓ $baseLabel" else baseLabel
+        button.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         button.setTextColor(
             if (selected) {
-                if (effectiveDark) Color.WHITE else 0xFF142128.toInt()
+                if (dark || palette.imageContrast) Color.WHITE else 0xFF006E78.toInt()
             } else foreground
         )
-        button.background = LiquidGlassDrawable(
-            context,
-            dp(15).toFloat(),
-            imageContrast
-        ).also { drawable ->
-            drawable.setSelected(selected)
-        }
+        (button.background as? LiquidGlassDrawable)?.setSelected(selected)
         button.isSelected = selected
     }
 
@@ -164,6 +174,14 @@ class VisualSettingsDialog(
             else this@VisualSettingsDialog.secondary
         )
         if (bold) typeface = android.graphics.Typeface.DEFAULT_BOLD
+        if (palette.imageContrast) {
+            setShadowLayer(
+                resources.displayMetrics.density * 1.05f,
+                0f,
+                resources.displayMetrics.density * 0.45f,
+                0xA8000000.toInt()
+            )
+        }
     }
 
     private fun optionButton(text: String) = GuardianActionButton(context).apply {
@@ -173,6 +191,12 @@ class VisualSettingsDialog(
         minHeight = dp(if (tabletDialog) 56 else 46)
         setPadding(dp(8), 0, dp(8), 0)
         clipToOutline = false
+        background = LiquidGlassDrawable(
+            context,
+            dp(15).toFloat(),
+            palette.imageContrast
+        )
+        visualBackground?.let(::bindGlassBackground)
         styleButton(this, false)
     }
 
@@ -180,5 +204,4 @@ class VisualSettingsDialog(
         LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
             if (first) marginEnd = dp(4) else marginStart = dp(4)
         }
-
 }

@@ -45,4 +45,64 @@ class ProbeWatchdogPolicyTest {
             )
         )
     }
+
+    @Test
+    fun hardRestartRevalidationRejectsLateOwnerAndVpnChanges() {
+        val expectedOwner = ProbeOwnerToken(1L, 3L)
+        val expected = ActualProbePermitSnapshot(
+            expectedOwner,
+            acquiredElapsed = 1_000L,
+            networkHandle = 700L,
+            stage = "HTTPS"
+        )
+        assertEquals(
+            true,
+            ProbeHardRestartPolicy.leaseStillEligible(
+                expected,
+                expected,
+                nowElapsed = 46_000L,
+                hardTimeoutMs = 45_000L,
+                expectedVpnHandle = 700L,
+                currentVpnHandle = 700L
+            )
+        )
+        assertEquals(
+            false,
+            ProbeHardRestartPolicy.leaseStillEligible(
+                expected,
+                ActualProbePermitSnapshot(
+                    ProbeOwnerToken(2L, 4L),
+                    2_000L,
+                    700L,
+                    "HTTPS"
+                ),
+                nowElapsed = 50_000L,
+                hardTimeoutMs = 45_000L,
+                expectedVpnHandle = 700L,
+                currentVpnHandle = 700L
+            )
+        )
+        assertEquals(
+            false,
+            ProbeHardRestartPolicy.leaseStillEligible(
+                expected.copy(stage = "MTALK"),
+                expected.copy(stage = "MTALK"),
+                nowElapsed = 50_000L,
+                hardTimeoutMs = 45_000L,
+                expectedVpnHandle = 700L,
+                currentVpnHandle = 700L
+            )
+        )
+        assertEquals(
+            false,
+            ProbeHardRestartPolicy.leaseStillEligible(
+                expected,
+                expected,
+                nowElapsed = 50_000L,
+                hardTimeoutMs = 45_000L,
+                expectedVpnHandle = 700L,
+                currentVpnHandle = 701L
+            )
+        )
+    }
 }

@@ -7,7 +7,6 @@ import android.content.Context
 import android.content.res.Configuration
 import android.graphics.Color
 import android.graphics.drawable.ColorDrawable
-import android.os.Build
 import android.view.Gravity
 import android.view.MotionEvent
 import android.view.VelocityTracker
@@ -27,7 +26,7 @@ import kotlin.math.abs
 open class GlassSheetDialog(
     context: Context,
     protected val preferences: VisualPreferences,
-    private val visualBackground: VisualBackgroundView? = null,
+    protected val visualBackground: VisualBackgroundView? = null,
     private val anchorView: View? = null
 ) : Dialog(context) {
     private val tablet = AdaptiveLayout.isTablet(context)
@@ -60,7 +59,6 @@ open class GlassSheetDialog(
     private val dragSlop = ViewConfiguration.get(context).scaledTouchSlop
     private var backdropProgress = 1f
     private var backdropAnimator: ValueAnimator? = null
-    private var appliedBlurRadius = -1
     private var appliedDimAmount = -1f
     private var backdropUpdatePosted = false
     private var returnTranslationX = 0f
@@ -107,6 +105,7 @@ open class GlassSheetDialog(
         textSize = if (tablet) 25f else 20f
         setTextColor(palette.foreground)
         typeface = android.graphics.Typeface.DEFAULT_BOLD
+        applyImageShadowIfNeeded()
     }
 
     protected fun body(text: CharSequence, monospace: Boolean = false) = TextView(context).apply {
@@ -116,12 +115,14 @@ open class GlassSheetDialog(
         setLineSpacing(0f, if (tablet) 1.24f else 1.18f)
         if (monospace) typeface = android.graphics.Typeface.MONOSPACE
         setTextIsSelectable(monospace)
+        applyImageShadowIfNeeded()
     }
 
     protected fun caption(text: CharSequence) = TextView(context).apply {
         this.text = text
         textSize = if (tablet) 15.5f else 13f
         setTextColor(palette.secondary)
+        applyImageShadowIfNeeded()
     }
 
     protected fun button(
@@ -141,6 +142,7 @@ open class GlassSheetDialog(
                 else -> palette.foreground
             }
         )
+        applyImageShadowIfNeeded()
         background = LiquidGlassDrawable(
             context,
             dp(15).toFloat(),
@@ -148,6 +150,17 @@ open class GlassSheetDialog(
         ).also { drawable ->
             drawable.setGood(emphasized)
         }
+        this@GlassSheetDialog.visualBackground?.let(::bindGlassBackground)
+    }
+
+    private fun TextView.applyImageShadowIfNeeded() {
+        if (!palette.imageContrast) return
+        setShadowLayer(
+            context.resources.displayMetrics.density * 1.05f,
+            0f,
+            context.resources.displayMetrics.density * 0.45f,
+            0xA8000000.toInt()
+        )
     }
 
     protected fun dismissThen(action: () -> Unit) {
@@ -174,9 +187,6 @@ open class GlassSheetDialog(
             }
             setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE)
             decorView.setPadding(dp(12), 0, dp(12), dp(12))
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                addFlags(WindowManager.LayoutParams.FLAG_BLUR_BEHIND)
-            }
         }
         setBackdropProgress(1f, immediate = true)
         super.show()
@@ -198,6 +208,16 @@ open class GlassSheetDialog(
                 ?: 0.96f
             sheet.pivotX = sheet.width / 2f
             sheet.pivotY = sheet.height / 2f
+            if (!ValueAnimator.areAnimatorsEnabled()) {
+                sheet.alpha = 1f
+                sheet.translationX = 0f
+                sheet.translationY = 0f
+                sheet.scaleX = 1f
+                sheet.scaleY = 1f
+                setBackdropProgress(0f, immediate = true)
+                visualBackground?.invalidateSurfacePositions()
+                return@post
+            }
             sheet.translationX = returnTranslationX
             sheet.translationY = returnTranslationY
             sheet.scaleX = returnScale
@@ -211,6 +231,7 @@ open class GlassSheetDialog(
                 .scaleY(1f)
                 .setDuration(340L)
                 .setInterpolator(OPEN_OVERSHOOT)
+                .setUpdateListener { visualBackground?.invalidateSurfacePositions() }
                 .start()
         }
     }
@@ -221,6 +242,10 @@ open class GlassSheetDialog(
             return
         }
         dismissing = true
+        if (!ValueAnimator.areAnimatorsEnabled()) {
+            completeDismiss()
+            return
+        }
         animateBackdropTo(1f, 205L, EXIT_CURVE)
         sheet.animate()
             .alpha(0f)
@@ -230,6 +255,7 @@ open class GlassSheetDialog(
             .scaleY(returnScale)
             .setDuration(210L)
             .setInterpolator(EXIT_CURVE)
+            .setUpdateListener { visualBackground?.invalidateSurfacePositions() }
             .withEndAction(::completeDismiss)
             .start()
         sheet.postDelayed(::completeDismiss, 235L)
@@ -270,6 +296,7 @@ open class GlassSheetDialog(
                     sheet.scaleX = scale
                     sheet.scaleY = scale
                     setBackdropProgress(progress)
+                    visualBackground?.invalidateSurfacePositions()
                 }
                 return true
             }
@@ -300,6 +327,15 @@ open class GlassSheetDialog(
     }
 
     private fun reboundAfterDrag() {
+        if (!ValueAnimator.areAnimatorsEnabled()) {
+            sheet.translationY = 0f
+            sheet.alpha = 1f
+            sheet.scaleX = 1f
+            sheet.scaleY = 1f
+            setBackdropProgress(0f, immediate = true)
+            visualBackground?.invalidateSurfacePositions()
+            return
+        }
         animateBackdropTo(0f, 260L, ENTER_CURVE)
         sheet.animate()
             .translationY(0f)
@@ -308,6 +344,7 @@ open class GlassSheetDialog(
             .scaleY(1f)
             .setDuration(260L)
             .setInterpolator(ENTER_CURVE)
+            .setUpdateListener { visualBackground?.invalidateSurfacePositions() }
             .start()
     }
 
@@ -322,6 +359,7 @@ open class GlassSheetDialog(
             .scaleY(0.985f)
             .setDuration(190L)
             .setInterpolator(EXIT_CURVE)
+            .setUpdateListener { visualBackground?.invalidateSurfacePositions() }
             .withEndAction(::completeDismiss)
             .start()
         sheet.postDelayed(::completeDismiss, 220L)
@@ -361,6 +399,10 @@ open class GlassSheetDialog(
         interpolator: TimeInterpolator
     ) {
         backdropAnimator?.cancel()
+        if (!ValueAnimator.areAnimatorsEnabled()) {
+            setBackdropProgress(target, immediate = true)
+            return
+        }
         backdropAnimator = ValueAnimator.ofFloat(backdropProgress, target).apply {
             this.duration = duration
             this.interpolator = interpolator
@@ -389,16 +431,11 @@ open class GlassSheetDialog(
     private fun applyBackdropProgress() {
         val dialogWindow = window ?: return
         val visibleProgress = 1f - backdropProgress
-        val radius = (dp(36) * visibleProgress * (0.65f + visibleProgress * 0.35f)).toInt()
         val dimAmount = FULL_DIM_AMOUNT * visibleProgress
-        if (radius == appliedBlurRadius && abs(dimAmount - appliedDimAmount) < 0.002f) return
-        appliedBlurRadius = radius
+        if (abs(dimAmount - appliedDimAmount) < 0.002f) return
         appliedDimAmount = dimAmount
         dialogWindow.attributes = dialogWindow.attributes.apply {
             this.dimAmount = dimAmount
-            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                blurBehindRadius = radius.coerceAtLeast(0)
-            }
         }
     }
 
@@ -412,7 +449,7 @@ open class GlassSheetDialog(
     private companion object {
         const val DISMISS_FRACTION = 0.22f
         const val DISMISS_VELOCITY = 1_050f
-        const val FULL_DIM_AMOUNT = 0.38f
+        const val FULL_DIM_AMOUNT = 0.28f
         val ENTER_CURVE = PathInterpolator(0.16f, 1f, 0.3f, 1f)
         val EXIT_CURVE = PathInterpolator(0.4f, 0f, 1f, 1f)
         val OPEN_OVERSHOOT = OvershootInterpolator(0.58f)
@@ -431,14 +468,13 @@ data class GlassSheetPalette(
         fun resolve(context: Context, preferences: VisualPreferences): GlassSheetPalette {
             val dark = context.resources.configuration.uiMode and
                 Configuration.UI_MODE_NIGHT_MASK == Configuration.UI_MODE_NIGHT_YES
-            val imageContrast = !dark && preferences.background != BackgroundPreference.SOLID
-            val effectiveDark = dark || imageContrast
+            val imageContrast = preferences.background != BackgroundPreference.SOLID
             return GlassSheetPalette(
-                foreground = if (effectiveDark) 0xFFF7F7F9.toInt() else 0xFF142128.toInt(),
-                secondary = if (effectiveDark) 0xFFE8E8ED.toInt() else 0xFF465B66.toInt(),
-                accentText = if (effectiveDark) 0xFF7CF2A4.toInt() else 0xFF116C4A.toInt(),
-                danger = if (effectiveDark) 0xFFFF6961.toInt() else 0xFFB42318.toInt(),
-                handle = if (effectiveDark) 0x77FFFFFF else 0x66000000,
+                foreground = if (dark || imageContrast) 0xFFF7F7F9.toInt() else 0xFF10212C.toInt(),
+                secondary = if (dark || imageContrast) 0xFFE2E8EE.toInt() else 0xFF425968.toInt(),
+                accentText = if (dark || imageContrast) 0xFF7CF2A4.toInt() else 0xFF0E6B48.toInt(),
+                danger = if (dark) 0xFFFF6961.toInt() else 0xFFB42318.toInt(),
+                handle = if (dark || imageContrast) 0x99FFFFFF.toInt() else 0x66000000,
                 imageContrast = imageContrast
             )
         }

@@ -4,15 +4,17 @@ import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Matrix
-import androidx.exifinterface.media.ExifInterface
 import android.net.Uri
 import androidx.annotation.DrawableRes
+import androidx.exifinterface.media.ExifInterface
 import java.io.File
+import java.io.InputStream
 import kotlin.math.max
 
 object BackgroundImageStore {
     private const val FILE_NAME = "custom-background.jpg"
     private const val MAX_EDGE_PX = 2560
+    private const val MAX_IMPORT_BYTES = 96L * 1024L * 1024L
 
     fun imageFile(context: Context): File = File(context.filesDir, FILE_NAME)
 
@@ -27,31 +29,57 @@ object BackgroundImageStore {
     }
 
     fun decodeFromUri(context: Context, uri: Uri): Bitmap {
+        val importFile = File.createTempFile("background-import-", ".bin", context.cacheDir)
+        try {
+            openUriStream(context, uri).use { input ->
+                importFile.outputStream().buffered().use { output ->
+                    val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                    var copied = 0L
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read < 0) break
+                        copied += read
+                        require(copied <= MAX_IMPORT_BYTES) { "所选图片过大" }
+                        output.write(buffer, 0, read)
+                    }
+                    require(copied > 0L) { "所选图片为空" }
+                }
+            }
+            return decodeFromFile(importFile)
+        } finally {
+            importFile.delete()
+        }
+    }
+
+    private fun openUriStream(context: Context, uri: Uri): InputStream {
         val resolver = context.contentResolver
+        runCatching {
+            resolver.openAssetFileDescriptor(uri, "r")?.createInputStream()
+        }.getOrNull()?.let { return it }
+        return runCatching { resolver.openInputStream(uri) }
+            .getOrNull()
+            ?: error("系统未授予所选图片的读取权限")
+    }
+
+    private fun decodeFromFile(file: File): Bitmap {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        resolver.openInputStream(uri)?.use { BitmapFactory.decodeStream(it, null, bounds) }
-            ?: error("无法读取所选图片")
+        BitmapFactory.decodeFile(file.absolutePath, bounds)
         require(bounds.outWidth > 0 && bounds.outHeight > 0) { "无法识别所选图片" }
 
         var sample = 1
         while (max(bounds.outWidth, bounds.outHeight) / sample > MAX_EDGE_PX) sample *= 2
-        val decoded = resolver.openInputStream(uri)?.use {
-            BitmapFactory.decodeStream(
-                it,
-                null,
-                BitmapFactory.Options().apply {
-                    inSampleSize = sample
-                    inPreferredConfig = Bitmap.Config.ARGB_8888
-                }
-            )
-        } ?: error("图片解码失败")
+        val decoded = BitmapFactory.decodeFile(
+            file.absolutePath,
+            BitmapFactory.Options().apply {
+                inSampleSize = sample
+                inPreferredConfig = Bitmap.Config.ARGB_8888
+            }
+        ) ?: error("图片解码失败")
         val orientation = runCatching {
-            resolver.openInputStream(uri)?.use {
-                ExifInterface(it).getAttributeInt(
-                    ExifInterface.TAG_ORIENTATION,
-                    ExifInterface.ORIENTATION_NORMAL
-                )
-            } ?: ExifInterface.ORIENTATION_NORMAL
+            ExifInterface(file).getAttributeInt(
+                ExifInterface.TAG_ORIENTATION,
+                ExifInterface.ORIENTATION_NORMAL
+            )
         }.getOrDefault(ExifInterface.ORIENTATION_NORMAL)
         val normalized = rotateForOrientation(decoded, orientation)
         if (normalized !== decoded) decoded.recycle()
@@ -87,6 +115,7 @@ object BackgroundImageStore {
             if (!target.exists() && backup.exists()) backup.renameTo(target)
         }
     }
+
 
     fun decodeCustomForDisplay(context: Context, width: Int, height: Int): Bitmap? {
         if (!hasImage(context)) return null

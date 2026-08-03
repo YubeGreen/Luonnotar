@@ -4,7 +4,7 @@ param(
     [ValidateRange(70, 900)]
     [int]$ScreenOffSeconds = 80,
     [ValidateRange(0, 900)]
-    [int]$PostWakeSeconds = 315,
+    [int]$PostWakeSeconds = 20,
     [string]$OutputRoot = "",
     [string]$AdbPath = "adb",
     [string]$DeviceSerial = "",
@@ -15,7 +15,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
 if ([string]::IsNullOrWhiteSpace($ApkPath)) {
-    $ApkPath = Join-Path $PSScriptRoot "..\Luonnotar-1.6.3-YubeGreen-release.apk"
+    $ApkPath = Join-Path $PSScriptRoot "..\Luonnotar-1.6.8-YubeGreen-release.apk"
 }
 if ([string]::IsNullOrWhiteSpace($OutputRoot)) {
     $OutputRoot = Join-Path $PSScriptRoot "test-output"
@@ -397,22 +397,13 @@ function Test-ProbeWindows {
         $_.Epoch -ge $AnchorEpoch -and
         $_.Epoch -le $EndEpoch
     })
-    $windows = @(
-        [pscustomobject]@{ Name = "screen-off probe near 0s"; Min = 0.0; Max = 15.0 },
-        [pscustomobject]@{ Name = "screen-off probe near 30s"; Min = 20.0; Max = 45.0 },
-        [pscustomobject]@{ Name = "screen-off probe near 60s"; Min = 50.0; Max = 80.0 }
-    )
-    foreach ($window in $windows) {
-        $matches = @($starts | Where-Object {
-            $offset = $_.Epoch - $AnchorEpoch
-            $offset -ge $window.Min -and $offset -le $window.Max
-        })
-        $offsets = @($matches | ForEach-Object {
-            [Math]::Round($_.Epoch - $AnchorEpoch, 2)
-        })
-        Add-ValidationResult -Name $window.Name -Passed ($matches.Count -gt 0) `
-            -Details "observed offsets: $($offsets -join ', ') s"
-    }
+    $quietWindowStarts = @($starts | Where-Object {
+        $offset = $_.Epoch - $AnchorEpoch
+        $offset -ge 0 -and $offset -lt 120
+    })
+    Add-ValidationResult -Name "cooperative 120-second quiet window" `
+        -Passed ($quietWindowStarts.Count -eq 0) `
+        -Details "active HTTPS starts during quiet window=$($quietWindowStarts.Count)"
 }
 
 function Test-VpnOnlyEvidence {
@@ -464,35 +455,13 @@ function Test-PostWakeCadence {
     $starts = @($Entries | Where-Object {
         $_.Event -eq "https_probe_started" -and $_.Epoch -ge $ScreenOnEpoch
     })
-    $immediate = @($starts | Where-Object {
+    $unexpected = @($starts | Where-Object {
         $offset = $_.Epoch - $ScreenOnEpoch
-        $offset -ge 0 -and $offset -le 15
+        $offset -ge 0 -and $offset -le $ObservedSeconds
     })
-    Add-ValidationResult -Name "screen-on forced probe" -Passed ($immediate.Count -gt 0) `
-        -Details "immediate starts=$($immediate.Count)"
-
-    $tooEarly = @($starts | Where-Object {
-        $offset = $_.Epoch - $ScreenOnEpoch
-        $offset -ge 20 -and $offset -lt 270
-    })
-    Add-ValidationResult -Name "no 30-second cadence while screen is on" `
-        -Passed ($tooEarly.Count -eq 0) `
-        -Details "unexpected starts between 20s and 270s=$($tooEarly.Count)"
-
-    if ($ObservedSeconds -lt 285) {
-        Add-ValidationResult -Name "five-minute screen-on cadence" -Passed $false `
-            -Details "SKIPPED: PostWakeSeconds=$ObservedSeconds; use at least 305 seconds for full verification"
-        return
-    }
-    $fiveMinute = @($starts | Where-Object {
-        $offset = $_.Epoch - $ScreenOnEpoch
-        $offset -ge 275 -and $offset -le 335
-    })
-    $offsets = @($fiveMinute | ForEach-Object {
-        [Math]::Round($_.Epoch - $ScreenOnEpoch, 2)
-    })
-    Add-ValidationResult -Name "five-minute screen-on cadence" -Passed ($fiveMinute.Count -gt 0) `
-        -Details "observed offsets: $($offsets -join ', ') s"
+    Add-ValidationResult -Name "screen events do not force HTTPS in cooperative mode" `
+        -Passed ($unexpected.Count -eq 0) `
+        -Details "HTTPS starts after screen-on=$($unexpected.Count)"
 }
 
 $script:AdbExecutable = Resolve-AdbExecutable -RequestedPath $AdbPath
@@ -504,7 +473,7 @@ $script:DeviceSerial = if ([string]::IsNullOrWhiteSpace($DeviceSerial)) {
 $resolvedApk = (Resolve-Path -LiteralPath $ApkPath -ErrorAction Stop).Path
 $resolvedOutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
 $timestamp = Get-Date -Format "yyyyMMdd-HHmmss"
-$script:OutputDirectory = Join-Path $resolvedOutputRoot "iqoo-aggressive-$timestamp"
+$script:OutputDirectory = Join-Path $resolvedOutputRoot "iqoo-cooperative-$timestamp"
 New-Item -ItemType Directory -Path $script:OutputDirectory -Force | Out-Null
 
 $runFailure = $null
@@ -522,10 +491,10 @@ try {
         ) -Encoding UTF8
         if (
             $installedVersion.ExitCode -ne 0 -or
-            $installedVersion.Output -notmatch "versionCode=20(?:\s|$)" -or
-            $installedVersion.Output -notmatch "versionName=1\.6\.3(?:\s|$)"
+            $installedVersion.Output -notmatch "versionCode=27(?:\s|$)" -or
+            $installedVersion.Output -notmatch "versionName=1\.7\.0(?:\s|$)"
         ) {
-            throw "SkipInstall requires Luonnotar 1.6.3 (versionCode 20) to be installed."
+            throw "SkipInstall requires Luonnotar 1.7.0 (versionCode 27) to be installed."
         }
     } else {
         Write-Host "Installing: $resolvedApk"
@@ -554,24 +523,13 @@ try {
     if (-not $guardianEnabled) {
         throw "Extreme guardian is not enabled. Accept the first-run policy and enable it once, then rerun."
     }
-    $aggressiveEnabled = Ensure-UiSetting `
-        -EnabledTexts @("关闭 vivo/iQOO 激进保活") `
-        -EnableTexts @(
-            "开启 vivo/iQOO 激进保活（建议）",
-            "开启激进保活（仅 vivo/iQOO 建议）"
-        ) `
-        -SettingName "vivo/iQOO aggressive mode"
-    if (-not $aggressiveEnabled) {
-        throw "vivo/iQOO aggressive mode could not be enabled or confirmed."
-    }
-
     Extend-ScreenTimeoutForTest
     Set-ScreenAwake
     Save-StateSnapshot -Prefix "pre"
     Invoke-Adb -Arguments @("logcat", "-c") | Out-Null
     Invoke-Adb -Arguments @(
         "shell", "log", "-t", "LuonnotarTest",
-        "IQOO_AGGRESSIVE_BEGIN_$timestamp"
+        "IQOO_COOPERATIVE_BEGIN_$timestamp"
     ) -AllowFailure | Out-Null
 
     Write-Host "Turning the screen off for $ScreenOffSeconds seconds..."
@@ -601,11 +559,10 @@ try {
             -AnchorEpoch $screenOffEvent.Epoch `
             -EndEpoch ($screenOffEvent.Epoch + $ScreenOffSeconds + 15)
     }
-    Test-VpnOnlyEvidence -Entries $offEntries
     Test-MaximumProbeConcurrency -Entries $offEntries
     Save-StateSnapshot -Prefix "screen-off"
 
-    Write-Host "Waking the device and observing the normal five-minute cadence..."
+    Write-Host "Waking the device and observing cooperative idle behavior..."
     Set-ScreenAwake
     $screenWasTurnedOff = $false
     Wait-WithProgress -Seconds $PostWakeSeconds -KeepAwake

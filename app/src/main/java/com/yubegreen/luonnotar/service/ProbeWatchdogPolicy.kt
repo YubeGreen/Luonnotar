@@ -21,3 +21,24 @@ object ProbeWatchdogPolicy {
         else -> ProbeWatchdogAction.NONE
     }
 }
+
+object ProbeHardRestartPolicy {
+    fun leaseStillEligible(
+        expected: ActualProbePermitSnapshot,
+        current: ActualProbePermitSnapshot,
+        nowElapsed: Long,
+        hardTimeoutMs: Long,
+        expectedVpnHandle: Long,
+        currentVpnHandle: Long
+    ): Boolean =
+        expected.owner != null &&
+            expected.stage == "HTTPS" &&
+            current.stage == "HTTPS" &&
+            current.owner === expected.owner &&
+            current.owner.generation == expected.owner.generation &&
+            current.acquiredElapsed == expected.acquiredElapsed &&
+            current.networkHandle == expected.networkHandle &&
+            current.acquiredElapsed > 0L &&
+            nowElapsed - current.acquiredElapsed >= hardTimeoutMs &&
+            currentVpnHandle == expectedVpnHandle
+}

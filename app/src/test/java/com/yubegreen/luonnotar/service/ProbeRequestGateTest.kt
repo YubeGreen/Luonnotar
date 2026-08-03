@@ -138,7 +138,13 @@ class ProbeRequestGateTest {
                             tokenSequence.incrementAndGet(),
                             1L
                         )
-                        if (permit.tryAcquire(token)) {
+                        if (
+                            permit.tryAcquire(
+                                token,
+                                acquiredElapsed = token.value,
+                                networkHandle = 700L
+                            )
+                        ) {
                             val active = concurrent.incrementAndGet()
                             maximum.accumulateAndGet(active) { current, value ->
                                 maxOf(current, value)
@@ -165,12 +171,39 @@ class ProbeRequestGateTest {
         val oldToken = ProbeOwnerToken(1L, 1L)
         val newToken = ProbeOwnerToken(2L, 2L)
 
-        assertTrue(permit.tryAcquire(oldToken))
+        assertTrue(permit.tryAcquire(oldToken, 10L, 700L))
         assertTrue(permit.release(oldToken))
-        assertTrue(permit.tryAcquire(newToken))
+        assertTrue(permit.tryAcquire(newToken, 20L, 701L))
         assertFalse(permit.release(oldToken))
         assertTrue(permit.isHeld())
+        assertTrue(permit.snapshot().owner === newToken)
+        assertTrue(permit.snapshot().acquiredElapsed == 20L)
+        assertTrue(permit.snapshot().networkHandle == 701L)
         assertTrue(permit.release(newToken))
         assertFalse(permit.isHeld())
+    }
+
+    @Test
+    fun newServiceCanObserveAnOldProcessPermitLease() {
+        val permit = ActualProbePermit()
+        val oldServiceToken = ProbeOwnerToken(1L, 4L)
+
+        assertTrue(
+            permit.tryAcquire(
+                oldServiceToken,
+                acquiredElapsed = 1_000L,
+                networkHandle = 900L,
+                stage = "HTTPS"
+            )
+        )
+        val snapshot = permit.snapshot()
+
+        assertTrue(snapshot.owner === oldServiceToken)
+        assertTrue(snapshot.acquiredElapsed == 1_000L)
+        assertTrue(snapshot.networkHandle == 900L)
+        assertTrue(snapshot.stage == "HTTPS")
+        assertFalse(permit.release(ProbeOwnerToken(1L, 4L)))
+        assertTrue(permit.isHeld())
+        assertTrue(permit.release(oldServiceToken))
     }
 }

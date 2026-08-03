@@ -40,6 +40,7 @@ class PolicyActivity : AppCompatActivity() {
     private lateinit var check: AppCompatCheckBox
     private lateinit var policyScroll: ScrollView
     private lateinit var readHint: TextView
+    private lateinit var visualBackground: VisualBackgroundView
     private var readToEnd = false
     private var restoredScrollY = 0
     private var restoredChecked = false
@@ -74,7 +75,7 @@ class PolicyActivity : AppCompatActivity() {
         val preferences = VisualPreferences.load(this)
         val tablet = AdaptiveLayout.isTablet(this)
         val contentEdge = if (tablet) 24 else 18
-        val background = VisualBackgroundView(this).apply { apply(preferences) }
+        visualBackground = VisualBackgroundView(this).apply { apply(preferences) }
         val column = AdaptiveMaxWidthLinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             maximumWidthPx = AdaptiveLayout.contentMaximumWidthPx(this@PolicyActivity)
@@ -122,6 +123,7 @@ class PolicyActivity : AppCompatActivity() {
             addView(policyPanel)
             setOnScrollChangeListener { _, _, scrollY, _, _ ->
                 updatePolicyReadState(this, scrollY)
+                visualBackground.invalidateSurfacePositions()
             }
         }
         policyScroll.addOnLayoutChangeListener { view, _, _, _, _, _, _, _, _ ->
@@ -164,7 +166,7 @@ class PolicyActivity : AppCompatActivity() {
         refreshAgreement()
 
         val root = FrameLayout(this).apply {
-            addView(background, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(visualBackground, FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT))
             addView(
                 column,
                 FrameLayout.LayoutParams(
@@ -190,7 +192,7 @@ class PolicyActivity : AppCompatActivity() {
             bottomFade,
             FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, Gravity.BOTTOM)
         )
-        policyPanel.bindBackground(background)
+        policyPanel.bindBackground(visualBackground)
         ViewCompat.setOnApplyWindowInsetsListener(root) { _, insets ->
             val safe = insets.getInsets(
                 WindowInsetsCompat.Type.systemBars() or WindowInsetsCompat.Type.displayCutout()
@@ -237,9 +239,9 @@ class PolicyActivity : AppCompatActivity() {
             Configuration.UI_MODE_NIGHT_YES
         val imageContrast = usesImageContrast()
         val edge = when {
-            imageContrast -> 0xD9000000.toInt()
-            dark -> 0xE60B0B0D.toInt()
-            else -> 0xEBF5F5F7.toInt()
+            imageContrast -> 0x52000000
+            dark -> 0x7007090D
+            else -> 0x4CF6F8FC
         }
         topFade.background = GradientDrawable(
             GradientDrawable.Orientation.TOP_BOTTOM,
@@ -343,6 +345,7 @@ class PolicyActivity : AppCompatActivity() {
         setPadding(dp(10), dp(8), dp(10), dp(8))
         setTextColor(color)
         background = LiquidGlassDrawable(this@PolicyActivity, dp(17).toFloat(), usesImageContrast())
+        if (::visualBackground.isInitialized) bindGlassBackground(visualBackground)
         setOnClickListener { action() }
     }
 

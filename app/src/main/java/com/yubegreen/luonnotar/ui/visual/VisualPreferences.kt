@@ -27,9 +27,11 @@ data class VisualPreferences(
     val backgroundScale: BackgroundScale = BackgroundScale.FILL_CROP
 ) {
     fun save(context: Context) {
+        val effectiveTheme =
+            if (background == BackgroundPreference.SHAO_OU) ThemePreference.DARK else theme
         context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
             .edit()
-            .putString(KEY_THEME, theme.name)
+            .putString(KEY_THEME, effectiveTheme.name)
             .putString(KEY_BACKGROUND, background.name)
             .putString(KEY_BACKGROUND_SCALE, backgroundScale.name)
             .apply()
@@ -54,14 +56,23 @@ data class VisualPreferences(
             }
         }
 
-        fun load(prefs: SharedPreferences) = VisualPreferences(
-            theme = enumValue(prefs.getString(KEY_THEME, null), ThemePreference.DARK),
-            background = enumValue(prefs.getString(KEY_BACKGROUND, null), BackgroundPreference.SOLID),
-            backgroundScale = enumValue(
-                prefs.getString(KEY_BACKGROUND_SCALE, null),
-                BackgroundScale.FILL_CROP
+        fun load(prefs: SharedPreferences): VisualPreferences {
+            val background =
+                enumValue(prefs.getString(KEY_BACKGROUND, null), BackgroundPreference.SOLID)
+            val storedTheme = enumValue(prefs.getString(KEY_THEME, null), ThemePreference.DARK)
+            return VisualPreferences(
+                theme = if (background == BackgroundPreference.SHAO_OU) {
+                    ThemePreference.DARK
+                } else {
+                    storedTheme
+                },
+                background = background,
+                backgroundScale = enumValue(
+                    prefs.getString(KEY_BACKGROUND_SCALE, null),
+                    BackgroundScale.FILL_CROP
+                )
             )
-        )
+        }
 
         fun nightMode(theme: ThemePreference): Int = when (theme) {
             ThemePreference.DARK -> AppCompatDelegate.MODE_NIGHT_YES

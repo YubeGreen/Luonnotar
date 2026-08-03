@@ -1,4 +1,5 @@
 import java.util.Properties
+import org.gradle.api.tasks.Copy
 
 plugins {
     id("com.android.application")
@@ -28,8 +29,8 @@ android {
         applicationId = "com.yubegreen.luonnotar"
         minSdk = 26
         targetSdk = 36
-        versionCode = 20
-        versionName = "1.6.3"
+        versionCode = 64
+        versionName = "2.4.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEVELOPER_NAME", "\"YubeGreen\"")
     }
@@ -76,14 +77,50 @@ android {
 
     buildFeatures {
         buildConfig = true
+        aidl = true
     }
 }
 
 android.applicationVariants.all {
+    val apkVersionName = versionName ?: "unknown"
+    val apkBuildType = buildType.name
+
     outputs.all {
-        (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl).outputFileName =
-            if (buildType.name == "release") "Luonnotar-release.apk" else "Luonnotar-debug.apk"
+        (this as com.android.build.gradle.internal.api.BaseVariantOutputImpl)
+            .outputFileName =
+            "Luonnotar-$apkVersionName-YubeGreen-$apkBuildType.apk"
     }
+}
+
+val copyReleaseApkToProjectRoot = tasks.register("copyReleaseApkToProjectRoot") {
+    doLast {
+        val releaseDir = layout.buildDirectory
+            .dir("outputs/apk/release")
+            .get()
+            .asFile
+
+        val sourceApk = releaseDir
+            .listFiles()
+            ?.singleOrNull {
+                it.isFile &&
+                    it.name.startsWith("Luonnotar-") &&
+                    it.name.endsWith("-YubeGreen-release.apk")
+            }
+            ?: error("Expected exactly one YubeGreen release APK in: $releaseDir")
+
+        val destinationApk = rootProject.file(sourceApk.name)
+
+        sourceApk.copyTo(
+            target = destinationApk,
+            overwrite = true
+        )
+
+        println("Copied release APK to: ${destinationApk.absolutePath}")
+    }
+}
+
+tasks.matching { it.name == "assembleRelease" }.configureEach {
+    finalizedBy(copyReleaseApkToProjectRoot)
 }
 
 dependencies {
@@ -92,8 +129,13 @@ dependencies {
     implementation("androidx.work:work-runtime-ktx:2.10.5")
     implementation("androidx.exifinterface:exifinterface:1.4.2")
     implementation("com.google.android.gms:play-services-base:18.10.0")
+    implementation("com.google.android.gms:play-services-location:21.4.0")
+    implementation("dev.rikka.shizuku:api:13.1.5")
+    implementation("dev.rikka.shizuku:provider:13.1.5")
+    implementation("com.flyfishxu:kadb-android:1.3.0")
 
     testImplementation("junit:junit:4.13.2")
+    testImplementation("org.json:json:20240303")
     androidTestImplementation("androidx.test:runner:1.6.2")
     androidTestImplementation("androidx.test.ext:junit:1.2.1")
     androidTestImplementation("androidx.test:core:1.6.1")

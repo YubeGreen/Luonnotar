@@ -4,11 +4,14 @@ import android.content.Context
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
+import android.net.LinkProperties
+import android.net.NetworkRequest
 import android.os.Handler
 import android.os.HandlerThread
 import android.os.Build
 import com.yubegreen.luonnotar.util.LogManager
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.ConcurrentHashMap
 
 data class NetworkEvidence(
     val connected: Boolean,
@@ -28,6 +31,10 @@ class NetworkStateMonitor(
     private val handler = Handler(callbackThread.looper)
     private val refreshUnderlay = Runnable { publish(current()) }
     private val active = AtomicBoolean(false)
+    private val observedCapabilities =
+        ConcurrentHashMap<Long, NetworkCapabilities>()
+    private val observedLinkProperties =
+        ConcurrentHashMap<Long, LinkProperties>()
     @Volatile
     private var last: NetworkEvidence? = null
     private val callback = object : ConnectivityManager.NetworkCallback() {
@@ -36,11 +43,25 @@ class NetworkStateMonitor(
             capabilities: NetworkCapabilities
         ) {
             if (!active.get()) return
+            observedCapabilities[network.networkHandle] = capabilities
             publish(evidenceFromCallback(network, capabilities))
+        }
+
+        override fun onLinkPropertiesChanged(
+            network: Network,
+            linkProperties: LinkProperties
+        ) {
+            if (!active.get()) return
+            observedLinkProperties[network.networkHandle] = linkProperties
+            observedCapabilities[network.networkHandle]?.let {
+                publish(evidenceFromCallback(network, it))
+            }
         }
 
         override fun onLost(network: Network) {
             if (!active.get()) return
+            observedCapabilities.remove(network.networkHandle)
+            observedLinkProperties.remove(network.networkHandle)
             if (last?.networkHandle == network.networkHandle) {
                 publish(
                     NetworkEvidence(
@@ -55,13 +76,65 @@ class NetworkStateMonitor(
             }
         }
     }
+    private val physicalRequest = NetworkRequest.Builder()
+        .addCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        .build()
+    private val physicalCallback =
+        object : ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: Network,
+                capabilities: NetworkCapabilities
+            ) {
+                if (!active.get()) return
+                observedCapabilities[network.networkHandle] = capabilities
+                if (
+                    last?.transport == "UNDERLAY_UNKNOWN" &&
+                    !capabilities.hasTransport(
+                        NetworkCapabilities.TRANSPORT_VPN
+                    )
+                ) {
+                    handler.removeCallbacks(refreshUnderlay)
+                    handler.postDelayed(refreshUnderlay, 250L)
+                }
+            }
+
+            override fun onLinkPropertiesChanged(
+                network: Network,
+                linkProperties: LinkProperties
+            ) {
+                if (!active.get()) return
+                observedLinkProperties[network.networkHandle] = linkProperties
+                handler.removeCallbacks(refreshUnderlay)
+                handler.post(refreshUnderlay)
+            }
+
+            override fun onLost(network: Network) {
+                if (!active.get()) return
+                observedCapabilities.remove(network.networkHandle)
+                observedLinkProperties.remove(network.networkHandle)
+                handler.post {
+                    if (active.get()) publish(current())
+                }
+            }
+        }
 
     fun start() {
         if (!active.compareAndSet(false, true)) return
         runCatching {
+            connectivity.registerNetworkCallback(
+                physicalRequest,
+                physicalCallback,
+                handler
+            )
             connectivity.registerDefaultNetworkCallback(callback, handler)
         }.onFailure {
             active.set(false)
+            runCatching {
+                connectivity.unregisterNetworkCallback(physicalCallback)
+            }
+            runCatching {
+                connectivity.unregisterNetworkCallback(callback)
+            }
             handler.removeCallbacksAndMessages(null)
             callbackThread.quitSafely()
             throw it
@@ -72,6 +145,9 @@ class NetworkStateMonitor(
     fun stop() {
         if (!active.getAndSet(false)) return
         runCatching { connectivity.unregisterNetworkCallback(callback) }
+        runCatching {
+            connectivity.unregisterNetworkCallback(physicalCallback)
+        }
         handler.removeCallbacksAndMessages(null)
         callbackThread.quitSafely()
         if (Thread.currentThread() !== callbackThread) {
@@ -82,16 +158,22 @@ class NetworkStateMonitor(
     fun current(): NetworkEvidence {
         val active = connectivity.activeNetwork
         val caps = active?.let(connectivity::getNetworkCapabilities)
+        val links = active?.let(connectivity::getLinkProperties)
         val defaultIsVpn = caps?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         val underlay = if (caps == null) {
             Underlay("NONE", "no_active_network")
         } else if (!defaultIsVpn) {
             Underlay(
-                physicalTransport(caps) ?: "OTHER",
-                "default_network_capabilities"
+                physicalUnderlay(caps, links)?.transport ?: "OTHER",
+                physicalUnderlay(caps, links)?.source
+                    ?: "default_network_capabilities"
             )
         } else {
-            resolveVpnUnderlay(caps, allowValidatedNetworkScan = true)
+            resolveVpnUnderlay(
+                caps,
+                allowValidatedNetworkScan = true,
+                linkProperties = links
+            )
         }
         return NetworkEvidence(
             connected = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true,
@@ -108,12 +190,14 @@ class NetworkStateMonitor(
         caps: NetworkCapabilities
     ): NetworkEvidence {
         val underlay = if (caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)) {
-            resolveVpnUnderlay(caps, allowValidatedNetworkScan = false)
-        } else {
-            Underlay(
-                physicalTransport(caps) ?: "OTHER",
-                "network_callback_capabilities"
+            resolveVpnUnderlay(
+                caps,
+                allowValidatedNetworkScan = false,
+                linkProperties = null
             )
+        } else {
+            physicalUnderlay(caps, null)
+                ?: Underlay("OTHER", "network_callback_capabilities")
         }
         if (
             caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) &&
@@ -134,17 +218,25 @@ class NetworkStateMonitor(
 
     private fun resolveVpnUnderlay(
         vpnCapabilities: NetworkCapabilities,
-        allowValidatedNetworkScan: Boolean
+        allowValidatedNetworkScan: Boolean,
+        linkProperties: LinkProperties?
     ): Underlay {
-        physicalTransport(vpnCapabilities)?.let {
-            return Underlay(it, "vpn_capabilities_transport")
+        physicalUnderlay(vpnCapabilities, linkProperties)?.let {
+            return it.copy(source = "vpn_${it.source}")
         }
         underlyingNetworkTransport(vpnCapabilities)?.let {
             return Underlay(it, "vpn_underlying_networks")
         }
         if (allowValidatedNetworkScan) {
             validatedPhysicalNetworkTransport()?.let {
-                return Underlay(it, "validated_non_vpn_network_scan")
+                return Underlay(
+                    if (it == "WIFI") {
+                        "POSSIBLE_UNDERLAY_WIFI"
+                    } else {
+                        "POSSIBLE_UNDERLAY_$it"
+                    },
+                    "possible_validated_non_vpn_network_scan"
+                )
             }
         }
         return Underlay(
@@ -168,8 +260,14 @@ class NetworkStateMonitor(
             UnderlayTransportPolicy.preferred(
                 networks.asSequence()
                 .filterIsInstance<Network>()
-                .mapNotNull { connectivity.getNetworkCapabilities(it) }
-                .mapNotNull(::physicalTransport)
+                .mapNotNull { network ->
+                    observedCapabilities[network.networkHandle]?.let { caps ->
+                        physicalUnderlay(
+                            caps,
+                            observedLinkProperties[network.networkHandle]
+                        )?.transport
+                    }
+                }
                 .toSet()
             )
         }.getOrNull()
@@ -187,16 +285,36 @@ class NetworkStateMonitor(
             ) {
                 null
             } else {
-                physicalTransport(candidate)
+                physicalUnderlay(
+                    candidate,
+                    connectivity.getLinkProperties(network)
+                )?.transport
             }
         }.distinct()
         return UnderlayTransportPolicy.preferred(transports.toSet())
     }
 
-    private fun physicalTransport(caps: NetworkCapabilities): String? = when {
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> "WIFI"
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> "CELLULAR"
-        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> "ETHERNET"
+    private fun physicalUnderlay(
+        caps: NetworkCapabilities,
+        linkProperties: LinkProperties?
+    ): Underlay? = when {
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) ->
+            Underlay("WIFI", "wifi_transport")
+        VendorWifiTransportPolicy.isWifi(
+            capabilitiesSummary = caps.toString(),
+            interfaceName = linkProperties?.interfaceName
+        ) ->
+            Underlay(
+                "WIFI",
+                VendorWifiTransportPolicy.source(
+                    capabilitiesSummary = caps.toString(),
+                    interfaceName = linkProperties?.interfaceName
+                )
+            )
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) ->
+            Underlay("CELLULAR", "cellular_transport")
+        caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) ->
+            Underlay("ETHERNET", "ethernet_transport")
         else -> null
     }
 
@@ -230,5 +348,27 @@ object UnderlayTransportPolicy {
         "ETHERNET" in transports -> "ETHERNET"
         "CELLULAR" in transports -> "CELLULAR"
         else -> null
+    }
+}
+
+object VendorWifiTransportPolicy {
+    fun isWifi(
+        capabilitiesSummary: String,
+        interfaceName: String?
+    ): Boolean =
+        capabilitiesSummary.contains("EXTWIFI", ignoreCase = true) ||
+            interfaceName.orEmpty().matches(
+                Regex("^(wlan|wifi|ap)\\d+(?:[:.].*)?$", RegexOption.IGNORE_CASE)
+            )
+
+    fun source(
+        capabilitiesSummary: String,
+        interfaceName: String?
+    ): String = when {
+        capabilitiesSummary.contains("EXTWIFI", ignoreCase = true) ->
+            "vivo_extwifi_capabilities"
+        isWifi(capabilitiesSummary, interfaceName) ->
+            "wifi_interface_${interfaceName.orEmpty()}"
+        else -> "vendor_wifi_unknown"
     }
 }

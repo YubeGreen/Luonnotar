@@ -28,6 +28,12 @@ class AdbVpnVerificationReceiver : BroadcastReceiver() {
         )
         val networkHandle = intent.getLongExtra(EXTRA_NETWORK_HANDLE, -1L)
         if (networkHandle < 0) return
+        val prefs = LuonnotarPreferences.deviceProtected(context)
+        val sessionFingerprint = prefs.getString(
+            LuonnotarPreferences.KEY_VPN_SESSION_FINGERPRINT,
+            ""
+        ).orEmpty()
+        if (sessionFingerprint.isBlank()) return
         val evidenceHash = importFingerprint(
             activePackage,
             alwaysOn,
@@ -37,9 +43,9 @@ class AdbVpnVerificationReceiver : BroadcastReceiver() {
             whatsappRouted,
             whatsappBusinessRouted,
             internetRouted,
-            networkHandle
+            networkHandle,
+            sessionFingerprint
         )
-        val prefs = LuonnotarPreferences.deviceProtected(context)
         if (
             !prefs.getBoolean(LuonnotarPreferences.KEY_VPN, false) ||
             prefs.getLong(LuonnotarPreferences.KEY_NETWORK_HANDLE, -1L) != networkHandle
@@ -61,6 +67,10 @@ class AdbVpnVerificationReceiver : BroadcastReceiver() {
             .putBoolean(LuonnotarPreferences.KEY_ADB_INTERNET_ROUTED, internetRouted)
             .putString(LuonnotarPreferences.KEY_ADB_EVIDENCE_HASH, evidenceHash)
             .putLong(LuonnotarPreferences.KEY_ADB_NETWORK_HANDLE, networkHandle)
+            .putString(
+                LuonnotarPreferences.KEY_ADB_SESSION_FINGERPRINT,
+                sessionFingerprint
+            )
             .commit()
         LogManager.event(
             context,
@@ -75,6 +85,7 @@ class AdbVpnVerificationReceiver : BroadcastReceiver() {
                 "whatsappBusinessRouted" to whatsappBusinessRouted,
                 "internetRouted" to internetRouted,
                 "networkHandle" to networkHandle,
+                "sessionFingerprint" to sessionFingerprint,
                 "evidenceHash" to evidenceHash
             )
         )

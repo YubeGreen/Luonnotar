@@ -3,13 +3,16 @@
 
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_NETWORK_STATE" />
     <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
 
     <queries>
         <package android:name="ch.protonvpn.android" />
@@ -69,12 +72,35 @@
                 android:value="Maintains a user-enabled VPN-dependent push connectivity watchdog" />
         </service>
 
+
+        <service
+            android:name=".privileged.embedded.EmbeddedAdbService"
+            android:enabled="true"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="User-invoked local wireless ADB pairing and startup for the Luonnotar privileged engine" />
+        </service>
+
+        <receiver
+            android:name=".privileged.embedded.EmbeddedGuardianBootReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.LOCKED_BOOT_COMPLETED" />
+                <action android:name="android.intent.action.USER_UNLOCKED" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+            </intent-filter>
+        </receiver>
+
         <service
             android:name=".notification.ArrivalNotificationListener"
             android:exported="true"
             android:label="@string/notification_listener_label"
-            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE"
-            android:process=":keeper">
+            android:permission="android.permission.BIND_NOTIFICATION_LISTENER_SERVICE">
             <intent-filter>
                 <action android:name="android.service.notification.NotificationListenerService" />
             </intent-filter>
@@ -127,6 +153,69 @@
                 <action android:name="com.yubegreen.luonnotar.action.ADB_VERIFY_VPN" />
             </intent-filter>
         </receiver>
+
+        <receiver
+            android:name=".receiver.AdbFreezerDiagnosticsReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":keeper">
+            <intent-filter>
+                <action android:name="com.yubegreen.luonnotar.action.ADB_IMPORT_FREEZER" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".receiver.AdbGmsBinderPulseReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":keeper">
+            <intent-filter>
+                <action android:name="com.yubegreen.luonnotar.action.ADB_GMS_BINDER_PULSE_TEST" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".receiver.AdbRuntimeConfigReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":keeper">
+            <intent-filter>
+                <action android:name="com.yubegreen.luonnotar.action.ADB_RUNTIME_CONFIG_STATUS" />
+                <action android:name="com.yubegreen.luonnotar.action.ADB_SET_RUNTIME_CONFIG" />
+            </intent-filter>
+        </receiver>
+        <receiver
+            android:name=".receiver.AdbNotificationDiagnosticsReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP">
+            <intent-filter>
+                <action android:name="com.yubegreen.luonnotar.action.ADB_NOTIFICATION_STATUS" />
+                <action android:name="com.yubegreen.luonnotar.action.ADB_NOTIFICATION_PRIVACY" />
+                <action android:name="com.yubegreen.luonnotar.action.ADB_NOTIFICATION_SCAN_ACTIVE" />
+            </intent-filter>
+        </receiver>
+
+        <provider
+            android:name=".service.AdbRuntimeConfigProvider"
+            android:authorities="${applicationId}.adb_runtime_config"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP"
+            android:process=":keeper" />
+
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:enabled="true"
+            android:exported="true"
+            android:multiprocess="false"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
 
         <provider
             android:name="androidx.core.content.FileProvider"
