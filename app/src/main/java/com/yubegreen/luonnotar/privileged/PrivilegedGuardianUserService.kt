@@ -93,7 +93,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var lastPackageRebuildOutcome = PackageRebuildOutcome()
     private val packageSuccessorGuardByPackage = linkedMapOf<String, PackageSuccessorGuard>()
     private val packageSuccessorGuardFutureByPackage = linkedMapOf<String, ScheduledFuture<*>>()
+    private val packageSuccessorCircuitUntilByPackage = linkedMapOf<String, Long>()
     private val lastManagedPackageWakeByPackage = linkedMapOf<String, Long>()
+    private val managedPackageFrozenSinceByPackage = linkedMapOf<String, Long>()
+    private val lastManagedPackageFrozenWakeByPackage = linkedMapOf<String, Long>()
     private var packageSuccessorGuardStartCount = 0L
     private var packageSuccessorGuardRefreezeCount = 0L
     private var packageSuccessorGuardVerifiedCount = 0L
@@ -534,6 +537,21 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         forcedReason: String? = null
     ) {
         if (packageRebuildInProgress.contains(packageName)) return
+        val circuitUntil = packageSuccessorCircuitUntilByPackage[packageName] ?: 0L
+        if (circuitUntil > now) {
+            eventLocked(
+                "package_process_rebuild_deferred",
+                "$packageName reason=oem_refreeze_circuit_breaker until=$circuitUntil"
+            )
+            return
+        }
+        if (circuitUntil > 0L) {
+            packageSuccessorCircuitUntilByPackage.remove(packageName)
+            eventLocked(
+                "package_successor_circuit_breaker_closed",
+                "$packageName previousUntil=$circuitUntil"
+            )
+        }
         pruneDeliveryFailureStateLocked(packageName, now)
         val decision = if (forcedReason.isNullOrBlank()) {
             DeliveryFailureEscalationPolicy.decide(
@@ -1035,6 +1053,58 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         } else {
             guard.stableSinceElapsed = 0L
+            val vendorFamily = currentVendorFamilyLocked()
+            if (
+                RecoveryCampaignPolicy.shouldOpenPackageSuccessorCircuit(
+                    vendorFamily = vendorFamily,
+                    resetCount = guard.resetCount,
+                    refreezeCount = guard.refreezeCount
+                )
+            ) {
+                if (!guard.circuitRescueAttempted) {
+                    guard.circuitRescueAttempted = true
+                    val rescue = attemptBackgroundLauncherWakeLocked(
+                        packageName = packageName,
+                        reason = "oem_refreeze_circuit_rescue_generation_$generation",
+                        foregroundHoldMs =
+                            RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS
+                    )
+                    eventLocked(
+                        "package_successor_circuit_rescue",
+                        "$packageName generation=$generation resets=${guard.resetCount} " +
+                            "refreezes=${guard.refreezeCount} result=${rescue.name.lowercase()}"
+                    )
+                    val afterRescueProcesses = GuardianProcessParser.matching(
+                        listProcessesLocked(),
+                        processTargetsForPackage(packageName)
+                    )
+                    val stillFrozenAfterRescue = afterRescueProcesses.any { process ->
+                        readFreezeState(process.pid).frozen == true
+                    }
+                    if (!stillFrozenAfterRescue) {
+                        guard.frozenPids.clear()
+                        guard.stableSinceElapsed = SystemClock.elapsedRealtime()
+                        persistStatusLocked()
+                        return
+                    }
+                }
+
+                val until =
+                    SystemClock.elapsedRealtime() +
+                        RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_COOLDOWN_MS
+                packageSuccessorCircuitUntilByPackage[packageName] = until
+                eventLocked(
+                    "package_successor_circuit_breaker_opened",
+                    "$packageName generation=$generation vendor=$vendorFamily " +
+                        "resets=${guard.resetCount} refreezes=${guard.refreezeCount} until=$until"
+                )
+                finishPackageSuccessorGuardLocked(
+                    packageName,
+                    generation,
+                    "oem_refreeze_circuit_breaker"
+                )
+                return
+            }
             val shouldReset = RecoveryCampaignPolicy.shouldResetPackageSuccessor(
                 nowElapsed = now,
                 lastResetElapsed = guard.lastResetElapsed,
@@ -1055,7 +1125,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (shouldReset && !packageRebuildInProgress.contains(packageName)) {
                 val nextResetCount = guard.resetCount + 1
                 val strategy = RecoveryCampaignPolicy.packageSuccessorResetStrategy(
-                    vendorFamily = currentVendorFamilyLocked(),
+                    vendorFamily = vendorFamily,
                     nextResetCount = nextResetCount,
                     refreezeCount = guard.refreezeCount
                 )
@@ -1403,30 +1473,94 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     ) {
         MANAGED_LIVENESS_PACKAGES.forEach { packageName ->
             if (packageName !in config.packageTargets || !packageInstalled(packageName)) {
+                managedPackageFrozenSinceByPackage.remove(packageName)
                 return@forEach
             }
-            val processPresent = matchedProcesses.any { process ->
+            val packageProcesses = matchedProcesses.filter { process ->
                 packageForProcess(process.name) == packageName
             }
+            val processPresent = packageProcesses.isNotEmpty()
+            if (!processPresent) {
+                managedPackageFrozenSinceByPackage.remove(packageName)
+                if (
+                    !RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                        nowElapsed = now,
+                        lastWakeElapsed = lastManagedPackageWakeByPackage[packageName] ?: 0L,
+                        processPresent = false
+                    )
+                ) {
+                    return@forEach
+                }
+                lastManagedPackageWakeByPackage[packageName] = now
+                pulseAbsentPackageLocked(packageName, "managed_liveness_absent")
+                val launch = attemptBackgroundLauncherWakeLocked(
+                    packageName = packageName,
+                    reason = "managed_liveness_absent"
+                )
+                eventLocked(
+                    "managed_package_wake_attempted",
+                    "$packageName processPresent=false launcher=${launch.name.lowercase()}"
+                )
+                return@forEach
+            }
+
+            val frozen = packageProcesses.any { process ->
+                readFreezeState(process.pid).frozen == true
+            }
+            if (!frozen) {
+                if (managedPackageFrozenSinceByPackage.remove(packageName) != null) {
+                    eventLocked(
+                        "managed_package_verified_thawed",
+                        "$packageName pids=${packageProcesses.map { it.pid }.sorted()}"
+                    )
+                }
+                return@forEach
+            }
+
+            val frozenSince = managedPackageFrozenSinceByPackage[packageName]
+                ?.takeIf { it > 0L && it <= now }
+                ?: now.also {
+                    managedPackageFrozenSinceByPackage[packageName] = it
+                    eventLocked(
+                        "managed_package_verified_frozen",
+                        "$packageName pids=${packageProcesses.map { process -> process.pid }.sorted()}"
+                    )
+                }
             if (
-                !RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                !RecoveryCampaignPolicy.shouldAttemptFrozenManagedPackageWake(
                     nowElapsed = now,
-                    lastWakeElapsed = lastManagedPackageWakeByPackage[packageName] ?: 0L,
-                    processPresent = processPresent
+                    frozenSinceElapsed = frozenSince,
+                    lastWakeElapsed =
+                        lastManagedPackageFrozenWakeByPackage[packageName] ?: 0L
                 )
             ) {
                 return@forEach
             }
-            lastManagedPackageWakeByPackage[packageName] = now
-            pulseAbsentPackageLocked(packageName, "managed_liveness_absent")
+
+            lastManagedPackageFrozenWakeByPackage[packageName] = now
+            tunePackageLocked(packageName)
             val launch = attemptBackgroundLauncherWakeLocked(
                 packageName = packageName,
-                reason = "managed_liveness_absent"
+                reason = "managed_liveness_frozen",
+                foregroundHoldMs =
+                    RecoveryCampaignPolicy.MANAGED_PACKAGE_FROZEN_FOREGROUND_HOLD_MS
             )
+            val remainingFrozen = GuardianProcessParser.matching(
+                listProcessesLocked(),
+                processTargetsForPackage(packageName)
+            ).filter { process -> readFreezeState(process.pid).frozen == true }
             eventLocked(
-                "managed_package_wake_attempted",
-                "$packageName processPresent=false launcher=${launch.name.lowercase()}"
+                if (remainingFrozen.isEmpty()) {
+                    "managed_package_frozen_wake_verified"
+                } else {
+                    "managed_package_frozen_wake_failed"
+                },
+                "$packageName launcher=${launch.name.lowercase()} " +
+                    "remaining=${remainingFrozen.map { it.pid }.sorted()}"
             )
+            if (remainingFrozen.isEmpty()) {
+                managedPackageFrozenSinceByPackage.remove(packageName)
+            }
         }
     }
 
@@ -1461,7 +1595,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun attemptBackgroundLauncherWakeLocked(
         packageName: String,
-        reason: String
+        reason: String,
+        foregroundHoldMs: Long = PACKAGE_LAUNCH_HOME_DELAY_MS
     ): BackgroundLauncherWakeResult {
         if (packageName !in BACKGROUND_LAUNCH_WAKE_TARGETS) {
             eventLocked(
@@ -1522,7 +1657,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             return BackgroundLauncherWakeResult.START_FAILED
         }
 
-        SystemClock.sleep(PACKAGE_LAUNCH_HOME_DELAY_MS)
+        SystemClock.sleep(foregroundHoldMs.coerceAtLeast(0L))
         val home = runner.run(
             "am", "start", "--user", "0",
             "--activity-no-animation",
@@ -1534,7 +1669,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (!home.success) commandFailureCount += 1
         eventLocked(
             "package_background_launch_succeeded",
-            "$packageName reason=$reason component=$component home=${home.success}"
+            "$packageName reason=$reason component=$component home=${home.success} " +
+                "foregroundHoldMs=${foregroundHoldMs.coerceAtLeast(0L)}"
         )
         return BackgroundLauncherWakeResult.STARTED
     }
@@ -2839,6 +2975,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 put(packageName, guard.toJson())
             }
         })
+        .put("packageSuccessorCircuitUntil", JSONObject().apply {
+            packageSuccessorCircuitUntilByPackage.forEach { (packageName, until) ->
+                put(packageName, until)
+            }
+        })
         .put("lastPackageRebuild", lastPackageRebuildOutcome.toJson())
         .put("deliveryFailureEpisodes", JSONObject().apply {
             deliveryFailureEpisodesByPackage.forEach { (packageName, episodes) ->
@@ -2969,6 +3110,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var lastAbsencePulseElapsed: Long = 0L,
         var lastBackgroundLaunchElapsed: Long = 0L,
         var backgroundLaunchCount: Int = 0,
+        var circuitRescueAttempted: Boolean = false,
         var longGuardReported: Boolean = false,
         var resetBudgetReported: Boolean = false
     ) {
@@ -2988,6 +3130,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastAbsencePulseElapsed", lastAbsencePulseElapsed)
             .put("lastBackgroundLaunchElapsed", lastBackgroundLaunchElapsed)
             .put("backgroundLaunchCount", backgroundLaunchCount)
+            .put("circuitRescueAttempted", circuitRescueAttempted)
             .put("longGuardReported", longGuardReported)
             .put("resetBudgetReported", resetBudgetReported)
     }
@@ -3116,7 +3259,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 9
+        private const val STATUS_SCHEMA = 10
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L

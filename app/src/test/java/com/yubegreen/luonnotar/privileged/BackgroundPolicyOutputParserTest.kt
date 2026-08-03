@@ -66,4 +66,31 @@ class BackgroundPolicyOutputParserTest {
         assertTrue(BackgroundPolicyOutputParser.netPolicyContainsUid(output, 10237))
         assertFalse(BackgroundPolicyOutputParser.netPolicyContainsUid(output, 237))
     }
+
+    @Test fun mergesAndMatchesCloudLowLatencyWhitelistWithoutDuplicates() {
+        val merged = BackgroundPolicyOutputParser.mergeDelimitedSetting(
+            "com.google.android.gms, com.whatsapp;com.termux",
+            "com.whatsapp"
+        )
+        assertTrue(
+            BackgroundPolicyOutputParser.delimitedSettingContains(
+                merged,
+                "com.whatsapp"
+            )
+        )
+        assertTrue(
+            BackgroundPolicyOutputParser.delimitedSettingContains(
+                merged,
+                "com.termux"
+            )
+        )
+        assertFalse(
+            BackgroundPolicyOutputParser.delimitedSettingContains(
+                merged,
+                "com.what"
+            )
+        )
+        assertTrue(merged.split(',').count { it == "com.whatsapp" } == 1)
+    }
+
 }

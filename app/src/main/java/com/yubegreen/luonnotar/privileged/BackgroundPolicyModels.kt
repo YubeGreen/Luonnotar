@@ -361,7 +361,7 @@ object BackgroundPolicyVendorDetector {
 
     fun guidance(family: BackgroundPolicyVendorFamily): String = when (family) {
         BackgroundPolicyVendorFamily.XIAOMI ->
-            "已尝试写入 HyperOS/MIUI 的隐藏开机广播与后台自启动 AppOp；若报告中 10007/10008 未验证为 allow，仍需在系统设置中手动开启“后台自启动”和“省电策略：无限制”。"
+            "已尝试写入 HyperOS/MIUI 的隐藏开机广播、后台自启动 AppOp；HyperOS 3 还会合并 cloud_lowlatency_whitelist。若私有能力未验证，仍需在系统设置中手动开启“后台自启动”和“省电策略：无限制”。"
         BackgroundPolicyVendorFamily.VIVO ->
             "ADB 标准层已自动处理；OriginOS/iQOO 的后台高耗电、允许后台运行和自启动属于厂商私有层，需要在 i 管家或应用设置中确认。"
         BackgroundPolicyVendorFamily.OPPO ->
@@ -414,6 +414,16 @@ object BackgroundPolicyVendorDetector {
         else -> emptyList()
     }
 
+    fun supportsXiaomiCloudLowLatencyWhitelist(
+        device: BackgroundPolicyDeviceIdentity
+    ): Boolean =
+        device.family == BackgroundPolicyVendorFamily.XIAOMI &&
+            (
+                device.sdkInt >= 36 ||
+                    device.romVersion.startsWith("OS3", ignoreCase = true) ||
+                    device.romVersion.startsWith("3.")
+            )
+
     fun requiresPrivateLayerConfirmation(family: BackgroundPolicyVendorFamily): Boolean =
         family !in setOf(BackgroundPolicyVendorFamily.AOSP)
 }
@@ -449,6 +459,30 @@ object BackgroundPolicyOutputParser {
                 Regex("(?:^|[^A-Za-z0-9_.])${Regex.escape(packageName)}(?:$|[^A-Za-z0-9_.])")
                     .containsMatchIn(trimmed)
         }
+
+    fun delimitedSettingContains(raw: String, packageName: String): Boolean =
+        parseDelimitedSetting(raw).contains(packageName)
+
+    fun mergeDelimitedSetting(raw: String, packageName: String): String =
+        (parseDelimitedSetting(raw) + packageName)
+            .filter(GuardianEngineConfig::isSafePackageName)
+            .distinct()
+            .joinToString(",")
+
+    private fun parseDelimitedSetting(raw: String): List<String> {
+        val normalized = raw.trim()
+        if (
+            normalized.isBlank() ||
+            normalized.equals("null", ignoreCase = true) ||
+            normalized.equals("none", ignoreCase = true)
+        ) {
+            return emptyList()
+        }
+        return normalized
+            .split(',', ';', '\n', '\r', '\t', ' ')
+            .map(String::trim)
+            .filter(String::isNotBlank)
+    }
 
     fun netPolicyContainsUid(raw: String, uid: Int): Boolean =
         raw.lineSequence().any { line ->

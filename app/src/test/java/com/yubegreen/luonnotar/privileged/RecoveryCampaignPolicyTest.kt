@@ -372,4 +372,69 @@ class RecoveryCampaignPolicyTest {
         )
     }
 
+
+    @Test
+    fun vendorRefreezeCircuitBreakerStopsRunawayResetLoop() {
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOpenPackageSuccessorCircuit(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                resetCount = 4,
+                refreezeCount = 20
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOpenPackageSuccessorCircuit(
+                vendorFamily = BackgroundPolicyVendorFamily.AOSP,
+                resetCount = 20,
+                refreezeCount = 20
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldOpenPackageSuccessorCircuit(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                resetCount = RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_RESETS,
+                refreezeCount = RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldOpenPackageSuccessorCircuit(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                resetCount = 12,
+                refreezeCount = 12
+            )
+        )
+    }
+
+    @Test
+    fun frozenManagedPackageWakeRequiresPersistenceAndCooldown() {
+        assertFalse(
+            RecoveryCampaignPolicy.shouldAttemptFrozenManagedPackageWake(
+                nowElapsed = 110_000L,
+                frozenSinceElapsed = 100_000L,
+                lastWakeElapsed = 0L
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldAttemptFrozenManagedPackageWake(
+                nowElapsed = 115_000L,
+                frozenSinceElapsed = 100_000L,
+                lastWakeElapsed = 0L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldAttemptFrozenManagedPackageWake(
+                nowElapsed = 200_000L,
+                frozenSinceElapsed = 100_000L,
+                lastWakeElapsed = 150_000L
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldAttemptFrozenManagedPackageWake(
+                nowElapsed = 450_000L,
+                frozenSinceElapsed = 100_000L,
+                lastWakeElapsed = 150_000L
+            )
+        )
+    }
+
 }

@@ -19,7 +19,7 @@ internal class BackgroundPolicyEngine(
             .filter(GuardianEngineConfig::isSafePackageName)
             .distinct()
         val device = BackgroundPolicyVendorDetector.detect(readProperties())
-        val results = packages.map { applyToPackage(it, device.family, config) }
+        val results = packages.map { applyToPackage(it, device, config) }
         val hasConfirmedPolicyFailure = results.any { target ->
             target.installed && target.capabilities.any { capability ->
                 capability.state == BackgroundPolicyCapabilityState.FAILED
@@ -41,9 +41,10 @@ internal class BackgroundPolicyEngine(
 
     private fun applyToPackage(
         packageName: String,
-        vendorFamily: BackgroundPolicyVendorFamily,
+        device: BackgroundPolicyDeviceIdentity,
         config: GuardianEngineConfig
     ): BackgroundPolicyTargetResult {
+        val vendorFamily = device.family
         if (!packageInstalled(packageName)) {
             return BackgroundPolicyTargetResult(
                 packageName = packageName,
@@ -338,6 +339,10 @@ internal class BackgroundPolicyEngine(
             )
         }
 
+        if (BackgroundPolicyVendorDetector.supportsXiaomiCloudLowLatencyWhitelist(device)) {
+            capabilities += applyXiaomiCloudLowLatencyWhitelist(packageName, counter)
+        }
+
         val requiredNames = REQUIRED_CAPABILITIES
         val fullyVerified = requiredNames.all { name ->
             capabilities.firstOrNull { it.name == name }?.policySatisfied == true
@@ -349,6 +354,47 @@ internal class BackgroundPolicyEngine(
             commandsAttempted = counter.attempted,
             commandsSucceeded = counter.succeeded,
             capabilities = capabilities
+        )
+    }
+
+    private fun applyXiaomiCloudLowLatencyWhitelist(
+        packageName: String,
+        counter: CommandCounter
+    ): BackgroundPolicyCapabilityResult {
+        val before = runner.run(
+            "settings", "get", "system", XIAOMI_CLOUD_LOW_LATENCY_SETTING,
+            timeoutMs = VERIFY_TIMEOUT_MS
+        )
+        if (unsupported(before)) {
+            return BackgroundPolicyCapabilityResult(
+                name = "xiaomi_cloud_lowlatency_whitelist",
+                supported = false,
+                applied = false,
+                verified = false,
+                detail = before.summary()
+            )
+        }
+
+        val merged = BackgroundPolicyOutputParser.mergeDelimitedSetting(
+            before.stdout,
+            packageName
+        )
+        val apply = counter.run(
+            "settings", "put", "system", XIAOMI_CLOUD_LOW_LATENCY_SETTING, merged
+        )
+        val after = runner.run(
+            "settings", "get", "system", XIAOMI_CLOUD_LOW_LATENCY_SETTING,
+            timeoutMs = VERIFY_TIMEOUT_MS
+        )
+        return BackgroundPolicyCapabilityResult(
+            name = "xiaomi_cloud_lowlatency_whitelist",
+            supported = before.success || after.success,
+            applied = apply.success,
+            verified = BackgroundPolicyOutputParser.delimitedSettingContains(
+                after.stdout,
+                packageName
+            ),
+            detail = details(before, apply, after)
         )
     }
 
@@ -443,6 +489,8 @@ internal class BackgroundPolicyEngine(
         private const val APPLY_TIMEOUT_MS = 5_000L
         private const val VERIFY_TIMEOUT_MS = 4_000L
         private const val UNKNOWN_COMMAND_EXIT = 127
+        private const val XIAOMI_CLOUD_LOW_LATENCY_SETTING =
+            "cloud_lowlatency_whitelist"
         private val CORE_APP_OPS = listOf(
             "RUN_IN_BACKGROUND",
             "RUN_ANY_IN_BACKGROUND",

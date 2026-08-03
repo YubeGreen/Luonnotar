@@ -28,7 +28,14 @@ object RecoveryCampaignPolicy {
     const val PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_DELAY_MS = 15_000L
     const val PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_RETRY_MS = 60_000L
     const val PACKAGE_SUCCESSOR_MAX_BACKGROUND_LAUNCHES = 12
+    const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_RESETS = 5
+    const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES = 5
+    const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_COOLDOWN_MS = 30 * 60_000L
+    const val PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS = 8_000L
     const val MANAGED_PACKAGE_WAKE_INTERVAL_MS = 5 * 60_000L
+    const val MANAGED_PACKAGE_FROZEN_WAKE_DELAY_MS = 15_000L
+    const val MANAGED_PACKAGE_FROZEN_WAKE_INTERVAL_MS = 5 * 60_000L
+    const val MANAGED_PACKAGE_FROZEN_FOREGROUND_HOLD_MS = 8_000L
 
     const val GMS_CAMPAIGN_TICK_MS = 2_000L
     const val GMS_CAMPAIGN_DURATION_MS = 3 * 60_000L
@@ -162,6 +169,40 @@ object RecoveryCampaignPolicy {
                 vendorFamily == BackgroundPolicyVendorFamily.VIVO) ->
             PackageResetStrategy.FORCE_STOP_UNSTOP
         else -> PackageResetStrategy.KILL
+    }
+
+
+
+    fun shouldOpenPackageSuccessorCircuit(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        resetCount: Int,
+        refreezeCount: Int
+    ): Boolean =
+        vendorFamily in setOf(
+            BackgroundPolicyVendorFamily.XIAOMI,
+            BackgroundPolicyVendorFamily.VIVO
+        ) &&
+            resetCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_RESETS &&
+            refreezeCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES
+
+    fun shouldAttemptFrozenManagedPackageWake(
+        nowElapsed: Long,
+        frozenSinceElapsed: Long,
+        lastWakeElapsed: Long
+    ): Boolean {
+        if (
+            nowElapsed < 0L ||
+            frozenSinceElapsed <= 0L ||
+            frozenSinceElapsed > nowElapsed ||
+            lastWakeElapsed > nowElapsed
+        ) {
+            return false
+        }
+        if (nowElapsed - frozenSinceElapsed < MANAGED_PACKAGE_FROZEN_WAKE_DELAY_MS) {
+            return false
+        }
+        if (lastWakeElapsed <= 0L) return true
+        return nowElapsed - lastWakeElapsed >= MANAGED_PACKAGE_FROZEN_WAKE_INTERVAL_MS
     }
 
     fun shouldPulseAbsentPackageSuccessor(

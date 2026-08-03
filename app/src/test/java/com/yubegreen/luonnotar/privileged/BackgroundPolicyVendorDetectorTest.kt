@@ -21,6 +21,9 @@ class BackgroundPolicyVendorDetectorTest {
         assertEquals("HyperOS", device.romName)
         assertTrue(device.displayName().contains("Redmi"))
         assertTrue(BackgroundPolicyVendorDetector.requiresPrivateLayerConfirmation(device.family))
+        assertTrue(
+            BackgroundPolicyVendorDetector.supportsXiaomiCloudLowLatencyWhitelist(device)
+        )
     }
 
     @Test fun detectsIqooAsVivoFamily() {
@@ -119,5 +122,8 @@ class BackgroundPolicyVendorDetectorTest {
 
         assertEquals(BackgroundPolicyVendorFamily.AOSP, device.family)
         assertFalse(BackgroundPolicyVendorDetector.requiresPrivateLayerConfirmation(device.family))
+        assertFalse(
+            BackgroundPolicyVendorDetector.supportsXiaomiCloudLowLatencyWhitelist(device)
+        )
     }
 }
