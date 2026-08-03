@@ -48,3 +48,6 @@ tools/test-output/
 *.backup-*
 /努昂诺塔1.0-gpt.txt
 /新建 文本文档.txt
+
+# Sync signed Luonnotar release APKs
+!/Luonnotar-*-YubeGreen-release.apk
