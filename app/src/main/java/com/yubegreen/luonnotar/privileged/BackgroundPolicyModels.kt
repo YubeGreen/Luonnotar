@@ -437,6 +437,10 @@ object BackgroundPolicyOutputParser {
         Regex("(?:^|[=:\\s])false(?:$|\\s)", RegexOption.IGNORE_CASE)
             .containsMatchIn(raw.trim())
 
+    fun packageStoppedFalse(raw: String): Boolean =
+        Regex("""\bstopped=false\b""", RegexOption.IGNORE_CASE)
+            .containsMatchIn(raw)
+
     fun deviceIdleContains(raw: String, packageName: String): Boolean =
         raw.lineSequence().any { line ->
             val trimmed = line.trim()

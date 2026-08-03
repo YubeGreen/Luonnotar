@@ -66,6 +66,21 @@ internal class BackgroundPolicyEngine(
         val counter = CommandCounter()
         val capabilities = mutableListOf<BackgroundPolicyCapabilityResult>()
 
+        val unstopApply = counter.run(
+            "cmd", "package", "unstop", "--user", "0", packageName
+        )
+        val unstopRead = runner.run(
+            "dumpsys", "package", packageName,
+            timeoutMs = VERIFY_TIMEOUT_MS
+        )
+        capabilities += BackgroundPolicyCapabilityResult(
+            name = "package_unstopped",
+            supported = !unsupported(unstopApply) && unstopRead.success,
+            applied = unstopApply.success,
+            verified = BackgroundPolicyOutputParser.packageStoppedFalse(unstopRead.stdout),
+            detail = details(unstopApply, unstopRead)
+        )
+
         if (config.tuneStandby) {
             val inactiveSet = counter.run(
                 "am", "set-inactive", "--user", "0", packageName, "false"

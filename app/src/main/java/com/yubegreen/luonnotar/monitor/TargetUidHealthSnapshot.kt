@@ -82,6 +82,8 @@ data class TargetUidHealthSnapshot(
             "com.yubegreen.luonnotar",
             "ch.protonvpn.android",
             "com.tailscale.ipn",
+            "com.termux",
+            "com.termux.boot",
             "com.google.android.gms",
             "com.whatsapp",
             "com.whatsapp.w4b"

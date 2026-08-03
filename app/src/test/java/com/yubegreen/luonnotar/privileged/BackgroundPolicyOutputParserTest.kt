@@ -30,6 +30,19 @@ class BackgroundPolicyOutputParserTest {
         )
     }
 
+    @Test fun parsesPackageStoppedFlagWithoutAcceptingStoppedTrue() {
+        assertTrue(
+            BackgroundPolicyOutputParser.packageStoppedFalse(
+                "User 0: installed=true stopped=false notLaunched=false"
+            )
+        )
+        assertFalse(
+            BackgroundPolicyOutputParser.packageStoppedFalse(
+                "User 0: installed=true stopped=true notLaunched=false"
+            )
+        )
+    }
+
     @Test fun matchesDeviceIdlePackageExactly() {
         val output = """
             system-excidle,com.android.providers.downloads,10001

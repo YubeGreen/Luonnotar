@@ -95,7 +95,7 @@ data class GuardianEngineConfig(
         .toString()
 
     companion object {
-        const val SCHEMA = 4
+        const val SCHEMA = 5
 
         val DEFAULT_PROCESS_TARGETS = listOf(
             "com.google.android.gms",
@@ -104,6 +104,7 @@ data class GuardianEngineConfig(
             "com.whatsapp:account_switching",
             "com.whatsapp.w4b",
             "com.tailscale.ipn",
+            "com.termux",
             "ch.protonvpn.android"
         )
 
@@ -113,8 +114,13 @@ data class GuardianEngineConfig(
             "com.whatsapp",
             "com.whatsapp.w4b",
             "com.tailscale.ipn",
+            "com.termux",
+            "com.termux.boot",
             "ch.protonvpn.android"
         )
+
+        private val SCHEMA_5_PROCESS_ADDITIONS = listOf("com.termux")
+        private val SCHEMA_5_PACKAGE_ADDITIONS = listOf("com.termux", "com.termux.boot")
 
         private val SAFE_IDENTIFIER = Regex("^[A-Za-z0-9_]+(?:[.:][A-Za-z0-9_]+)+$")
 
@@ -128,9 +134,22 @@ data class GuardianEngineConfig(
             if (raw.isNullOrBlank()) return GuardianEngineConfig()
             return runCatching {
                 val json = JSONObject(raw)
+                val schema = json.optInt("schema", 0)
+                val storedProcessTargets =
+                    json.stringList("processTargets", DEFAULT_PROCESS_TARGETS)
+                val storedPackageTargets =
+                    json.stringList("packageTargets", DEFAULT_PACKAGE_TARGETS)
                 GuardianEngineConfig(
-                    processTargets = json.stringList("processTargets", DEFAULT_PROCESS_TARGETS),
-                    packageTargets = json.stringList("packageTargets", DEFAULT_PACKAGE_TARGETS),
+                    processTargets = if (schema < 5) {
+                        (storedProcessTargets + SCHEMA_5_PROCESS_ADDITIONS).distinct()
+                    } else {
+                        storedProcessTargets
+                    },
+                    packageTargets = if (schema < 5) {
+                        (storedPackageTargets + SCHEMA_5_PACKAGE_ADDITIONS).distinct()
+                    } else {
+                        storedPackageTargets
+                    },
                     pollIntervalMs = json.optLong("pollIntervalMs", 15_000L),
                     reassertIntervalMs = json.optLong("reassertIntervalMs", 60_000L),
                     tuningIntervalMs = json.optLong("tuningIntervalMs", 15 * 60_000L),

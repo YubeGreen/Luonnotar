@@ -24,6 +24,11 @@ object RecoveryCampaignPolicy {
     const val PACKAGE_SUCCESSOR_MEDIUM_BACKOFF_MS = 60_000L
     const val PACKAGE_SUCCESSOR_LONG_BACKOFF_MS = 2 * 60_000L
     const val PACKAGE_SUCCESSOR_MAX_BACKOFF_MS = 5 * 60_000L
+    const val PACKAGE_SUCCESSOR_ABSENCE_PULSE_INTERVAL_MS = 10_000L
+    const val PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_DELAY_MS = 15_000L
+    const val PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_RETRY_MS = 60_000L
+    const val PACKAGE_SUCCESSOR_MAX_BACKGROUND_LAUNCHES = 12
+    const val MANAGED_PACKAGE_WAKE_INTERVAL_MS = 5 * 60_000L
 
     const val GMS_CAMPAIGN_TICK_MS = 2_000L
     const val GMS_CAMPAIGN_DURATION_MS = 3 * 60_000L
@@ -146,6 +151,7 @@ object RecoveryCampaignPolicy {
         else -> PACKAGE_SUCCESSOR_MAX_BACKOFF_MS
     }
 
+    @Suppress("UNUSED_PARAMETER")
     fun packageSuccessorResetStrategy(
         vendorFamily: BackgroundPolicyVendorFamily,
         nextResetCount: Int,
@@ -155,8 +161,50 @@ object RecoveryCampaignPolicy {
             (vendorFamily == BackgroundPolicyVendorFamily.XIAOMI ||
                 vendorFamily == BackgroundPolicyVendorFamily.VIVO) ->
             PackageResetStrategy.FORCE_STOP_UNSTOP
-        nextResetCount >= 3 || refreezeCount >= 3 -> PackageResetStrategy.STOP_APP
         else -> PackageResetStrategy.KILL
+    }
+
+    fun shouldPulseAbsentPackageSuccessor(
+        nowElapsed: Long,
+        absentSinceElapsed: Long,
+        lastPulseElapsed: Long
+    ): Boolean {
+        if (nowElapsed < 0L || absentSinceElapsed <= 0L || absentSinceElapsed > nowElapsed) {
+            return false
+        }
+        if (lastPulseElapsed <= 0L || lastPulseElapsed > nowElapsed) return true
+        return nowElapsed - lastPulseElapsed >= PACKAGE_SUCCESSOR_ABSENCE_PULSE_INTERVAL_MS
+    }
+
+    fun shouldBackgroundLaunchAbsentPackageSuccessor(
+        nowElapsed: Long,
+        absentSinceElapsed: Long,
+        lastLaunchElapsed: Long,
+        launchCount: Int
+    ): Boolean {
+        if (
+            nowElapsed < 0L ||
+            absentSinceElapsed <= 0L ||
+            absentSinceElapsed > nowElapsed ||
+            launchCount >= PACKAGE_SUCCESSOR_MAX_BACKGROUND_LAUNCHES
+        ) {
+            return false
+        }
+        if (nowElapsed - absentSinceElapsed < PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_DELAY_MS) {
+            return false
+        }
+        if (lastLaunchElapsed <= 0L || lastLaunchElapsed > nowElapsed) return true
+        return nowElapsed - lastLaunchElapsed >= PACKAGE_SUCCESSOR_BACKGROUND_LAUNCH_RETRY_MS
+    }
+
+    fun shouldWakeManagedPackage(
+        nowElapsed: Long,
+        lastWakeElapsed: Long,
+        processPresent: Boolean
+    ): Boolean {
+        if (processPresent || nowElapsed < 0L || lastWakeElapsed > nowElapsed) return false
+        if (lastWakeElapsed <= 0L) return true
+        return nowElapsed - lastWakeElapsed >= MANAGED_PACKAGE_WAKE_INTERVAL_MS
     }
 
     fun shouldResetPackageSuccessor(

@@ -260,7 +260,7 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
-    fun packageSuccessorEscalatesFromKillToStopAppToForceStopUnstop() {
+    fun packageSuccessorAvoidsTerminalStopAppAndEscalatesVendorResetAtFive() {
         assertTrue(
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
                 BackgroundPolicyVendorFamily.XIAOMI,
@@ -273,7 +273,7 @@ class RecoveryCampaignPolicyTest {
                 BackgroundPolicyVendorFamily.XIAOMI,
                 nextResetCount = 3,
                 refreezeCount = 3
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.STOP_APP
+            ) == RecoveryCampaignPolicy.PackageResetStrategy.KILL
         )
         assertTrue(
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
@@ -287,7 +287,88 @@ class RecoveryCampaignPolicyTest {
                 BackgroundPolicyVendorFamily.AOSP,
                 nextResetCount = 5,
                 refreezeCount = 5
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.STOP_APP
+            ) == RecoveryCampaignPolicy.PackageResetStrategy.KILL
+        )
+    }
+
+    @Test
+    fun absentSuccessorGetsPulsedThenBackgroundLaunchedWithBounds() {
+        assertTrue(
+            RecoveryCampaignPolicy.shouldPulseAbsentPackageSuccessor(
+                nowElapsed = 100_000L,
+                absentSinceElapsed = 100_000L,
+                lastPulseElapsed = 0L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldPulseAbsentPackageSuccessor(
+                nowElapsed = 105_000L,
+                absentSinceElapsed = 100_000L,
+                lastPulseElapsed = 100_000L
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldPulseAbsentPackageSuccessor(
+                nowElapsed = 110_000L,
+                absentSinceElapsed = 100_000L,
+                lastPulseElapsed = 100_000L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldBackgroundLaunchAbsentPackageSuccessor(
+                nowElapsed = 110_000L,
+                absentSinceElapsed = 100_000L,
+                lastLaunchElapsed = 0L,
+                launchCount = 0
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldBackgroundLaunchAbsentPackageSuccessor(
+                nowElapsed = 115_000L,
+                absentSinceElapsed = 100_000L,
+                lastLaunchElapsed = 0L,
+                launchCount = 0
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldBackgroundLaunchAbsentPackageSuccessor(
+                nowElapsed = 200_000L,
+                absentSinceElapsed = 100_000L,
+                lastLaunchElapsed = 0L,
+                launchCount = RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_MAX_BACKGROUND_LAUNCHES
+            )
+        )
+    }
+
+    @Test
+    fun managedPackageWakeIsAbsentOnlyAndRateLimited() {
+        assertTrue(
+            RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                nowElapsed = 100_000L,
+                lastWakeElapsed = 0L,
+                processPresent = false
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                nowElapsed = 100_000L,
+                lastWakeElapsed = 0L,
+                processPresent = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                nowElapsed = 200_000L,
+                lastWakeElapsed = 100_000L,
+                processPresent = false
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldWakeManagedPackage(
+                nowElapsed = 500_000L,
+                lastWakeElapsed = 100_000L,
+                processPresent = false
+            )
         )
     }
 

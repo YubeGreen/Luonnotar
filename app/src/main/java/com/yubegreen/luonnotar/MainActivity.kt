@@ -484,8 +484,8 @@ class MainActivity : AppCompatActivity() {
         root.addView(TextView(this).apply {
             text =
                 "该引擎运行在 shell/root UID 的独立 UserService 中，不依赖努昂诺塔主进程或 :keeper 存活。" +
-                    "自动 GMS 深度恢复只在确认 GMS 真实冻结且 MCS 持续缺失时启动。" +
-                    "vivo / iQOO 会使用已验证的 force-stop → unstop 恢复链；失败后退避重试，不会因每日预算永久停摆。"
+                    "自动 GMS 深度恢复默认关闭；开启后仅在 10 分钟内出现至少 3 次独立 GMS 冻结证据时，" +
+                    "才会 force-stop GMS，并执行 6 小时冷却与每日 2 次上限。"
             textSize = if (tabletLayout) 15f else 12f
             setTextColor(palette.secondary)
             setPadding(dp(4), dp(2), dp(4), dp(12))
@@ -2073,7 +2073,9 @@ class MainActivity : AppCompatActivity() {
               "com.whatsapp",
               "com.whatsapp.w4b",
               "ch.protonvpn.android",
-              "com.tailscale.ipn"
+              "com.tailscale.ipn",
+              "com.termux",
+              "com.termux.boot"
             )
             ${'$'}installed = @()
             foreach (${'$'}package in ${'$'}targets) {

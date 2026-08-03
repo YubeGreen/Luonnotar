@@ -16,6 +16,12 @@ class TargetUidHealthSnapshotTest {
         assertTrue(
             TargetUidHealthSnapshot.isAllowedTargetPackage("com.whatsapp")
         )
+        assertTrue(
+            TargetUidHealthSnapshot.isAllowedTargetPackage("com.termux")
+        )
+        assertTrue(
+            TargetUidHealthSnapshot.isAllowedTargetPackage("com.termux.boot")
+        )
         assertFalse(
             TargetUidHealthSnapshot.isAllowedTargetPackage(
                 "com.example.untrusted"
