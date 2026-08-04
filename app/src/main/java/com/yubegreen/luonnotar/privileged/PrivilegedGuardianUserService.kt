@@ -1078,16 +1078,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val commandDetails = mutableListOf<String>()
         var strategy = requestedStrategy
-        if (
-            packageName in DELIVERY_PACKAGE_TARGETS &&
-            strategy == RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP
-        ) {
-            strategy = RecoveryCampaignPolicy.PackageResetStrategy.KILL
-            eventLocked(
-                "package_force_stop_blocked",
-                "$packageName trigger=$trigger reason=delivery_target_non_destructive fallback=$strategy"
-            )
-        }
         if (strategy == RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP) {
             val canUnstop = verifyPackageUnstopBeforeForceStopLocked(packageName, commandDetails)
             if (!canUnstop) {
@@ -2744,7 +2734,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             generation = generation,
             startedElapsed = now,
             deadlineElapsed = now + RecoveryCampaignPolicy.GMS_CAMPAIGN_DURATION_MS,
-            initialPids = oldPids
+            initialPids = oldPids,
+            nextResetEligibleElapsed = now +
+                RecoveryCampaignPolicy.gmsInitialResetDelayMs(vendorFamily)
         )
         gmsRecoveryCampaign = campaign
         gmsRecoveryInProgress = true
@@ -2756,7 +2748,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "gms_recovery_campaign_started",
             "trigger=$trigger manual=$manual generation=$generation oldPids=${oldPids.sorted()} " +
                 "strongEvidence=$strongEvidence emergency=$emergency vendor=$vendorFamily " +
-                "decision=${campaignDecision.reason} evidence=${automaticEvidenceReason.orEmpty()}"
+                "decision=${campaignDecision.reason} evidence=${automaticEvidenceReason.orEmpty()} " +
+                "nextResetEligibleElapsed=${campaign.nextResetEligibleElapsed}"
+        )
+        ensureGmsPreconnectionLeaseLocked(
+            campaign = campaign,
+            nowElapsed = now,
+            reason = "campaign_started",
+            force = true
         )
         persistStatusLocked(force = true)
 
@@ -2813,7 +2812,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             campaign.stabilizationStartedElapsed = 0L
             campaign.stabilizationDegradedSinceElapsed = 0L
             campaign.stabilizationLeaseRequestedElapsed = 0L
+            if (pidsBefore.isNotEmpty()) {
+                ensureGmsPreconnectionLeaseLocked(
+                    campaign = campaign,
+                    nowElapsed = now,
+                    reason = "successor_observed",
+                    force = true
+                )
+            }
         }
+
+        ensureGmsPreconnectionLeaseLocked(
+            campaign = campaign,
+            nowElapsed = now,
+            reason = "campaign_refresh",
+            force = false
+        )
 
         val frozenBefore = processesBefore.filter { readFreezeState(it.pid).frozen == true }
         val frozenBeforePids = frozenBefore.mapTo(linkedSetOf()) { it.pid }
@@ -2854,11 +2868,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (campaign.stabilizationStartedElapsed <= 0L) {
                 campaign.stabilizationStartedElapsed = now
                 campaign.stabilizationLeaseRequestedElapsed = now
-                val lease = sendGmsStabilizationLeaseLocked()
+                val lease = ensureGmsPreconnectionLeaseLocked(
+                    campaign = campaign,
+                    nowElapsed = now,
+                    reason = "transport_restored",
+                    force = true
+                )
                 eventLocked(
                     "gms_recovery_stabilization_lease_started",
                     "generation=$generation ports=${probe.establishedPorts.sorted()} " +
-                        "lease=${lease.summary()} durationMs=${RecoveryCampaignPolicy.GMS_STABILIZATION_LEASE_MS}"
+                        "lease=${lease?.summary().orEmpty()} " +
+                        "durationMs=${RecoveryCampaignPolicy.GMS_STABILIZATION_LEASE_MS}"
                 )
             }
             campaign.stabilizationDegradedSinceElapsed = 0L
@@ -2903,8 +2923,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 now - campaign.stabilizationDegradedSinceElapsed <
                     RecoveryCampaignPolicy.GMS_STABILIZATION_DEGRADED_GRACE_MS
 
+        val vendorFamily = currentVendorFamilyLocked()
+        val resetEligible = now >= campaign.nextResetEligibleElapsed
         if (
             !stabilizationGraceActive &&
+            resetEligible &&
             RecoveryCampaignPolicy.shouldResetGmsAgain(
                 nowElapsed = now,
                 lastResetElapsed = campaign.lastResetElapsed,
@@ -2912,7 +2935,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 anyGmsFrozen = anyFrozen,
                 transportHealthy = probe.healthy,
                 maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
-                    currentVendorFamilyLocked()
+                    vendorFamily
                 )
             )
         ) {
@@ -2922,6 +2945,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "gms_recovery_reset_deferred_stabilization_grace",
                 "generation=$generation degradedForMs=" +
                     (now - campaign.stabilizationDegradedSinceElapsed).coerceAtLeast(0L) +
+                    " frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
+            )
+        } else if (
+            !resetEligible &&
+            !probe.healthy &&
+            campaign.resetWaitReportedForCount != campaign.resetCount
+        ) {
+            campaign.resetWaitReportedForCount = campaign.resetCount
+            eventLocked(
+                "gms_recovery_reset_deferred_preconnection_lease",
+                "generation=$generation resetCount=${campaign.resetCount} " +
+                    "waitRemainingMs=" +
+                    (campaign.nextResetEligibleElapsed - now).coerceAtLeast(0L) +
                     " frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
             )
         }
@@ -3026,11 +3062,31 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         wakeGmsDependentsLocked()
         tunePackageLocked(GMS_PACKAGE)
+        val resetCompletedElapsed = SystemClock.elapsedRealtime()
+        val nextWaitMs = RecoveryCampaignPolicy.gmsPostResetWaitMs(
+            vendorFamily = vendorFamily,
+            resetCount = campaign.resetCount,
+            forceStopCount = campaign.forceStopCount
+        )
+        campaign.nextResetEligibleElapsed = if (nextWaitMs == Long.MAX_VALUE) {
+            Long.MAX_VALUE
+        } else {
+            resetCompletedElapsed + nextWaitMs
+        }
+        campaign.resetWaitReportedForCount = -1
+        ensureGmsPreconnectionLeaseLocked(
+            campaign = campaign,
+            nowElapsed = resetCompletedElapsed,
+            reason = "reset_${campaign.resetCount}_completed",
+            force = true
+        )
         campaign.commandDetails += details
         eventLocked(
             "gms_recovery_reset_completed",
             "generation=${campaign.generation} reset=${campaign.resetCount} " +
-                "remainingOldPids=${remainingOldPids.sorted()} commands=${details.joinToString(" | ")}"
+                "remainingOldPids=${remainingOldPids.sorted()} " +
+                "nextResetEligibleElapsed=${campaign.nextResetEligibleElapsed} " +
+                "commands=${details.joinToString(" | ")}"
         )
     }
 
@@ -3194,6 +3250,31 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         actionCount += 1
         if (!result.success) commandFailureCount += 1
         eventLocked("gms_recovery_binder_pulse", result.summary())
+        return result
+    }
+
+    private fun ensureGmsPreconnectionLeaseLocked(
+        campaign: GmsRecoveryCampaign,
+        nowElapsed: Long,
+        reason: String,
+        force: Boolean
+    ): GuardianCommandResult? {
+        if (
+            !force &&
+            campaign.preconnectionLeaseRequestedElapsed > 0L &&
+            nowElapsed - campaign.preconnectionLeaseRequestedElapsed <
+                RecoveryCampaignPolicy.GMS_PRECONNECTION_LEASE_REFRESH_MS
+        ) {
+            return null
+        }
+        val result = sendGmsStabilizationLeaseLocked()
+        campaign.preconnectionLeaseRequestedElapsed = nowElapsed
+        eventLocked(
+            "gms_recovery_preconnection_lease_requested",
+            "generation=${campaign.generation} reason=$reason " +
+                "result=${result.summary()} durationMs=" +
+                RecoveryCampaignPolicy.GMS_STABILIZATION_LEASE_MS
+        )
         return result
     }
 
@@ -3887,6 +3968,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var resetCount: Int = 0,
         var refreezeCount: Int = 0,
         var forceStopCount: Int = 0,
+        var nextResetEligibleElapsed: Long = 0L,
+        var resetWaitReportedForCount: Int = -1,
+        var preconnectionLeaseRequestedElapsed: Long = 0L,
         var stabilizationStartedElapsed: Long = 0L,
         var stabilizationDegradedSinceElapsed: Long = 0L,
         var stabilizationLeaseRequestedElapsed: Long = 0L,
@@ -3906,6 +3990,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("resetCount", resetCount)
             .put("refreezeCount", refreezeCount)
             .put("forceStopCount", forceStopCount)
+            .put("nextResetEligibleElapsed", nextResetEligibleElapsed)
+            .put("resetWaitReportedForCount", resetWaitReportedForCount)
+            .put("preconnectionLeaseRequestedElapsed", preconnectionLeaseRequestedElapsed)
             .put("stabilizationStartedElapsed", stabilizationStartedElapsed)
             .put("stabilizationDegradedSinceElapsed", stabilizationDegradedSinceElapsed)
             .put("stabilizationLeaseRequestedElapsed", stabilizationLeaseRequestedElapsed)
@@ -4005,7 +4092,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 12
+        private const val STATUS_SCHEMA = 13
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L

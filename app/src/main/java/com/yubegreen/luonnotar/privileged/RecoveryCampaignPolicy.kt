@@ -47,11 +47,15 @@ object RecoveryCampaignPolicy {
     const val GMS_CAMPAIGN_TICK_MS = 2_000L
     const val GMS_CAMPAIGN_DURATION_MS = 4 * 60_000L
     const val GMS_CAMPAIGN_STABLE_MS = 60_000L
-    const val GMS_STABILIZATION_LEASE_MS = 90_000L
+    const val GMS_STABILIZATION_LEASE_MS = 120_000L
+    const val GMS_PRECONNECTION_LEASE_REFRESH_MS = 30_000L
+    const val GMS_VIVO_INITIAL_PRECONNECTION_WAIT_MS = 20_000L
+    const val GMS_VIVO_AFTER_STOP_APP_WAIT_MS = 45_000L
+    const val GMS_VIVO_AFTER_FORCE_STOP_WAIT_MS = 120_000L
     const val GMS_STABILIZATION_DEGRADED_GRACE_MS = 20_000L
     const val GMS_MIN_RESET_INTERVAL_MS = 10_000L
     const val GMS_MAX_RESETS_PER_CAMPAIGN = 4
-    const val GMS_VIVO_MAX_RESETS_PER_CAMPAIGN = 3
+    const val GMS_VIVO_MAX_RESETS_PER_CAMPAIGN = 2
     const val GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN = 2
     const val GMS_VIVO_MAX_FORCE_STOPS_PER_CAMPAIGN = 1
     const val GMS_EMERGENCY_COOLDOWN_MS = 2 * 60_000L
@@ -193,6 +197,28 @@ object RecoveryCampaignPolicy {
         GMS_VIVO_MAX_FORCE_STOPS_PER_CAMPAIGN
     } else {
         GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN
+    }
+
+    fun gmsInitialResetDelayMs(
+        vendorFamily: BackgroundPolicyVendorFamily
+    ): Long = if (vendorFamily == BackgroundPolicyVendorFamily.VIVO) {
+        GMS_VIVO_INITIAL_PRECONNECTION_WAIT_MS
+    } else {
+        0L
+    }
+
+    fun gmsPostResetWaitMs(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        resetCount: Int,
+        forceStopCount: Int
+    ): Long = if (vendorFamily == BackgroundPolicyVendorFamily.VIVO) {
+        when {
+            forceStopCount > 0 -> Long.MAX_VALUE
+            resetCount <= 1 -> GMS_VIVO_AFTER_STOP_APP_WAIT_MS
+            else -> GMS_VIVO_AFTER_FORCE_STOP_WAIT_MS
+        }
+    } else {
+        GMS_MIN_RESET_INTERVAL_MS
     }
 
     fun shouldUseForceStopForGms(

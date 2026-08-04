@@ -357,7 +357,7 @@ class RecoveryCampaignPolicyTest {
     @Test
     fun vivoGmsForceStopIsDelayedAndBudgeted() {
         assertEquals(
-            3,
+            2,
             RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
                 BackgroundPolicyVendorFamily.VIVO
             )
@@ -390,6 +390,40 @@ class RecoveryCampaignPolicyTest {
                 resetCount = 3,
                 refreezeCount = 2,
                 forceStopCount = 1
+            )
+        )
+    }
+
+    @Test
+    fun vivoGmsCampaignWaitsForPreconnectionAndStopsAfterForceStop() {
+        assertEquals(
+            20_000L,
+            RecoveryCampaignPolicy.gmsInitialResetDelayMs(
+                BackgroundPolicyVendorFamily.VIVO
+            )
+        )
+        assertEquals(
+            45_000L,
+            RecoveryCampaignPolicy.gmsPostResetWaitMs(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                resetCount = 1,
+                forceStopCount = 0
+            )
+        )
+        assertEquals(
+            Long.MAX_VALUE,
+            RecoveryCampaignPolicy.gmsPostResetWaitMs(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                resetCount = 2,
+                forceStopCount = 1
+            )
+        )
+        assertEquals(
+            RecoveryCampaignPolicy.GMS_MIN_RESET_INTERVAL_MS,
+            RecoveryCampaignPolicy.gmsPostResetWaitMs(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                resetCount = 1,
+                forceStopCount = 0
             )
         )
     }

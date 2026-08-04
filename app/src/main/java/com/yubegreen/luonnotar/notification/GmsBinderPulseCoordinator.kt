@@ -17,15 +17,16 @@ import kotlin.math.max
  * Repeatedly creates a public GMS location Binder connection, performs a
  * read-only location-settings query, and disconnects.
  *
- * The short LAB_TEST mode remains a manual diagnostic.  The bounded
- * STABILIZATION_LEASE mode is used only after a privileged recovery has
- * already restored MCS, to keep public Binder traffic flowing while the ROM's
- * freezer is most likely to refreeze the new GMS processes.
+ * The short LAB_TEST mode remains a manual diagnostic. The bounded
+ * STABILIZATION_LEASE mode is also started before MCS exists and is refreshed
+ * across GMS PID replacements. This keeps public Binder traffic flowing during
+ * both connection bootstrap and the post-recovery refreeze window.
  */
 @Suppress("DEPRECATION")
 object GmsBinderPulseCoordinator {
     const val TEST_DURATION_MS = 15_000L
-    const val STABILIZATION_DURATION_MS = 90_000L
+    const val STABILIZATION_DURATION_MS = 120_000L
+    const val STABILIZATION_MAX_TOTAL_MS = 4 * 60_000L
     const val PULSE_INTERVAL_MS = 2_000L
     const val CONNECTED_HOLD_MS = 750L
     const val STABILIZATION_CONNECTED_HOLD_MS = 1_500L
@@ -94,44 +95,54 @@ object GmsBinderPulseCoordinator {
 
     private fun requestStart(context: Context, spec: PulseSpec): Boolean {
         var runToReplace: PulseRun? = null
-        val requestId = synchronized(stateLock) {
+        var runToExtend: PulseRun? = null
+        var rejected = false
+        var requestId = 0L
+
+        synchronized(stateLock) {
             val active = activeRun
             if (spec.mode == PulseMode.STABILIZATION_LEASE) {
                 if (active?.modeName == PulseMode.STABILIZATION_LEASE.name) {
-                    LogManager.event(
-                        context,
-                        "gms_binder_pulse_coalesced",
-                        mapOf(
-                            "reason" to "stabilization_already_active",
-                            "requestedMode" to spec.mode.name,
-                            "requestedReason" to spec.reason
-                        )
-                    )
-                    return true
-                }
-                // A short diagnostic pulse must never block the recovery lease.
-                // Invalidate any queued request and replace a running LAB_TEST on
-                // the main thread before claiming the stabilization run.
-                pendingRequestId = 0L
-                if (active != null) {
-                    runToReplace = active
-                    activeRun = null
+                    runToExtend = active
+                } else {
+                    // A short diagnostic pulse must never block the recovery
+                    // lease. Replace it before claiming the long-lived run.
+                    pendingRequestId = 0L
+                    if (active != null) {
+                        runToReplace = active
+                        activeRun = null
+                    }
+                    nextRequestId += 1L
+                    pendingRequestId = nextRequestId
+                    requestId = nextRequestId
                 }
             } else if (pendingRequestId != 0L || active != null) {
-                LogManager.event(
-                    context,
-                    "gms_binder_pulse_rejected",
-                    mapOf(
-                        "reason" to "already_running_or_queued",
-                        "requestedMode" to spec.mode.name,
-                        "requestedReason" to spec.reason
-                    )
-                )
-                return false
+                rejected = true
+            } else {
+                nextRequestId += 1L
+                pendingRequestId = nextRequestId
+                requestId = nextRequestId
             }
-            nextRequestId += 1L
-            pendingRequestId = nextRequestId
-            nextRequestId
+        }
+
+        if (rejected) {
+            LogManager.event(
+                context,
+                "gms_binder_pulse_rejected",
+                mapOf(
+                    "reason" to "already_running_or_queued",
+                    "requestedMode" to spec.mode.name,
+                    "requestedReason" to spec.reason
+                )
+            )
+            return false
+        }
+
+        runToExtend?.let { existing ->
+            runOnMain {
+                existing.extend(spec.reason, spec.durationMs)
+            }
+            return true
         }
 
         val startRunnable = Runnable {
@@ -248,6 +259,30 @@ object GmsBinderPulseCoordinator {
         fun stop(reason: String) {
             if (!running) return
             finish(reason, completed = false)
+        }
+
+        fun extend(reason: String, durationMs: Long) {
+            check(Looper.myLooper() == Looper.getMainLooper())
+            if (!running || spec.mode != PulseMode.STABILIZATION_LEASE) return
+            val now = SystemClock.elapsedRealtime()
+            val previousDeadline = deadlineElapsed
+            val hardDeadline = startedElapsed + STABILIZATION_MAX_TOTAL_MS
+            deadlineElapsed = minOf(
+                hardDeadline,
+                maxOf(previousDeadline, now + durationMs.coerceAtLeast(0L))
+            )
+            LogManager.event(
+                context,
+                "gms_binder_stabilization_lease_extended",
+                mapOf(
+                    "requestReason" to reason,
+                    "previousDeadlineElapsed" to previousDeadline,
+                    "deadlineElapsed" to deadlineElapsed,
+                    "remainingMs" to (deadlineElapsed - now).coerceAtLeast(0L),
+                    "hardDeadlineElapsed" to hardDeadline,
+                    "hostPid" to Process.myPid()
+                )
+            )
         }
 
         private fun runPulse(runGeneration: Long) {
