@@ -32,6 +32,7 @@ object RecoveryCampaignPolicy {
     const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES = 5
     const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_COOLDOWN_MS = 30 * 60_000L
     const val PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS = 8_000L
+    const val PACKAGE_SUCCESSOR_CIRCUIT_DELIVERY_RESCUE_INTERVAL_MS = 2 * 60_000L
     const val MANAGED_PACKAGE_WAKE_INTERVAL_MS = 5 * 60_000L
     const val MANAGED_PACKAGE_FROZEN_WAKE_DELAY_MS = 15_000L
     const val MANAGED_PACKAGE_FROZEN_WAKE_INTERVAL_MS = 5 * 60_000L
@@ -41,11 +42,14 @@ object RecoveryCampaignPolicy {
     const val GMS_CAMPAIGN_DURATION_MS = 3 * 60_000L
     const val GMS_CAMPAIGN_STABLE_MS = 15_000L
     const val GMS_MIN_RESET_INTERVAL_MS = 10_000L
-    const val GMS_MAX_RESETS_PER_CAMPAIGN = 8
+    const val GMS_MAX_RESETS_PER_CAMPAIGN = 4
+    const val GMS_VIVO_MAX_RESETS_PER_CAMPAIGN = 3
+    const val GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN = 2
+    const val GMS_VIVO_MAX_FORCE_STOPS_PER_CAMPAIGN = 1
     const val GMS_EMERGENCY_COOLDOWN_MS = 2 * 60_000L
-    const val GMS_VIVO_RETRY_COOLDOWN_MS = 30_000L
-    const val GMS_POST_LIMIT_BACKOFF_MS = 10 * 60_000L
-    const val GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS = 12
+    const val GMS_VIVO_RETRY_COOLDOWN_MS = 30 * 60_000L
+    const val GMS_POST_LIMIT_BACKOFF_MS = 2 * 60 * 60_000L
+    const val GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS = 6
 
     enum class PackageResetStrategy {
         KILL,
@@ -141,14 +145,36 @@ object RecoveryCampaignPolicy {
         )
     }
 
+    fun gmsMaxResetsPerCampaign(
+        vendorFamily: BackgroundPolicyVendorFamily
+    ): Int = if (vendorFamily == BackgroundPolicyVendorFamily.VIVO) {
+        GMS_VIVO_MAX_RESETS_PER_CAMPAIGN
+    } else {
+        GMS_MAX_RESETS_PER_CAMPAIGN
+    }
+
+    fun gmsMaxForceStopsPerCampaign(
+        vendorFamily: BackgroundPolicyVendorFamily
+    ): Int = if (vendorFamily == BackgroundPolicyVendorFamily.VIVO) {
+        GMS_VIVO_MAX_FORCE_STOPS_PER_CAMPAIGN
+    } else {
+        GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN
+    }
+
     fun shouldUseForceStopForGms(
         vendorFamily: BackgroundPolicyVendorFamily,
         resetCount: Int,
-        refreezeCount: Int
-    ): Boolean =
-        vendorFamily == BackgroundPolicyVendorFamily.VIVO ||
-            resetCount > 1 ||
-            refreezeCount > 0
+        refreezeCount: Int,
+        forceStopCount: Int
+    ): Boolean {
+        if (forceStopCount >= gmsMaxForceStopsPerCampaign(vendorFamily)) return false
+        return when (vendorFamily) {
+            BackgroundPolicyVendorFamily.VIVO ->
+                resetCount >= 2
+            else ->
+                resetCount > 1 || refreezeCount > 0
+        }
+    }
 
     fun packageSuccessorResetIntervalMs(resetCount: Int): Long = when {
         resetCount < PACKAGE_SUCCESSOR_FAST_RESETS -> PACKAGE_SUCCESSOR_FAST_RESET_INTERVAL_MS
@@ -184,6 +210,25 @@ object RecoveryCampaignPolicy {
         ) &&
             resetCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_RESETS &&
             refreezeCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES
+
+    fun shouldAttemptCircuitDeliveryRescue(
+        nowElapsed: Long,
+        circuitUntilElapsed: Long,
+        lastRescueElapsed: Long,
+        verifiedFrozen: Boolean
+    ): Boolean {
+        if (
+            !verifiedFrozen ||
+            nowElapsed < 0L ||
+            circuitUntilElapsed <= nowElapsed ||
+            lastRescueElapsed > nowElapsed
+        ) {
+            return false
+        }
+        if (lastRescueElapsed <= 0L) return true
+        return nowElapsed - lastRescueElapsed >=
+            PACKAGE_SUCCESSOR_CIRCUIT_DELIVERY_RESCUE_INTERVAL_MS
+    }
 
     fun shouldAttemptFrozenManagedPackageWake(
         nowElapsed: Long,
@@ -265,10 +310,11 @@ object RecoveryCampaignPolicy {
         lastResetElapsed: Long,
         resetCount: Int,
         anyGmsFrozen: Boolean,
-        transportHealthy: Boolean
+        transportHealthy: Boolean,
+        maxResetCount: Int = GMS_MAX_RESETS_PER_CAMPAIGN
     ): Boolean {
         if (nowElapsed < 0L || lastResetElapsed > nowElapsed) return false
-        if (resetCount >= GMS_MAX_RESETS_PER_CAMPAIGN) return false
+        if (resetCount >= maxResetCount.coerceAtLeast(0)) return false
         if (transportHealthy && !anyGmsFrozen) return false
         if (lastResetElapsed <= 0L) return true
         return nowElapsed - lastResetElapsed >= GMS_MIN_RESET_INTERVAL_MS

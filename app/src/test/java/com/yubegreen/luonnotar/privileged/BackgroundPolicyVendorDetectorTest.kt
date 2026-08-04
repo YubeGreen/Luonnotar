@@ -81,6 +81,8 @@ class BackgroundPolicyVendorDetectorTest {
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.yubegreen.luonnotar"))
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.google.android.gms"))
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.whatsapp"))
+        assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("org.thoughtcrime.securesms"))
+        assertTrue(GuardianEngineConfig.DEFAULT_PROCESS_TARGETS.contains("org.thoughtcrime.securesms"))
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.tailscale.ipn"))
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.termux"))
         assertTrue(GuardianEngineConfig.DEFAULT_PACKAGE_TARGETS.contains("com.termux.boot"))

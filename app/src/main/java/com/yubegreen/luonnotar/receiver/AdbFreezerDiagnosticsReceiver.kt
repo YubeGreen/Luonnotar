@@ -216,7 +216,8 @@ class AdbFreezerDiagnosticsReceiver : BroadcastReceiver() {
             "com.termux.boot",
             "com.google.android.gms",
             "com.whatsapp",
-            "com.whatsapp.w4b"
+            "com.whatsapp.w4b",
+            "org.thoughtcrime.securesms"
         )
         return runCatching {
             val array = JSONArray(raw)

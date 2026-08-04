@@ -22,6 +22,9 @@ class TargetUidHealthSnapshotTest {
         assertTrue(
             TargetUidHealthSnapshot.isAllowedTargetPackage("com.termux.boot")
         )
+        assertTrue(
+            TargetUidHealthSnapshot.isAllowedTargetPackage("org.thoughtcrime.securesms")
+        )
         assertFalse(
             TargetUidHealthSnapshot.isAllowedTargetPackage(
                 "com.example.untrusted"

@@ -86,7 +86,8 @@ data class TargetUidHealthSnapshot(
             "com.termux.boot",
             "com.google.android.gms",
             "com.whatsapp",
-            "com.whatsapp.w4b"
+            "com.whatsapp.w4b",
+            "org.thoughtcrime.securesms"
         )
 
         internal fun isAllowedTargetPackage(packageName: String): Boolean =

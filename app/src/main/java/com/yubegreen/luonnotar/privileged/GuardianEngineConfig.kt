@@ -95,7 +95,7 @@ data class GuardianEngineConfig(
         .toString()
 
     companion object {
-        const val SCHEMA = 5
+        const val SCHEMA = 6
 
         val DEFAULT_PROCESS_TARGETS = listOf(
             "com.google.android.gms",
@@ -105,6 +105,7 @@ data class GuardianEngineConfig(
             "com.whatsapp.w4b",
             "com.tailscale.ipn",
             "com.termux",
+            "org.thoughtcrime.securesms",
             "ch.protonvpn.android"
         )
 
@@ -116,11 +117,14 @@ data class GuardianEngineConfig(
             "com.tailscale.ipn",
             "com.termux",
             "com.termux.boot",
+            "org.thoughtcrime.securesms",
             "ch.protonvpn.android"
         )
 
         private val SCHEMA_5_PROCESS_ADDITIONS = listOf("com.termux")
         private val SCHEMA_5_PACKAGE_ADDITIONS = listOf("com.termux", "com.termux.boot")
+        private val SCHEMA_6_PROCESS_ADDITIONS = listOf("org.thoughtcrime.securesms")
+        private val SCHEMA_6_PACKAGE_ADDITIONS = listOf("org.thoughtcrime.securesms")
 
         private val SAFE_IDENTIFIER = Regex("^[A-Za-z0-9_]+(?:[.:][A-Za-z0-9_]+)+$")
 
@@ -140,16 +144,16 @@ data class GuardianEngineConfig(
                 val storedPackageTargets =
                     json.stringList("packageTargets", DEFAULT_PACKAGE_TARGETS)
                 GuardianEngineConfig(
-                    processTargets = if (schema < 5) {
-                        (storedProcessTargets + SCHEMA_5_PROCESS_ADDITIONS).distinct()
-                    } else {
-                        storedProcessTargets
-                    },
-                    packageTargets = if (schema < 5) {
-                        (storedPackageTargets + SCHEMA_5_PACKAGE_ADDITIONS).distinct()
-                    } else {
-                        storedPackageTargets
-                    },
+                    processTargets = buildList {
+                        addAll(storedProcessTargets)
+                        if (schema < 5) addAll(SCHEMA_5_PROCESS_ADDITIONS)
+                        if (schema < 6) addAll(SCHEMA_6_PROCESS_ADDITIONS)
+                    }.distinct(),
+                    packageTargets = buildList {
+                        addAll(storedPackageTargets)
+                        if (schema < 5) addAll(SCHEMA_5_PACKAGE_ADDITIONS)
+                        if (schema < 6) addAll(SCHEMA_6_PACKAGE_ADDITIONS)
+                    }.distinct(),
                     pollIntervalMs = json.optLong("pollIntervalMs", 15_000L),
                     reassertIntervalMs = json.optLong("reassertIntervalMs", 60_000L),
                     tuningIntervalMs = json.optLong("tuningIntervalMs", 15 * 60_000L),

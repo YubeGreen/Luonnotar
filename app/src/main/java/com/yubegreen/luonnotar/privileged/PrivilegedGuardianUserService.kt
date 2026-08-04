@@ -94,6 +94,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val packageSuccessorGuardByPackage = linkedMapOf<String, PackageSuccessorGuard>()
     private val packageSuccessorGuardFutureByPackage = linkedMapOf<String, ScheduledFuture<*>>()
     private val packageSuccessorCircuitUntilByPackage = linkedMapOf<String, Long>()
+    private val lastPackageCircuitDeliveryRescueByPackage = linkedMapOf<String, Long>()
+    private var packageCircuitDeliveryRescueCount = 0L
     private val lastManagedPackageWakeByPackage = linkedMapOf<String, Long>()
     private val managedPackageFrozenSinceByPackage = linkedMapOf<String, Long>()
     private val lastManagedPackageFrozenWakeByPackage = linkedMapOf<String, Long>()
@@ -131,6 +133,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var lastGmsBadAuthenticationElapsed = 0L
     private var gmsBadAuthenticationCount = 0L
     private var lastGmsMcsConnectAttemptElapsed = 0L
+    private var adbTcp5555ObservedHealthy = false
+    private var adbTcp5555Configured = false
+    private var adbTcp5555LastProbeElapsed = 0L
+    private var adbTcp5555LastHealthyElapsed = 0L
+    private var adbTcp5555MissingSinceElapsed = 0L
+    private var adbTcp5555LastRecoveryElapsed = 0L
+    private var adbTcp5555ProbeCount = 0L
+    private var adbTcp5555RecoveryCount = 0L
+    private var adbTcp5555ListenerPresent = false
     private var diagnosticWriteErrorCount = 0L
     private var lastDiagnosticStatusWriteElapsed = 0L
     @Volatile private var cachedStatusJson = "{}"
@@ -539,9 +550,26 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (packageRebuildInProgress.contains(packageName)) return
         val circuitUntil = packageSuccessorCircuitUntilByPackage[packageName] ?: 0L
         if (circuitUntil > now) {
+            val rescueAllowed =
+                packageName in DELIVERY_PACKAGE_TARGETS &&
+                    RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                        nowElapsed = now,
+                        circuitUntilElapsed = circuitUntil,
+                        lastRescueElapsed =
+                            lastPackageCircuitDeliveryRescueByPackage[packageName] ?: 0L,
+                        verifiedFrozen = verifiedFrozenAfterBurst
+                    )
+            if (rescueAllowed) {
+                lastPackageCircuitDeliveryRescueByPackage[packageName] = now
+                attemptCircuitDeliveryRescueLocked(
+                    packageName = packageName,
+                    circuitUntil = circuitUntil
+                )
+            }
             eventLocked(
                 "package_process_rebuild_deferred",
-                "$packageName reason=oem_refreeze_circuit_breaker until=$circuitUntil"
+                "$packageName reason=oem_refreeze_circuit_breaker until=$circuitUntil " +
+                    "deliveryRescue=$rescueAllowed"
             )
             return
         }
@@ -588,6 +616,75 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "$packageName ${error.javaClass.simpleName}:${error.message}"
             )
         }
+    }
+
+    private fun attemptCircuitDeliveryRescueLocked(
+        packageName: String,
+        circuitUntil: Long
+    ) {
+        packageCircuitDeliveryRescueCount += 1
+        val details = mutableListOf<String>()
+        tunePackageLocked(packageName)
+
+        val processes = GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage(packageName)
+        )
+        processes.forEach { process ->
+            val before = readFreezeState(process.pid)
+            val unfreeze = unfreezeLocked(process)
+            if (!unfreeze.stdout.contains("not_applicable_secondary_process")) {
+                actionCount += 1
+                details += "unfreeze_${process.pid}:${unfreeze.summary()}"
+                if (!isUnfreezeAccepted(unfreeze)) commandFailureCount += 1
+            }
+            val afterActivityManager = readFreezeState(process.pid)
+            if (
+                afterActivityManager.frozen == true &&
+                config.rootCgroupThaw &&
+                before.controlFile != null
+            ) {
+                directCgroupAttemptCount += 1
+                actionCount += 1
+                val direct = directCgroupThaw(before) == true
+                details += "cgroup_${process.pid}:$direct"
+                if (direct) {
+                    directCgroupSuccessCount += 1
+                } else {
+                    commandFailureCount += 1
+                }
+            }
+        }
+
+        val gmsUnfreeze = unfreezePackageLocked(GMS_PACKAGE)
+        actionCount += 1
+        details += "gms_unfreeze:${gmsUnfreeze.summary()}"
+        if (!isUnfreezeAccepted(gmsUnfreeze)) commandFailureCount += 1
+        val binderPulse = sendGmsBinderPulseLocked()
+        details += "gms_binder_pulse:${binderPulse.summary()}"
+        tunePackageLocked(GMS_PACKAGE)
+
+        val launcher = attemptBackgroundLauncherWakeLocked(
+            packageName = packageName,
+            reason = "circuit_delivery_rescue",
+            foregroundHoldMs =
+                RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS
+        )
+        details += "launcher=${launcher.name.lowercase()}"
+
+        val remaining = GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage(packageName)
+        ).filter { process -> readFreezeState(process.pid).frozen == true }
+        eventLocked(
+            if (remaining.isEmpty()) {
+                "package_circuit_delivery_rescue_verified"
+            } else {
+                "package_circuit_delivery_rescue_unresolved"
+            },
+            "$packageName circuitUntil=$circuitUntil remaining=${remaining.map { it.pid }.sorted()} " +
+                details.joinToString(" | ").take(1_500)
+        )
     }
 
     private fun rebuildPackageProcessLocked(packageName: String, trigger: String) {
@@ -1564,6 +1661,149 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun maybeProbeAdbTcp5555Locked(now: Long) {
+        if (
+            !AdbTcpPortHealthPolicy.shouldProbe(
+                nowElapsed = now,
+                lastProbeElapsed = adbTcp5555LastProbeElapsed
+            )
+        ) {
+            return
+        }
+        adbTcp5555LastProbeElapsed = now
+        adbTcp5555ProbeCount += 1
+
+        val socketResult = runner.run(
+            "ss", "-H", "-ltn",
+            timeoutMs = SOCKET_PROBE_TIMEOUT_MS
+        )
+        if (!socketResult.success) {
+            eventLocked(
+                "adb_tcp_5555_probe_unobservable",
+                socketResult.summary()
+            )
+            return
+        }
+
+        val listenerPresent =
+            AdbTcpPortHealthPolicy.listeningOnPort(socketResult.stdout)
+        val configured = adbTcp5555ConfiguredLocked()
+        adbTcp5555Configured = configured
+        val armed = adbTcp5555ObservedHealthy || configured
+        val changed = listenerPresent != adbTcp5555ListenerPresent
+        adbTcp5555ListenerPresent = listenerPresent
+
+        if (listenerPresent) {
+            adbTcp5555ObservedHealthy = true
+            adbTcp5555LastHealthyElapsed = now
+            adbTcp5555MissingSinceElapsed = 0L
+            if (changed) {
+                eventLocked(
+                    "adb_tcp_5555_listener_healthy",
+                    "configured=$configured source=ss"
+                )
+            }
+            return
+        }
+
+        if (!armed) {
+            if (changed || adbTcp5555ProbeCount == 1L) {
+                eventLocked(
+                    "adb_tcp_5555_monitor_unarmed",
+                    "listenerNeverObserved=true configured=$configured"
+                )
+            }
+            return
+        }
+
+        if (
+            adbTcp5555MissingSinceElapsed <= 0L ||
+            adbTcp5555MissingSinceElapsed > now
+        ) {
+            adbTcp5555MissingSinceElapsed = now
+            eventLocked(
+                "adb_tcp_5555_listener_missing",
+                "configured=$configured lastHealthy=$adbTcp5555LastHealthyElapsed"
+            )
+        }
+
+        if (
+            !AdbTcpPortHealthPolicy.shouldRecover(
+                nowElapsed = now,
+                armed = true,
+                missingSinceElapsed = adbTcp5555MissingSinceElapsed,
+                lastRecoveryElapsed = adbTcp5555LastRecoveryElapsed
+            )
+        ) {
+            return
+        }
+        if (
+            "com.termux" !in config.packageTargets ||
+            !packageInstalled("com.termux")
+        ) {
+            eventLocked(
+                "adb_tcp_5555_recovery_skipped",
+                "termux_not_targeted_or_not_installed"
+            )
+            return
+        }
+
+        adbTcp5555LastRecoveryElapsed = now
+        adbTcp5555RecoveryCount += 1
+        tunePackageLocked("com.termux")
+        GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage("com.termux")
+        ).forEach { process ->
+            if (readFreezeState(process.pid).frozen == true) {
+                val unfreeze = unfreezeLocked(process)
+                if (!unfreeze.stdout.contains("not_applicable_secondary_process")) {
+                    actionCount += 1
+                    if (!isUnfreezeAccepted(unfreeze)) commandFailureCount += 1
+                }
+            }
+        }
+        val launcher = attemptBackgroundLauncherWakeLocked(
+            packageName = "com.termux",
+            reason = "adb_tcp_5555_listener_missing",
+            foregroundHoldMs = AdbTcpPortHealthPolicy.FOREGROUND_HOLD_MS
+        )
+        SystemClock.sleep(1_000L)
+        val verify = runner.run(
+            "ss", "-H", "-ltn",
+            timeoutMs = SOCKET_PROBE_TIMEOUT_MS
+        )
+        val recovered =
+            verify.success &&
+                AdbTcpPortHealthPolicy.listeningOnPort(verify.stdout)
+        if (recovered) {
+            adbTcp5555ListenerPresent = true
+            adbTcp5555ObservedHealthy = true
+            adbTcp5555LastHealthyElapsed = SystemClock.elapsedRealtime()
+            adbTcp5555MissingSinceElapsed = 0L
+        }
+        eventLocked(
+            if (recovered) {
+                "adb_tcp_5555_recovery_verified"
+            } else {
+                "adb_tcp_5555_recovery_unresolved"
+            },
+            "launcher=${launcher.name.lowercase()} configured=$configured " +
+                "verify=${verify.summary()}"
+        )
+    }
+
+    private fun adbTcp5555ConfiguredLocked(): Boolean =
+        listOf("service.adb.tcp.port", "persist.adb.tcp.port").any { property ->
+            val value = runner.run(
+                "getprop", property,
+                timeoutMs = PACKAGE_QUERY_TIMEOUT_MS
+            ).stdout.trim()
+            value.split(',', ' ').any { token ->
+                token.trim().toIntOrNull() == AdbTcpPortHealthPolicy.PORT
+            }
+        }
+
     private fun pulseAbsentPackageLocked(packageName: String, reason: String) {
         val details = mutableListOf<String>()
         val canUnstop = verifyPackageUnstopBeforeForceStopLocked(packageName, details)
@@ -1924,6 +2164,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         lastActionByName.keys.retainAll(currentNames)
         latestProcesses = states
         maybeWakeManagedPackagesLocked(now, matched)
+        maybeProbeAdbTcp5555Locked(now)
 
         if (force || lastTuneElapsed <= 0L || now - lastTuneElapsed >= config.tuningIntervalMs) {
             tunePackagesLocked()
@@ -2291,7 +2532,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 lastResetElapsed = campaign.lastResetElapsed,
                 resetCount = campaign.resetCount,
                 anyGmsFrozen = anyFrozen,
-                transportHealthy = probe.healthy
+                transportHealthy = probe.healthy,
+                maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
+                    currentVendorFamilyLocked()
+                )
             )
         ) {
             resetGmsPackageLocked(campaign, processesAfter, frozenAfter, probe)
@@ -2323,22 +2567,24 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
         val details = mutableListOf<String>()
         val vendorFamily = currentVendorFamilyLocked()
-        val forceStopFirst = RecoveryCampaignPolicy.shouldUseForceStopForGms(
+        val forceStopAllowed = RecoveryCampaignPolicy.shouldUseForceStopForGms(
             vendorFamily = vendorFamily,
             resetCount = campaign.resetCount,
-            refreezeCount = campaign.refreezeCount
+            refreezeCount = campaign.refreezeCount,
+            forceStopCount = campaign.forceStopCount
         )
         eventLocked(
             "gms_recovery_reset_started",
             "generation=${campaign.generation} reset=${campaign.resetCount} oldPids=${oldPids.sorted()} " +
                 "frozen=${frozenProcesses.map { "${it.name}:${it.pid}" }} " +
                 "transport=${transportProbe.healthy} vendor=$vendorFamily " +
-                "strategy=${if (forceStopFirst) "force_stop_unstop" else "stop_app_then_force_stop"}"
+                "strategy=${if (forceStopAllowed) "force_stop_budget_available" else "non_destructive_or_stop_app"} " +
+                "forceStops=${campaign.forceStopCount}/${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)}"
         )
 
         var remainingOldPids: Set<Int> = oldPids
         var stopAppSucceeded = false
-        if (!forceStopFirst && supportsStopApp) {
+        if (!forceStopAllowed && supportsStopApp) {
             val stopResult = runner.run(
                 "am", "stop-app", "--user", "0", GMS_PACKAGE,
                 timeoutMs = GMS_STOP_APP_TIMEOUT_MS
@@ -2351,16 +2597,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             stopAppSucceeded = stopResult.success && remainingOldPids.isEmpty()
         }
 
-        if (forceStopFirst || !stopAppSucceeded) {
+        if (forceStopAllowed) {
             remainingOldPids = forceStopAndUnstopGmsLocked(
                 campaign = campaign,
                 oldPids = oldPids,
                 details = details,
-                reason = if (forceStopFirst) {
-                    "vendor_or_refreeze_escalation"
-                } else {
-                    "stop_app_unverified"
-                }
+                reason = "bounded_vendor_or_refreeze_escalation"
+            )
+        } else if (!stopAppSucceeded) {
+            details += "am_force_stop:deferred_by_campaign_budget"
+            eventLocked(
+                "gms_recovery_destructive_reset_deferred",
+                "generation=${campaign.generation} reset=${campaign.resetCount} " +
+                    "vendor=$vendorFamily forceStops=${campaign.forceStopCount} " +
+                    "max=${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)}"
             )
         }
 
@@ -2403,6 +2653,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             return oldPids
         }
 
+        campaign.forceStopCount += 1
         eventLocked(
             "gms_recovery_force_stop_started",
             "generation=${campaign.generation} reset=${campaign.resetCount} " +
@@ -2612,7 +2863,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun wakeGmsDependentsLocked() {
         val dependents = GuardianProcessParser.matching(
             listProcessesLocked(),
-            listOf("com.whatsapp", "com.whatsapp.w4b", "com.tailscale.ipn")
+            listOf(
+                "com.whatsapp",
+                "com.whatsapp.w4b",
+                "org.thoughtcrime.securesms",
+                "com.tailscale.ipn"
+            )
         )
         dependents.forEach { process ->
             val result = unfreezeLocked(process)
@@ -2980,6 +3236,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 put(packageName, until)
             }
         })
+        .put("packageCircuitDeliveryRescueCount", packageCircuitDeliveryRescueCount)
+        .put("lastPackageCircuitDeliveryRescue", JSONObject().apply {
+            lastPackageCircuitDeliveryRescueByPackage.forEach { (packageName, elapsed) ->
+                put(packageName, elapsed)
+            }
+        })
         .put("lastPackageRebuild", lastPackageRebuildOutcome.toJson())
         .put("deliveryFailureEpisodes", JSONObject().apply {
             deliveryFailureEpisodesByPackage.forEach { (packageName, episodes) ->
@@ -3041,6 +3303,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("badAuthenticationCount", gmsBadAuthenticationCount)
             .put("lastBadAuthenticationElapsed", lastGmsBadAuthenticationElapsed)
             .put("lastMcsConnectAttemptElapsed", lastGmsMcsConnectAttemptElapsed)
+        )
+        .put("adbTcp5555", JSONObject()
+            .put("armed", adbTcp5555ObservedHealthy || adbTcp5555Configured)
+            .put("configured", adbTcp5555Configured)
+            .put("listenerPresent", adbTcp5555ListenerPresent)
+            .put("observedHealthy", adbTcp5555ObservedHealthy)
+            .put("lastProbeElapsed", adbTcp5555LastProbeElapsed)
+            .put("lastHealthyElapsed", adbTcp5555LastHealthyElapsed)
+            .put("missingSinceElapsed", adbTcp5555MissingSinceElapsed)
+            .put("lastRecoveryElapsed", adbTcp5555LastRecoveryElapsed)
+            .put("probeCount", adbTcp5555ProbeCount)
+            .put("recoveryCount", adbTcp5555RecoveryCount)
         )
         .put("protectionHealth", protectionHealthJsonLocked())
         .put("backgroundPolicy", lastBackgroundPolicyReport.toJsonObject())
@@ -3148,6 +3422,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var lastResetElapsed: Long = 0L,
         var resetCount: Int = 0,
         var refreezeCount: Int = 0,
+        var forceStopCount: Int = 0,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -3163,6 +3438,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastResetElapsed", lastResetElapsed)
             .put("resetCount", resetCount)
             .put("refreezeCount", refreezeCount)
+            .put("forceStopCount", forceStopCount)
     }
 
     private data class GuardianProcessState(
@@ -3259,7 +3535,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 10
+        private const val STATUS_SCHEMA = 11
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L

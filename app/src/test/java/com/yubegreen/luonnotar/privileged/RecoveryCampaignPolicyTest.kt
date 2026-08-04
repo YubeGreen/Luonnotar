@@ -1,5 +1,6 @@
 package com.yubegreen.luonnotar.privileged
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -47,7 +48,9 @@ class RecoveryCampaignPolicyTest {
                 newDeliveryEpisode = true
             ).allowed
         )
-        val full = List(RecoveryCampaignPolicy.PACKAGE_MAX_REBUILDS_PER_24_HOURS) { 10_000L + it }
+        val full = List(RecoveryCampaignPolicy.PACKAGE_MAX_REBUILDS_PER_24_HOURS) {
+            10_000L + it
+        }
         assertFalse(
             RecoveryCampaignPolicy.decideCriticalPackageRebuild(
                 nowElapsed = 100_000L,
@@ -184,28 +187,29 @@ class RecoveryCampaignPolicyTest {
             RecoveryCampaignPolicy.shouldResetGmsAgain(
                 nowElapsed = 120_000L,
                 lastResetElapsed = 100_000L,
+                resetCount = RecoveryCampaignPolicy.GMS_VIVO_MAX_RESETS_PER_CAMPAIGN,
+                anyGmsFrozen = true,
+                transportHealthy = false,
+                maxResetCount = RecoveryCampaignPolicy.GMS_VIVO_MAX_RESETS_PER_CAMPAIGN
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldResetGmsAgain(
+                nowElapsed = 120_000L,
+                lastResetElapsed = 100_000L,
                 resetCount = 1,
                 anyGmsFrozen = false,
                 transportHealthy = true
             )
         )
     }
+
     @Test
-    fun verifiedGmsOutageUsesBackoffInsteadOfPermanentDailyBlock() {
+    fun verifiedGmsOutageUsesLongBackoffAfterDailyLimit() {
         val full = List(RecoveryCampaignPolicy.GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS) {
             100_000L + it * 1_000L
         }
         assertFalse(
-            RecoveryCampaignPolicy.decideGmsCampaign(
-                nowElapsed = 200_000L,
-                lastCampaignElapsed = 190_000L,
-                campaignHistory = full,
-                manual = false,
-                strongEvidence = true,
-                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
-            ).allowed
-        )
-        assertTrue(
             RecoveryCampaignPolicy.decideGmsCampaign(
                 nowElapsed = 900_000L,
                 lastCampaignElapsed = 200_000L,
@@ -217,7 +221,27 @@ class RecoveryCampaignPolicyTest {
         )
         assertTrue(
             RecoveryCampaignPolicy.decideGmsCampaign(
-                nowElapsed = 250_000L,
+                nowElapsed = 7_500_000L,
+                lastCampaignElapsed = 200_000L,
+                campaignHistory = full,
+                manual = false,
+                strongEvidence = true,
+                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+            ).allowed
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.decideGmsCampaign(
+                nowElapsed = 1_000_000L,
+                lastCampaignElapsed = 200_000L,
+                campaignHistory = full,
+                manual = true,
+                strongEvidence = false,
+                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+            ).allowed
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.decideGmsCampaign(
+                nowElapsed = 2_100_000L,
                 lastCampaignElapsed = 200_000L,
                 campaignHistory = full,
                 manual = true,
@@ -228,66 +252,158 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
-    fun vivoAndRefrozenSuccessorsEscalateToForceStop() {
-        assertTrue(
+    fun vivoGmsForceStopIsDelayedAndBudgeted() {
+        assertEquals(
+            3,
+            RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
+                BackgroundPolicyVendorFamily.VIVO
+            )
+        )
+        assertEquals(
+            1,
+            RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(
+                BackgroundPolicyVendorFamily.VIVO
+            )
+        )
+        assertFalse(
             RecoveryCampaignPolicy.shouldUseForceStopForGms(
                 vendorFamily = BackgroundPolicyVendorFamily.VIVO,
                 resetCount = 1,
-                refreezeCount = 0
+                refreezeCount = 0,
+                forceStopCount = 0
             )
         )
         assertTrue(
             RecoveryCampaignPolicy.shouldUseForceStopForGms(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                resetCount = 2,
+                refreezeCount = 0,
+                forceStopCount = 0
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseForceStopForGms(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                resetCount = 3,
+                refreezeCount = 2,
+                forceStopCount = 1
+            )
+        )
+    }
+
+    @Test
+    fun nonVivoGmsForceStopStillRequiresEscalationAndBudget() {
+        assertTrue(
+            RecoveryCampaignPolicy.shouldUseForceStopForGms(
                 vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
                 resetCount = 2,
-                refreezeCount = 0
+                refreezeCount = 0,
+                forceStopCount = 0
             )
         )
         assertTrue(
             RecoveryCampaignPolicy.shouldUseForceStopForGms(
                 vendorFamily = BackgroundPolicyVendorFamily.AOSP,
                 resetCount = 1,
-                refreezeCount = 1
+                refreezeCount = 1,
+                forceStopCount = 0
             )
         )
         assertFalse(
             RecoveryCampaignPolicy.shouldUseForceStopForGms(
                 vendorFamily = BackgroundPolicyVendorFamily.AOSP,
                 resetCount = 1,
-                refreezeCount = 0
+                refreezeCount = 0,
+                forceStopCount = 0
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseForceStopForGms(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                resetCount = 4,
+                refreezeCount = 4,
+                forceStopCount = RecoveryCampaignPolicy.GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN
             )
         )
     }
 
     @Test
     fun packageSuccessorAvoidsTerminalStopAppAndEscalatesVendorResetAtFive() {
-        assertTrue(
+        assertEquals(
+            RecoveryCampaignPolicy.PackageResetStrategy.KILL,
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
                 BackgroundPolicyVendorFamily.XIAOMI,
                 nextResetCount = 1,
                 refreezeCount = 1
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.KILL
+            )
         )
-        assertTrue(
+        assertEquals(
+            RecoveryCampaignPolicy.PackageResetStrategy.KILL,
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
                 BackgroundPolicyVendorFamily.XIAOMI,
                 nextResetCount = 3,
                 refreezeCount = 3
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.KILL
+            )
         )
-        assertTrue(
+        assertEquals(
+            RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP,
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
                 BackgroundPolicyVendorFamily.XIAOMI,
                 nextResetCount = 5,
                 refreezeCount = 5
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP
+            )
         )
-        assertTrue(
+        assertEquals(
+            RecoveryCampaignPolicy.PackageResetStrategy.KILL,
             RecoveryCampaignPolicy.packageSuccessorResetStrategy(
                 BackgroundPolicyVendorFamily.AOSP,
                 nextResetCount = 5,
                 refreezeCount = 5
-            ) == RecoveryCampaignPolicy.PackageResetStrategy.KILL
+            )
+        )
+    }
+
+    @Test
+    fun circuitDeliveryRescueRequiresActiveCircuitFreezeAndCooldown() {
+        assertFalse(
+            RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                nowElapsed = 100_000L,
+                circuitUntilElapsed = 200_000L,
+                lastRescueElapsed = 0L,
+                verifiedFrozen = false
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                nowElapsed = 200_000L,
+                circuitUntilElapsed = 200_000L,
+                lastRescueElapsed = 0L,
+                verifiedFrozen = true
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                nowElapsed = 100_000L,
+                circuitUntilElapsed = 200_000L,
+                lastRescueElapsed = 0L,
+                verifiedFrozen = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                nowElapsed = 150_000L,
+                circuitUntilElapsed = 300_000L,
+                lastRescueElapsed = 100_000L,
+                verifiedFrozen = true
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldAttemptCircuitDeliveryRescue(
+                nowElapsed = 220_000L,
+                circuitUntilElapsed = 300_000L,
+                lastRescueElapsed = 100_000L,
+                verifiedFrozen = true
+            )
         )
     }
 
@@ -372,7 +488,6 @@ class RecoveryCampaignPolicyTest {
         )
     }
 
-
     @Test
     fun vendorRefreezeCircuitBreakerStopsRunawayResetLoop() {
         assertFalse(
@@ -436,5 +551,4 @@ class RecoveryCampaignPolicyTest {
             )
         )
     }
-
 }

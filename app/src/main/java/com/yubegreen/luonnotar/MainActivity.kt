@@ -2072,6 +2072,7 @@ class MainActivity : AppCompatActivity() {
               "com.google.android.gms",
               "com.whatsapp",
               "com.whatsapp.w4b",
+              "org.thoughtcrime.securesms",
               "ch.protonvpn.android",
               "com.tailscale.ipn",
               "com.termux",
