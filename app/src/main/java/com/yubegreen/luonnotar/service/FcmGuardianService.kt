@@ -94,6 +94,8 @@ class FcmGuardianService : Service() {
             "com.yubegreen.luonnotar.action.GMS_BINDER_ANCHOR_RETRY"
         const val ACTION_GMS_BINDER_PULSE_TEST =
             "com.yubegreen.luonnotar.action.GMS_BINDER_PULSE_TEST"
+        const val ACTION_GMS_BINDER_STABILIZATION_LEASE =
+            "com.yubegreen.luonnotar.action.GMS_BINDER_STABILIZATION_LEASE"
         const val EXTRA_START_REASON = "start_reason"
         const val KEEPALIVE_URL = "https://connectivitycheck.gstatic.com/generate_204"
         private const val TICK_SECONDS = 5L
@@ -890,6 +892,26 @@ class FcmGuardianService : Service() {
                         "started" to started,
                         "durationMs" to
                             GmsBinderPulseCoordinator.TEST_DURATION_MS
+                    )
+                )
+            }
+            ACTION_GMS_BINDER_STABILIZATION_LEASE -> {
+                val active = isActivelyEnabled()
+                if (active) {
+                    GmsBinderAnchorCoordinator.manualRetry(this, true)
+                }
+                val started = active && GmsBinderPulseCoordinator.startStabilization(
+                    this,
+                    reason.ifBlank { "privileged_gms_recovery" }
+                )
+                LogManager.event(
+                    this,
+                    "gms_binder_stabilization_lease_requested",
+                    mapOf(
+                        "guardianActive" to active,
+                        "started" to started,
+                        "durationMs" to
+                            GmsBinderPulseCoordinator.STABILIZATION_DURATION_MS
                     )
                 )
             }

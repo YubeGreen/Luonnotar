@@ -3,10 +3,10 @@ package com.yubegreen.luonnotar.privileged
 /**
  * Bounds the event-driven recovery campaigns introduced in 2.4.0.
  *
- * Verified delivery outages must not turn into a permanent dead end after a
- * daily budget is consumed. Normal recovery remains tightly rate-limited;
- * after the budget, it changes to a long backoff and the successor guard uses
- * progressively stronger process-reset strategies.
+ * Verified delivery outages must not turn into either a reset storm or a
+ * long confirmed dead zone. Recovery is bounded by adaptive retry intervals,
+ * a separate destructive-action budget, and short post-recovery protection
+ * leases that defend the exact window in which vendor freezers tend to relapse.
  */
 object RecoveryCampaignPolicy {
     const val DAY_MS = 24L * 60L * 60L * 1_000L
@@ -33,23 +33,35 @@ object RecoveryCampaignPolicy {
     const val PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_COOLDOWN_MS = 30 * 60_000L
     const val PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS = 8_000L
     const val PACKAGE_SUCCESSOR_CIRCUIT_DELIVERY_RESCUE_INTERVAL_MS = 2 * 60_000L
+    const val PACKAGE_DELIVERY_PROTECTION_BASE_MS = 45_000L
+    const val PACKAGE_DELIVERY_PROTECTION_EXTENSION_MS = 30_000L
+    const val PACKAGE_DELIVERY_PROTECTION_MAX_MS = 90_000L
+    const val PACKAGE_DELIVERY_PROTECTION_TICK_MS = 1_000L
+    const val PACKAGE_DELIVERY_PROTECTION_KILL_MIN_ELAPSED_MS = 10_000L
+    const val PACKAGE_DELIVERY_PROTECTION_MAX_KILLS = 1
     const val MANAGED_PACKAGE_WAKE_INTERVAL_MS = 5 * 60_000L
     const val MANAGED_PACKAGE_FROZEN_WAKE_DELAY_MS = 15_000L
     const val MANAGED_PACKAGE_FROZEN_WAKE_INTERVAL_MS = 5 * 60_000L
     const val MANAGED_PACKAGE_FROZEN_FOREGROUND_HOLD_MS = 8_000L
 
     const val GMS_CAMPAIGN_TICK_MS = 2_000L
-    const val GMS_CAMPAIGN_DURATION_MS = 3 * 60_000L
-    const val GMS_CAMPAIGN_STABLE_MS = 15_000L
+    const val GMS_CAMPAIGN_DURATION_MS = 4 * 60_000L
+    const val GMS_CAMPAIGN_STABLE_MS = 60_000L
+    const val GMS_STABILIZATION_LEASE_MS = 90_000L
+    const val GMS_STABILIZATION_DEGRADED_GRACE_MS = 20_000L
     const val GMS_MIN_RESET_INTERVAL_MS = 10_000L
     const val GMS_MAX_RESETS_PER_CAMPAIGN = 4
     const val GMS_VIVO_MAX_RESETS_PER_CAMPAIGN = 3
     const val GMS_DEFAULT_MAX_FORCE_STOPS_PER_CAMPAIGN = 2
     const val GMS_VIVO_MAX_FORCE_STOPS_PER_CAMPAIGN = 1
     const val GMS_EMERGENCY_COOLDOWN_MS = 2 * 60_000L
-    const val GMS_VIVO_RETRY_COOLDOWN_MS = 30 * 60_000L
-    const val GMS_POST_LIMIT_BACKOFF_MS = 2 * 60 * 60_000L
-    const val GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS = 6
+    const val GMS_RETRY_AFTER_ONE_FAILURE_MS = 2 * 60_000L
+    const val GMS_RETRY_AFTER_TWO_FAILURES_MS = 5 * 60_000L
+    const val GMS_RETRY_AFTER_THREE_FAILURES_MS = 15 * 60_000L
+    const val GMS_RETRY_AFTER_REPEATED_FAILURES_MS = 30 * 60_000L
+    const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
+    const val GMS_FORCE_STOP_MIN_INTERVAL_MS = 10 * 60_000L
+    const val GMS_FORCE_STOP_MAX_PER_24_HOURS = 6
 
     enum class PackageResetStrategy {
         KILL,
@@ -59,6 +71,7 @@ object RecoveryCampaignPolicy {
 
     data class PackageDecision(val allowed: Boolean, val reason: String)
     data class GmsCampaignDecision(val allowed: Boolean, val reason: String)
+    data class GmsForceStopDecision(val allowed: Boolean, val reason: String)
 
     fun decideCriticalPackageRebuild(
         nowElapsed: Long,
@@ -101,48 +114,69 @@ object RecoveryCampaignPolicy {
 
     fun decideGmsCampaign(
         nowElapsed: Long,
-        lastCampaignElapsed: Long,
+        lastCampaignCompletedElapsed: Long,
         campaignHistory: List<Long>,
         manual: Boolean,
         strongEvidence: Boolean,
-        preferredRetryIntervalMs: Long = GMS_EMERGENCY_COOLDOWN_MS
+        consecutiveFailureCount: Int = 0
     ): GmsCampaignDecision {
         if (nowElapsed < 0L) return GmsCampaignDecision(false, "invalid_clock")
         if (!manual && !strongEvidence) {
             return GmsCampaignDecision(false, "strong_evidence_missing")
         }
-        if (lastCampaignElapsed > nowElapsed) {
+        if (lastCampaignCompletedElapsed > nowElapsed) {
             return GmsCampaignDecision(false, "elapsed_clock_reset")
         }
 
         val cutoff = (nowElapsed - DAY_MS).coerceAtLeast(0L)
         val recent = campaignHistory.count { it in cutoff..nowElapsed }
-        val overNormalLimit = recent >= GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS
-        val retryInterval = when {
-            manual -> preferredRetryIntervalMs.coerceAtLeast(0L)
-            overNormalLimit && strongEvidence -> GMS_POST_LIMIT_BACKOFF_MS
-            else -> preferredRetryIntervalMs.coerceAtLeast(0L)
+        if (!manual && recent >= GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS) {
+            return GmsCampaignDecision(false, "campaign_hard_daily_limit")
         }
-        if (lastCampaignElapsed > 0L && nowElapsed - lastCampaignElapsed < retryInterval) {
-            return GmsCampaignDecision(
-                false,
-                if (overNormalLimit && !manual) {
-                    "campaign_post_limit_backoff"
-                } else {
-                    "campaign_cooldown"
-                }
-            )
+        val retryInterval = if (manual) {
+            GMS_EMERGENCY_COOLDOWN_MS
+        } else {
+            gmsAutomaticRetryIntervalMs(consecutiveFailureCount)
+        }
+        if (
+            lastCampaignCompletedElapsed > 0L &&
+            nowElapsed - lastCampaignCompletedElapsed < retryInterval
+        ) {
+            return GmsCampaignDecision(false, "campaign_adaptive_cooldown")
         }
 
         return GmsCampaignDecision(
             true,
             when {
-                manual && overNormalLimit -> "manual_campaign_limit_override"
                 manual -> "manual_campaign"
-                overNormalLimit -> "verified_outage_post_limit_retry"
-                else -> "verified_frozen_mcs_missing"
+                consecutiveFailureCount <= 0 -> "verified_frozen_mcs_missing"
+                else -> "verified_outage_adaptive_retry_$consecutiveFailureCount"
             }
         )
+    }
+
+    fun gmsAutomaticRetryIntervalMs(consecutiveFailureCount: Int): Long = when {
+        consecutiveFailureCount <= 1 -> GMS_RETRY_AFTER_ONE_FAILURE_MS
+        consecutiveFailureCount == 2 -> GMS_RETRY_AFTER_TWO_FAILURES_MS
+        consecutiveFailureCount == 3 -> GMS_RETRY_AFTER_THREE_FAILURES_MS
+        else -> GMS_RETRY_AFTER_REPEATED_FAILURES_MS
+    }
+
+    fun decideGmsForceStop(
+        nowElapsed: Long,
+        forceStopHistory: List<Long>
+    ): GmsForceStopDecision {
+        if (nowElapsed < 0L) return GmsForceStopDecision(false, "invalid_clock")
+        val cutoff = (nowElapsed - DAY_MS).coerceAtLeast(0L)
+        val recent = forceStopHistory.filter { it in cutoff..nowElapsed }
+        if (recent.size >= GMS_FORCE_STOP_MAX_PER_24_HOURS) {
+            return GmsForceStopDecision(false, "force_stop_daily_budget")
+        }
+        val last = recent.maxOrNull() ?: 0L
+        if (last > 0L && nowElapsed - last < GMS_FORCE_STOP_MIN_INTERVAL_MS) {
+            return GmsForceStopDecision(false, "force_stop_min_interval")
+        }
+        return GmsForceStopDecision(true, "force_stop_budget_available")
     }
 
     fun gmsMaxResetsPerCampaign(
@@ -210,6 +244,37 @@ object RecoveryCampaignPolicy {
         ) &&
             resetCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_RESETS &&
             refreezeCount >= PACKAGE_SUCCESSOR_CIRCUIT_BREAKER_REFREEZES
+
+    fun deliveryProtectionDeadline(
+        nowElapsed: Long,
+        startedElapsed: Long,
+        currentDeadlineElapsed: Long,
+        newDeliveryEpisode: Boolean
+    ): Long {
+        if (nowElapsed < 0L || startedElapsed < 0L) return 0L
+        val hardDeadline = startedElapsed + PACKAGE_DELIVERY_PROTECTION_MAX_MS
+        val desired = if (currentDeadlineElapsed <= 0L) {
+            nowElapsed + PACKAGE_DELIVERY_PROTECTION_BASE_MS
+        } else if (newDeliveryEpisode) {
+            maxOf(currentDeadlineElapsed, nowElapsed + PACKAGE_DELIVERY_PROTECTION_EXTENSION_MS)
+        } else {
+            currentDeadlineElapsed
+        }
+        return minOf(desired, hardDeadline)
+    }
+
+    fun shouldEscalateDeliveryProtectionKill(
+        nowElapsed: Long,
+        startedElapsed: Long,
+        deliveryEpisodeCount: Int,
+        killCount: Int,
+        verifiedFrozen: Boolean
+    ): Boolean =
+        verifiedFrozen &&
+            deliveryEpisodeCount >= 2 &&
+            killCount < PACKAGE_DELIVERY_PROTECTION_MAX_KILLS &&
+            startedElapsed in 0L..nowElapsed &&
+            nowElapsed - startedElapsed >= PACKAGE_DELIVERY_PROTECTION_KILL_MIN_ELAPSED_MS
 
     fun shouldAttemptCircuitDeliveryRescue(
         nowElapsed: Long,

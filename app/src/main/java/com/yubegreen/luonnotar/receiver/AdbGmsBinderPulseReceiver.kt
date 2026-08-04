@@ -18,7 +18,9 @@ import com.yubegreen.luonnotar.util.LuonnotarPreferences
  */
 class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
-        if (intent?.action != ACTION_TRIGGER) return
+        val action = intent?.action ?: return
+        if (action !in SUPPORTED_ACTIONS) return
+        val stabilization = action == ACTION_STABILIZATION_LEASE
 
         val appContext = context.applicationContext
         val prefs = LuonnotarPreferences.deviceProtected(appContext)
@@ -42,10 +44,20 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
 
         val serviceIntent =
             Intent(appContext, FcmGuardianService::class.java)
-                .setAction(FcmGuardianService.ACTION_GMS_BINDER_PULSE_TEST)
+                .setAction(
+                    if (stabilization) {
+                        FcmGuardianService.ACTION_GMS_BINDER_STABILIZATION_LEASE
+                    } else {
+                        FcmGuardianService.ACTION_GMS_BINDER_PULSE_TEST
+                    }
+                )
                 .putExtra(
                     FcmGuardianService.EXTRA_START_REASON,
-                    "adb_gms_binder_pulse_test"
+                    if (stabilization) {
+                        "privileged_gms_stabilization_lease"
+                    } else {
+                        "adb_gms_binder_pulse_test"
+                    }
                 )
 
         val started = runCatching {
@@ -69,7 +81,11 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
         )
         LogManager.event(
             appContext,
-            "adb_gms_binder_pulse_requested",
+            if (stabilization) {
+                "adb_gms_binder_stabilization_requested"
+            } else {
+                "adb_gms_binder_pulse_requested"
+            },
             mapOf(
                 "guardianActive" to guardianActive,
                 "serviceDispatchStarted" to started
@@ -80,5 +96,8 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
     companion object {
         const val ACTION_TRIGGER =
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_PULSE_TEST"
+        const val ACTION_STABILIZATION_LEASE =
+            "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_STABILIZATION_LEASE"
+        private val SUPPORTED_ACTIONS = setOf(ACTION_TRIGGER, ACTION_STABILIZATION_LEASE)
     }
 }

@@ -76,7 +76,7 @@ class RecoveryCampaignPolicyTest {
         assertFalse(
             RecoveryCampaignPolicy.decideGmsCampaign(
                 nowElapsed = 100_000L,
-                lastCampaignElapsed = 0L,
+                lastCampaignCompletedElapsed = 0L,
                 campaignHistory = emptyList(),
                 manual = false,
                 strongEvidence = false
@@ -85,7 +85,7 @@ class RecoveryCampaignPolicyTest {
         assertTrue(
             RecoveryCampaignPolicy.decideGmsCampaign(
                 nowElapsed = 100_000L,
-                lastCampaignElapsed = 0L,
+                lastCampaignCompletedElapsed = 0L,
                 campaignHistory = emptyList(),
                 manual = false,
                 strongEvidence = true
@@ -94,7 +94,7 @@ class RecoveryCampaignPolicyTest {
         assertFalse(
             RecoveryCampaignPolicy.decideGmsCampaign(
                 nowElapsed = 100_000L,
-                lastCampaignElapsed = 90_000L,
+                lastCampaignCompletedElapsed = 90_000L,
                 campaignHistory = listOf(90_000L),
                 manual = true,
                 strongEvidence = false
@@ -205,49 +205,152 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
-    fun verifiedGmsOutageUsesLongBackoffAfterDailyLimit() {
-        val full = List(RecoveryCampaignPolicy.GMS_MAX_EMERGENCY_CAMPAIGNS_PER_24_HOURS) {
-            100_000L + it * 1_000L
-        }
+    fun verifiedGmsOutageUsesAdaptiveRetryInsteadOfThirtyMinuteDeadZone() {
+        assertEquals(
+            2 * 60_000L,
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(1)
+        )
+        assertEquals(
+            5 * 60_000L,
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(2)
+        )
+        assertEquals(
+            15 * 60_000L,
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(3)
+        )
+        assertEquals(
+            30 * 60_000L,
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(4)
+        )
+
         assertFalse(
             RecoveryCampaignPolicy.decideGmsCampaign(
-                nowElapsed = 900_000L,
-                lastCampaignElapsed = 200_000L,
-                campaignHistory = full,
+                nowElapsed = 219_000L,
+                lastCampaignCompletedElapsed = 100_000L,
+                campaignHistory = listOf(10_000L),
                 manual = false,
                 strongEvidence = true,
-                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+                consecutiveFailureCount = 1
             ).allowed
         )
         assertTrue(
             RecoveryCampaignPolicy.decideGmsCampaign(
-                nowElapsed = 7_500_000L,
-                lastCampaignElapsed = 200_000L,
-                campaignHistory = full,
+                nowElapsed = 220_000L,
+                lastCampaignCompletedElapsed = 100_000L,
+                campaignHistory = listOf(10_000L),
                 manual = false,
                 strongEvidence = true,
-                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+                consecutiveFailureCount = 1
             ).allowed
         )
         assertFalse(
+            RecoveryCampaignPolicy.decideGmsCampaign(
+                nowElapsed = 999_000L,
+                lastCampaignCompletedElapsed = 100_000L,
+                campaignHistory = listOf(10_000L),
+                manual = false,
+                strongEvidence = true,
+                consecutiveFailureCount = 3
+            ).allowed
+        )
+        assertTrue(
             RecoveryCampaignPolicy.decideGmsCampaign(
                 nowElapsed = 1_000_000L,
-                lastCampaignElapsed = 200_000L,
-                campaignHistory = full,
-                manual = true,
-                strongEvidence = false,
-                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+                lastCampaignCompletedElapsed = 100_000L,
+                campaignHistory = listOf(10_000L),
+                manual = false,
+                strongEvidence = true,
+                consecutiveFailureCount = 3
+            ).allowed
+        )
+    }
+
+    @Test
+    fun gmsForceStopHasGlobalTenMinuteAndDailyBudgets() {
+        assertTrue(
+            RecoveryCampaignPolicy.decideGmsForceStop(
+                nowElapsed = 1_000_000L,
+                forceStopHistory = emptyList()
+            ).allowed
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.decideGmsForceStop(
+                nowElapsed = 1_000_000L,
+                forceStopHistory = listOf(500_001L)
             ).allowed
         )
         assertTrue(
-            RecoveryCampaignPolicy.decideGmsCampaign(
-                nowElapsed = 2_100_000L,
-                lastCampaignElapsed = 200_000L,
-                campaignHistory = full,
-                manual = true,
-                strongEvidence = false,
-                preferredRetryIntervalMs = RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
+            RecoveryCampaignPolicy.decideGmsForceStop(
+                nowElapsed = 1_100_000L,
+                forceStopHistory = listOf(500_000L)
             ).allowed
+        )
+        val full = List(RecoveryCampaignPolicy.GMS_FORCE_STOP_MAX_PER_24_HOURS) {
+            100_000L + it * RecoveryCampaignPolicy.GMS_FORCE_STOP_MIN_INTERVAL_MS
+        }
+        assertFalse(
+            RecoveryCampaignPolicy.decideGmsForceStop(
+                nowElapsed = full.last() + RecoveryCampaignPolicy.GMS_FORCE_STOP_MIN_INTERVAL_MS,
+                forceStopHistory = full
+            ).allowed
+        )
+    }
+
+    @Test
+    fun deliveryProtectionIsBoundedAndEscalatesOnlyOnSecondVerifiedEpisode() {
+        assertEquals(
+            145_000L,
+            RecoveryCampaignPolicy.deliveryProtectionDeadline(
+                nowElapsed = 100_000L,
+                startedElapsed = 100_000L,
+                currentDeadlineElapsed = 0L,
+                newDeliveryEpisode = true
+            )
+        )
+        assertEquals(
+            175_000L,
+            RecoveryCampaignPolicy.deliveryProtectionDeadline(
+                nowElapsed = 145_000L,
+                startedElapsed = 100_000L,
+                currentDeadlineElapsed = 145_000L,
+                newDeliveryEpisode = true
+            )
+        )
+        assertEquals(
+            190_000L,
+            RecoveryCampaignPolicy.deliveryProtectionDeadline(
+                nowElapsed = 180_000L,
+                startedElapsed = 100_000L,
+                currentDeadlineElapsed = 175_000L,
+                newDeliveryEpisode = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldEscalateDeliveryProtectionKill(
+                nowElapsed = 120_000L,
+                startedElapsed = 100_000L,
+                deliveryEpisodeCount = 1,
+                killCount = 0,
+                verifiedFrozen = true
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldEscalateDeliveryProtectionKill(
+                nowElapsed = 120_000L,
+                startedElapsed = 100_000L,
+                deliveryEpisodeCount = 2,
+                killCount = 0,
+                verifiedFrozen = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldEscalateDeliveryProtectionKill(
+                nowElapsed = 120_000L,
+                startedElapsed = 100_000L,
+                deliveryEpisodeCount = 2,
+                killCount = 1,
+                verifiedFrozen = true
+            )
         )
     }
 

@@ -17,19 +17,23 @@ import kotlin.math.max
  * Repeatedly creates a public GMS location Binder connection, performs a
  * read-only location-settings query, and disconnects.
  *
- * This remains a manually triggered laboratory experiment. OriginOS testing
- * proved that repeated successful Binder/query cycles are not a reliable MCS
- * recovery mechanism, so production scheduling must not call this coordinator.
+ * The short LAB_TEST mode remains a manual diagnostic.  The bounded
+ * STABILIZATION_LEASE mode is used only after a privileged recovery has
+ * already restored MCS, to keep public Binder traffic flowing while the ROM's
+ * freezer is most likely to refreeze the new GMS processes.
  */
 @Suppress("DEPRECATION")
 object GmsBinderPulseCoordinator {
     const val TEST_DURATION_MS = 15_000L
+    const val STABILIZATION_DURATION_MS = 90_000L
     const val PULSE_INTERVAL_MS = 2_000L
     const val CONNECTED_HOLD_MS = 750L
+    const val STABILIZATION_CONNECTED_HOLD_MS = 1_500L
     private const val CONNECT_TIMEOUT_MS = 1_600L
 
     private enum class PulseMode {
-        LAB_TEST
+        LAB_TEST,
+        STABILIZATION_LEASE
     }
 
     private data class PulseSpec(
@@ -58,6 +62,18 @@ object GmsBinderPulseCoordinator {
             )
         )
 
+    fun startStabilization(context: Context, reason: String): Boolean =
+        requestStart(
+            context.applicationContext,
+            PulseSpec(
+                mode = PulseMode.STABILIZATION_LEASE,
+                reason = reason,
+                durationMs = STABILIZATION_DURATION_MS,
+                intervalMs = PULSE_INTERVAL_MS,
+                connectedHoldMs = STABILIZATION_CONNECTED_HOLD_MS
+            )
+        )
+
     fun stop(context: Context, reason: String) = runOnMain {
         val run = synchronized(stateLock) {
             pendingRequestId = 0L
@@ -77,8 +93,31 @@ object GmsBinderPulseCoordinator {
     }
 
     private fun requestStart(context: Context, spec: PulseSpec): Boolean {
+        var runToReplace: PulseRun? = null
         val requestId = synchronized(stateLock) {
-            if (pendingRequestId != 0L || activeRun != null) {
+            val active = activeRun
+            if (spec.mode == PulseMode.STABILIZATION_LEASE) {
+                if (active?.modeName == PulseMode.STABILIZATION_LEASE.name) {
+                    LogManager.event(
+                        context,
+                        "gms_binder_pulse_coalesced",
+                        mapOf(
+                            "reason" to "stabilization_already_active",
+                            "requestedMode" to spec.mode.name,
+                            "requestedReason" to spec.reason
+                        )
+                    )
+                    return true
+                }
+                // A short diagnostic pulse must never block the recovery lease.
+                // Invalidate any queued request and replace a running LAB_TEST on
+                // the main thread before claiming the stabilization run.
+                pendingRequestId = 0L
+                if (active != null) {
+                    runToReplace = active
+                    activeRun = null
+                }
+            } else if (pendingRequestId != 0L || active != null) {
                 LogManager.event(
                     context,
                     "gms_binder_pulse_rejected",
@@ -96,6 +135,7 @@ object GmsBinderPulseCoordinator {
         }
 
         val startRunnable = Runnable {
+            runToReplace?.stop("upgraded_to_stabilization")
             startClaimed(context, spec, requestId)
         }
         if (Looper.myLooper() == Looper.getMainLooper()) {

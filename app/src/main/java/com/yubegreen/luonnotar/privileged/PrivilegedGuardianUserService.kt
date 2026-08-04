@@ -96,6 +96,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val packageSuccessorCircuitUntilByPackage = linkedMapOf<String, Long>()
     private val lastPackageCircuitDeliveryRescueByPackage = linkedMapOf<String, Long>()
     private var packageCircuitDeliveryRescueCount = 0L
+    private val deliveryProtectionByPackage = linkedMapOf<String, DeliveryProtectionLease>()
+    private val deliveryProtectionFutureByPackage = linkedMapOf<String, ScheduledFuture<*>>()
+    private var deliveryProtectionStartCount = 0L
+    private var deliveryProtectionCompletionCount = 0L
+    private var deliveryProtectionKillCount = 0L
     private val lastManagedPackageWakeByPackage = linkedMapOf<String, Long>()
     private val managedPackageFrozenSinceByPackage = linkedMapOf<String, Long>()
     private val lastManagedPackageFrozenWakeByPackage = linkedMapOf<String, Long>()
@@ -105,11 +110,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var latestProcesses = emptyList<GuardianProcessState>()
     private val gmsFreezeEvents = ArrayDeque<Long>()
     private val gmsRecoveryHistory = ArrayDeque<Long>()
+    private val gmsForceStopHistory = ArrayDeque<Long>()
     private var gmsRecoveryInProgress = false
     private var gmsManualRecoveryQueued = false
     private var gmsManualRecoveryRequestId = 0L
     private var gmsManualRecoveryState = "idle"
     private var lastGmsRecoveryElapsed = 0L
+    private var lastGmsRecoveryCompletedElapsed = 0L
+    private var gmsConsecutiveCampaignFailures = 0
     private var gmsRecoveryAttemptCount = 0L
     private var gmsRecoverySuccessCount = 0L
     private var gmsRecoveryGeneration = 0L
@@ -274,6 +282,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         initialCycleFuture = null
         cancelVendorRecoveryBurstsLocked()
         cancelPackageSuccessorGuardsLocked("engine_stopped")
+        cancelDeliveryProtectionLeasesLocked("engine_stopped")
         cancelGmsRecoveryCampaignLocked("engine_stopped")
         stopEventWatcherLocked()
         eventLocked("engine_stopped", "requested_by_client")
@@ -290,6 +299,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             initialCycleFuture = null
             cancelVendorRecoveryBurstsLocked()
             cancelPackageSuccessorGuardsLocked("engine_destroyed")
+            cancelDeliveryProtectionLeasesLocked("engine_destroyed")
             cancelGmsRecoveryCampaignLocked("engine_destroyed")
             stopEventWatcherLocked()
             executor.shutdownNow()
@@ -462,6 +472,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             val newEpisode = recordDeliveryFailureEpisodeLocked(packageName, now)
             val verifiedFrozen = packageHasVerifiedFrozenProcessLocked(packageName)
+            if (packageName in DELIVERY_PACKAGE_TARGETS) {
+                startOrExtendDeliveryProtectionLocked(
+                    packageName = packageName,
+                    now = now,
+                    signalKind = signal.kind,
+                    newDeliveryEpisode = newEpisode,
+                    verifiedFrozen = verifiedFrozen
+                )
+            }
             val activeGuard = packageSuccessorGuardByPackage[packageName]
             if (activeGuard != null) {
                 if (newEpisode) {
@@ -548,6 +567,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         forcedReason: String? = null
     ) {
         if (packageRebuildInProgress.contains(packageName)) return
+        val activeProtection = deliveryProtectionByPackage[packageName]
+        if (activeProtection != null && activeProtection.deadlineElapsed > now) {
+            eventLocked(
+                "package_process_rebuild_deferred",
+                "$packageName reason=delivery_protection_active until=${activeProtection.deadlineElapsed} " +
+                    "episodes=${activeProtection.deliveryEpisodeCount} kills=${activeProtection.killCount}"
+            )
+            return
+        }
         val circuitUntil = packageSuccessorCircuitUntilByPackage[packageName] ?: 0L
         if (circuitUntil > now) {
             val rescueAllowed =
@@ -618,6 +646,293 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun startOrExtendDeliveryProtectionLocked(
+        packageName: String,
+        now: Long,
+        signalKind: VendorFreezeSignalKind,
+        newDeliveryEpisode: Boolean,
+        verifiedFrozen: Boolean
+    ) {
+        if (packageName !in DELIVERY_PACKAGE_TARGETS) return
+        val interactive = readScreenInteractiveLocked()
+        if (interactive != false) {
+            val processes = GuardianProcessParser.matching(
+                listProcessesLocked(),
+                processTargetsForPackage(packageName)
+            )
+            processes.filter { readFreezeState(it.pid).frozen == true }.forEach { process ->
+                val result = unfreezeLocked(process)
+                if (!result.stdout.contains("not_applicable_secondary_process")) {
+                    actionCount += 1
+                    if (!isUnfreezeAccepted(result)) commandFailureCount += 1
+                }
+            }
+            tunePackageLocked(packageName)
+            eventLocked(
+                "package_delivery_protection_deferred",
+                "$packageName signal=$signalKind screenInteractive=${interactive ?: "unknown"}"
+            )
+            return
+        }
+
+        val existing = deliveryProtectionByPackage[packageName]
+        if (existing == null || existing.deadlineElapsed <= now) {
+            existing?.let { finishDeliveryProtectionLocked(packageName, it.generation, "expired_replaced") }
+            val generation = deliveryProtectionStartCount + 1L
+            val deadline = RecoveryCampaignPolicy.deliveryProtectionDeadline(
+                nowElapsed = now,
+                startedElapsed = now,
+                currentDeadlineElapsed = 0L,
+                newDeliveryEpisode = true
+            )
+            val lease = DeliveryProtectionLease(
+                packageName = packageName,
+                generation = generation,
+                startedElapsed = now,
+                deadlineElapsed = deadline,
+                lastSignalElapsed = now,
+                deliveryEpisodeCount = 1
+            )
+            deliveryProtectionByPackage[packageName] = lease
+            deliveryProtectionStartCount = generation
+            eventLocked(
+                "package_delivery_protection_started",
+                "$packageName generation=$generation signal=$signalKind deadline=$deadline " +
+                    "verifiedFrozen=$verifiedFrozen"
+            )
+            performDeliveryProtectionPassLocked(lease, initial = true)
+            deliveryProtectionFutureByPackage.remove(packageName)?.cancel(false)
+            deliveryProtectionFutureByPackage[packageName] = executor.scheduleWithFixedDelay(
+                {
+                    synchronized(lock) {
+                        runCatching {
+                            runDeliveryProtectionTickLocked(packageName, generation)
+                        }.onFailure { error ->
+                            errorCount += 1
+                            eventLocked(
+                                "package_delivery_protection_failed",
+                                "$packageName generation=$generation " +
+                                    "${error.javaClass.simpleName}:${error.message}"
+                            )
+                            finishDeliveryProtectionLocked(
+                                packageName,
+                                generation,
+                                "exception:${error.javaClass.simpleName}"
+                            )
+                        }
+                    }
+                },
+                RecoveryCampaignPolicy.PACKAGE_DELIVERY_PROTECTION_TICK_MS,
+                RecoveryCampaignPolicy.PACKAGE_DELIVERY_PROTECTION_TICK_MS,
+                TimeUnit.MILLISECONDS
+            )
+            return
+        }
+
+        existing.lastSignalElapsed = now
+        if (newDeliveryEpisode) existing.deliveryEpisodeCount += 1
+        existing.deadlineElapsed = RecoveryCampaignPolicy.deliveryProtectionDeadline(
+            nowElapsed = now,
+            startedElapsed = existing.startedElapsed,
+            currentDeadlineElapsed = existing.deadlineElapsed,
+            newDeliveryEpisode = newDeliveryEpisode
+        )
+        eventLocked(
+            "package_delivery_protection_extended",
+            "$packageName generation=${existing.generation} signal=$signalKind " +
+                "episode=$newDeliveryEpisode episodes=${existing.deliveryEpisodeCount} " +
+                "deadline=${existing.deadlineElapsed}"
+        )
+        if (
+            RecoveryCampaignPolicy.shouldEscalateDeliveryProtectionKill(
+                nowElapsed = now,
+                startedElapsed = existing.startedElapsed,
+                deliveryEpisodeCount = existing.deliveryEpisodeCount,
+                killCount = existing.killCount,
+                verifiedFrozen = verifiedFrozen
+            )
+        ) {
+            escalateDeliveryProtectionKillLocked(existing, signalKind)
+        } else {
+            performDeliveryProtectionPassLocked(existing, initial = false)
+        }
+    }
+
+    private fun runDeliveryProtectionTickLocked(packageName: String, generation: Long) {
+        val lease = deliveryProtectionByPackage[packageName] ?: return
+        if (lease.generation != generation) return
+        if (!running) {
+            finishDeliveryProtectionLocked(packageName, generation, "engine_stopped")
+            return
+        }
+        val now = SystemClock.elapsedRealtime()
+        val interactive = readScreenInteractiveLocked()
+        if (interactive == true) {
+            finishDeliveryProtectionLocked(packageName, generation, "screen_interactive")
+            return
+        }
+        if (now >= lease.deadlineElapsed) {
+            finishDeliveryProtectionLocked(packageName, generation, "deadline_complete")
+            return
+        }
+        performDeliveryProtectionPassLocked(lease, initial = false)
+        persistStatusLocked()
+    }
+
+    private fun performDeliveryProtectionPassLocked(
+        lease: DeliveryProtectionLease,
+        initial: Boolean
+    ) {
+        val now = SystemClock.elapsedRealtime()
+        val details = mutableListOf<String>()
+        if (
+            initial || lease.lastTuneElapsed <= 0L ||
+            now - lease.lastTuneElapsed >= DELIVERY_PROTECTION_TUNE_INTERVAL_MS
+        ) {
+            tunePackageLocked(lease.packageName)
+            tunePackageLocked(GMS_PACKAGE)
+            lease.lastTuneElapsed = now
+            details += "tune"
+        }
+
+        var processes = GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage(lease.packageName)
+        )
+        if (processes.isEmpty()) {
+            val unstop = runPackageUnstopWithRetryLocked(lease.packageName)
+            details += "package_unstop:${unstop.summary()}"
+            if (!unstop.success) commandFailureCount += 1
+        }
+        processes.forEach { process ->
+            if (readFreezeState(process.pid).frozen == true) {
+                val result = unfreezeLocked(process)
+                if (!result.stdout.contains("not_applicable_secondary_process")) {
+                    actionCount += 1
+                    details += "unfreeze_${process.pid}:${result.summary()}"
+                    if (!isUnfreezeAccepted(result)) commandFailureCount += 1
+                }
+            }
+        }
+
+        val gmsProcesses = listGmsProcessesLocked()
+        gmsProcesses.filter { readFreezeState(it.pid).frozen == true }.forEach { process ->
+            val result = unfreezeLocked(process)
+            if (!result.stdout.contains("not_applicable_secondary_process")) {
+                actionCount += 1
+                details += "gms_unfreeze_${process.pid}:${result.summary()}"
+                if (!isUnfreezeAccepted(result)) commandFailureCount += 1
+            }
+        }
+        if (
+            initial || lease.lastBinderPulseElapsed <= 0L ||
+            now - lease.lastBinderPulseElapsed >= DELIVERY_PROTECTION_BINDER_PULSE_INTERVAL_MS
+        ) {
+            val pulse = sendGmsBinderPulseLocked()
+            details += "gms_binder_pulse:${pulse.summary()}"
+            lease.lastBinderPulseElapsed = now
+        }
+
+        processes = GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage(lease.packageName)
+        )
+        val anyFrozen = processes.any { readFreezeState(it.pid).frozen == true }
+        if (initial || processes.isEmpty() || anyFrozen || lease.lastLauncherElapsed <= 0L) {
+            val launcher = startPackageForegroundLocked(
+                packageName = lease.packageName,
+                reason = "delivery_protection"
+            )
+            details += "launcher=${launcher.name.lowercase()}"
+            if (launcher == BackgroundLauncherWakeResult.STARTED) {
+                lease.lastLauncherElapsed = now
+            }
+        }
+        if (details.isNotEmpty()) {
+            eventLocked(
+                "package_delivery_protection_pass",
+                "${lease.packageName} generation=${lease.generation} initial=$initial " +
+                    details.joinToString(" | ").take(1_500)
+            )
+        }
+    }
+
+    private fun escalateDeliveryProtectionKillLocked(
+        lease: DeliveryProtectionLease,
+        signalKind: VendorFreezeSignalKind
+    ) {
+        lease.killCount += 1
+        deliveryProtectionKillCount += 1
+        val oldPids = GuardianProcessParser.matching(
+            listProcessesLocked(),
+            processTargetsForPackage(lease.packageName)
+        ).mapTo(linkedSetOf()) { it.pid }
+        eventLocked(
+            "package_delivery_protection_kill_started",
+            "${lease.packageName} generation=${lease.generation} signal=$signalKind " +
+                "oldPids=${oldPids.sorted()}"
+        )
+        val result = runner.run(
+            "am", "kill", "--user", "0", lease.packageName,
+            timeoutMs = PACKAGE_KILL_TIMEOUT_MS
+        )
+        actionCount += 1
+        if (!result.success) commandFailureCount += 1
+        val remaining = waitForOldPidsRemovedLocked(
+            lease.packageName,
+            oldPids,
+            PACKAGE_KILL_VERIFY_WAIT_MS
+        )
+        val unstop = runPackageUnstopWithRetryLocked(lease.packageName)
+        if (!unstop.success) commandFailureCount += 1
+        tunePackageLocked(lease.packageName)
+        val launcher = startPackageForegroundLocked(
+            packageName = lease.packageName,
+            reason = "delivery_protection_kill_successor"
+        )
+        if (launcher == BackgroundLauncherWakeResult.STARTED) {
+            lease.lastLauncherElapsed = SystemClock.elapsedRealtime()
+        }
+        eventLocked(
+            "package_delivery_protection_kill_completed",
+            "${lease.packageName} generation=${lease.generation} remaining=${remaining.sorted()} " +
+                "kill=${result.summary()} unstop=${unstop.summary()} launcher=${launcher.name.lowercase()}"
+        )
+    }
+
+    private fun finishDeliveryProtectionLocked(
+        packageName: String,
+        generation: Long,
+        reason: String
+    ) {
+        val lease = deliveryProtectionByPackage[packageName] ?: return
+        if (lease.generation != generation) return
+        deliveryProtectionFutureByPackage.remove(packageName)?.cancel(false)
+        deliveryProtectionByPackage.remove(packageName)
+        returnHomeLocked("delivery_protection_$reason")
+        deliveryProtectionCompletionCount += 1
+        eventLocked(
+            "package_delivery_protection_finished",
+            "$packageName generation=$generation reason=$reason episodes=${lease.deliveryEpisodeCount} " +
+                "kills=${lease.killCount} durationMs=" +
+                (SystemClock.elapsedRealtime() - lease.startedElapsed).coerceAtLeast(0L)
+        )
+    }
+
+    private fun cancelDeliveryProtectionLeasesLocked(reason: String) {
+        val leases = deliveryProtectionByPackage.values.toList()
+        deliveryProtectionFutureByPackage.values.forEach { it.cancel(false) }
+        deliveryProtectionFutureByPackage.clear()
+        deliveryProtectionByPackage.clear()
+        if (leases.isNotEmpty()) returnHomeLocked("delivery_protection_cancel_$reason")
+        leases.forEach { lease ->
+            eventLocked(
+                "package_delivery_protection_cancelled",
+                "${lease.packageName} generation=${lease.generation} reason=$reason"
+            )
+        }
+    }
+
     private fun attemptCircuitDeliveryRescueLocked(
         packageName: String,
         circuitUntil: Long
@@ -664,13 +979,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         details += "gms_binder_pulse:${binderPulse.summary()}"
         tunePackageLocked(GMS_PACKAGE)
 
-        val launcher = attemptBackgroundLauncherWakeLocked(
+        val now = SystemClock.elapsedRealtime()
+        startOrExtendDeliveryProtectionLocked(
             packageName = packageName,
-            reason = "circuit_delivery_rescue",
-            foregroundHoldMs =
-                RecoveryCampaignPolicy.PACKAGE_SUCCESSOR_CIRCUIT_RESCUE_HOLD_MS
+            now = now,
+            signalKind = VendorFreezeSignalKind.GCM_DELIVERY_CANCELLED,
+            // The event path has already debounced and recorded the real
+            // delivery episode. Circuit rescue must not manufacture a second
+            // episode and prematurely consume the one-kill escalation budget.
+            newDeliveryEpisode = false,
+            verifiedFrozen = true
         )
-        details += "launcher=${launcher.name.lowercase()}"
+        details += "delivery_protection=started_or_extended"
 
         val remaining = GuardianProcessParser.matching(
             listProcessesLocked(),
@@ -758,6 +1078,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val commandDetails = mutableListOf<String>()
         var strategy = requestedStrategy
+        if (
+            packageName in DELIVERY_PACKAGE_TARGETS &&
+            strategy == RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP
+        ) {
+            strategy = RecoveryCampaignPolicy.PackageResetStrategy.KILL
+            eventLocked(
+                "package_force_stop_blocked",
+                "$packageName trigger=$trigger reason=delivery_target_non_destructive fallback=$strategy"
+            )
+        }
         if (strategy == RecoveryCampaignPolicy.PackageResetStrategy.FORCE_STOP_UNSTOP) {
             val canUnstop = verifyPackageUnstopBeforeForceStopLocked(packageName, commandDetails)
             if (!canUnstop) {
@@ -1838,6 +2168,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         reason: String,
         foregroundHoldMs: Long = PACKAGE_LAUNCH_HOME_DELAY_MS
     ): BackgroundLauncherWakeResult {
+        val started = startPackageForegroundLocked(packageName, reason)
+        if (started != BackgroundLauncherWakeResult.STARTED) return started
+        SystemClock.sleep(foregroundHoldMs.coerceAtLeast(0L))
+        val home = returnHomeLocked("package_background_launch_$reason")
+        eventLocked(
+            "package_background_launch_succeeded",
+            "$packageName reason=$reason home=$home " +
+                "foregroundHoldMs=${foregroundHoldMs.coerceAtLeast(0L)}"
+        )
+        return BackgroundLauncherWakeResult.STARTED
+    }
+
+    private fun startPackageForegroundLocked(
+        packageName: String,
+        reason: String
+    ): BackgroundLauncherWakeResult {
         if (packageName !in BACKGROUND_LAUNCH_WAKE_TARGETS) {
             eventLocked(
                 "package_background_launch_skipped",
@@ -1896,8 +2242,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
             return BackgroundLauncherWakeResult.START_FAILED
         }
+        eventLocked(
+            "package_background_foreground_started",
+            "$packageName reason=$reason component=$component"
+        )
+        return BackgroundLauncherWakeResult.STARTED
+    }
 
-        SystemClock.sleep(foregroundHoldMs.coerceAtLeast(0L))
+    private fun returnHomeLocked(reason: String): Boolean {
         val home = runner.run(
             "am", "start", "--user", "0",
             "--activity-no-animation",
@@ -1907,12 +2259,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
         actionCount += 1
         if (!home.success) commandFailureCount += 1
-        eventLocked(
-            "package_background_launch_succeeded",
-            "$packageName reason=$reason component=$component home=${home.success} " +
-                "foregroundHoldMs=${foregroundHoldMs.coerceAtLeast(0L)}"
-        )
-        return BackgroundLauncherWakeResult.STARTED
+        eventLocked("package_background_home_requested", "reason=$reason result=${home.summary()}")
+        return home.success
     }
 
     private fun readScreenInteractiveLocked(): Boolean? {
@@ -2365,15 +2713,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val vendorFamily = currentVendorFamilyLocked()
         val campaignDecision = RecoveryCampaignPolicy.decideGmsCampaign(
             nowElapsed = now,
-            lastCampaignElapsed = lastGmsRecoveryElapsed,
+            lastCampaignCompletedElapsed = lastGmsRecoveryCompletedElapsed,
             campaignHistory = gmsRecoveryHistory.toList(),
             manual = manual,
             strongEvidence = strongEvidence,
-            preferredRetryIntervalMs = if (vendorFamily == BackgroundPolicyVendorFamily.VIVO) {
-                RecoveryCampaignPolicy.GMS_VIVO_RETRY_COOLDOWN_MS
-            } else {
-                RecoveryCampaignPolicy.GMS_EMERGENCY_COOLDOWN_MS
-            }
+            consecutiveFailureCount = gmsConsecutiveCampaignFailures
         )
         if (!campaignDecision.allowed) {
             eventLocked(
@@ -2466,6 +2810,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             campaign.lastObservedPids = pidsBefore
             campaign.frozenPids.clear()
             campaign.stableSinceElapsed = 0L
+            campaign.stabilizationStartedElapsed = 0L
+            campaign.stabilizationDegradedSinceElapsed = 0L
+            campaign.stabilizationLeaseRequestedElapsed = 0L
         }
 
         val frozenBefore = processesBefore.filter { readFreezeState(it.pid).frozen == true }
@@ -2504,11 +2851,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
 
         if (!anyFrozen && probe.healthy) {
+            if (campaign.stabilizationStartedElapsed <= 0L) {
+                campaign.stabilizationStartedElapsed = now
+                campaign.stabilizationLeaseRequestedElapsed = now
+                val lease = sendGmsStabilizationLeaseLocked()
+                eventLocked(
+                    "gms_recovery_stabilization_lease_started",
+                    "generation=$generation ports=${probe.establishedPorts.sorted()} " +
+                        "lease=${lease.summary()} durationMs=${RecoveryCampaignPolicy.GMS_STABILIZATION_LEASE_MS}"
+                )
+            }
+            campaign.stabilizationDegradedSinceElapsed = 0L
             if (campaign.stableSinceElapsed <= 0L || campaign.stableSinceElapsed > now) {
                 campaign.stableSinceElapsed = now
                 eventLocked(
                     "gms_recovery_stability_window_started",
-                    "generation=$generation ports=${probe.establishedPorts.sorted()}"
+                    "generation=$generation ports=${probe.establishedPorts.sorted()} " +
+                        "requiredMs=${RecoveryCampaignPolicy.GMS_CAMPAIGN_STABLE_MS}"
                 )
             }
             if (
@@ -2524,9 +2883,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         } else {
             campaign.stableSinceElapsed = 0L
+            if (campaign.stabilizationStartedElapsed > 0L) {
+                if (
+                    campaign.stabilizationDegradedSinceElapsed <= 0L ||
+                    campaign.stabilizationDegradedSinceElapsed > now
+                ) {
+                    campaign.stabilizationDegradedSinceElapsed = now
+                    eventLocked(
+                        "gms_recovery_stabilization_degraded",
+                        "generation=$generation frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
+                    )
+                }
+            }
         }
 
+        val stabilizationGraceActive =
+            campaign.stabilizationStartedElapsed > 0L &&
+                campaign.stabilizationDegradedSinceElapsed > 0L &&
+                now - campaign.stabilizationDegradedSinceElapsed <
+                    RecoveryCampaignPolicy.GMS_STABILIZATION_DEGRADED_GRACE_MS
+
         if (
+            !stabilizationGraceActive &&
             RecoveryCampaignPolicy.shouldResetGmsAgain(
                 nowElapsed = now,
                 lastResetElapsed = campaign.lastResetElapsed,
@@ -2539,6 +2917,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         ) {
             resetGmsPackageLocked(campaign, processesAfter, frozenAfter, probe)
+        } else if (stabilizationGraceActive) {
+            eventLocked(
+                "gms_recovery_reset_deferred_stabilization_grace",
+                "generation=$generation degradedForMs=" +
+                    (now - campaign.stabilizationDegradedSinceElapsed).coerceAtLeast(0L) +
+                    " frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
+            )
         }
 
         if (now >= campaign.deadlineElapsed) {
@@ -2567,19 +2952,31 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
         val details = mutableListOf<String>()
         val vendorFamily = currentVendorFamilyLocked()
-        val forceStopAllowed = RecoveryCampaignPolicy.shouldUseForceStopForGms(
+        val campaignForceStopAllowed = RecoveryCampaignPolicy.shouldUseForceStopForGms(
             vendorFamily = vendorFamily,
             resetCount = campaign.resetCount,
             refreezeCount = campaign.refreezeCount,
             forceStopCount = campaign.forceStopCount
         )
+        val forceStopDecision = RecoveryCampaignPolicy.decideGmsForceStop(
+            nowElapsed = now,
+            forceStopHistory = gmsForceStopHistory.toList()
+        )
+        val forceStopAllowed = campaignForceStopAllowed && forceStopDecision.allowed
+        val forceStopBlockReason = when {
+            !campaignForceStopAllowed -> "campaign_escalation_or_budget"
+            !forceStopDecision.allowed -> forceStopDecision.reason
+            else -> forceStopDecision.reason
+        }
         eventLocked(
             "gms_recovery_reset_started",
             "generation=${campaign.generation} reset=${campaign.resetCount} oldPids=${oldPids.sorted()} " +
                 "frozen=${frozenProcesses.map { "${it.name}:${it.pid}" }} " +
                 "transport=${transportProbe.healthy} vendor=$vendorFamily " +
                 "strategy=${if (forceStopAllowed) "force_stop_budget_available" else "non_destructive_or_stop_app"} " +
-                "forceStops=${campaign.forceStopCount}/${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)}"
+                "forceStopReason=$forceStopBlockReason " +
+                "forceStops=${campaign.forceStopCount}/${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)} " +
+                "dailyForceStops=${gmsForceStopHistory.size}/${RecoveryCampaignPolicy.GMS_FORCE_STOP_MAX_PER_24_HOURS}"
         )
 
         var remainingOldPids: Set<Int> = oldPids
@@ -2605,12 +3002,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 reason = "bounded_vendor_or_refreeze_escalation"
             )
         } else if (!stopAppSucceeded) {
-            details += "am_force_stop:deferred_by_campaign_budget"
+            details += "am_force_stop:deferred_$forceStopBlockReason"
             eventLocked(
                 "gms_recovery_destructive_reset_deferred",
                 "generation=${campaign.generation} reset=${campaign.resetCount} " +
                     "vendor=$vendorFamily forceStops=${campaign.forceStopCount} " +
-                    "max=${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)}"
+                    "max=${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)} " +
+                    "globalReason=$forceStopBlockReason"
             )
         }
 
@@ -2654,6 +3052,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         campaign.forceStopCount += 1
+        gmsForceStopHistory.addLast(SystemClock.elapsedRealtime())
+        pruneGmsStateLocked(SystemClock.elapsedRealtime())
         eventLocked(
             "gms_recovery_force_stop_started",
             "generation=${campaign.generation} reset=${campaign.resetCount} " +
@@ -2797,6 +3197,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         return result
     }
 
+    private fun sendGmsStabilizationLeaseLocked(): GuardianCommandResult {
+        val result = runner.run(
+            "am", "broadcast", "--user", "0", "--receiver-foreground",
+            "-a", GMS_BINDER_STABILIZATION_ACTION,
+            "-n", GMS_BINDER_PULSE_COMPONENT,
+            timeoutMs = GMS_BINDER_PULSE_TIMEOUT_MS
+        )
+        actionCount += 1
+        if (!result.success) commandFailureCount += 1
+        eventLocked("gms_recovery_stabilization_lease_requested", result.summary())
+        return result
+    }
+
     private fun finishGmsRecoveryCampaignLocked(generation: Long, result: String) {
         val campaign = gmsRecoveryCampaign ?: return
         if (campaign.generation != generation) return
@@ -2814,12 +3227,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             source = "campaign_final"
         )
         val success = result == "stable_transport_verified" && !finalFrozen && finalProbe.healthy
+        lastGmsRecoveryCompletedElapsed = now
         if (success) {
             gmsRecoverySuccessCount += 1
             gmsTransportVerifiedRecoveryCount += 1
             gmsFreezeEvents.clear()
+            gmsConsecutiveCampaignFailures = 0
         } else {
             errorCount += 1
+            gmsConsecutiveCampaignFailures =
+                (gmsConsecutiveCampaignFailures + 1).coerceAtMost(1000)
         }
         gmsRecoveryInProgress = false
         gmsRecoveryCampaign = null
@@ -2841,7 +3258,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "gms_recovery_campaign_finished",
             "generation=$generation result=${lastGmsRecoveryOutcome.result} success=$success " +
                 "resets=${campaign.resetCount} refreezes=${campaign.refreezeCount} " +
-                "finalPids=$finalPids frozen=$finalFrozen ports=${finalProbe.establishedPorts.sorted()}"
+                "finalPids=$finalPids frozen=$finalFrozen ports=${finalProbe.establishedPorts.sorted()} " +
+                "consecutiveFailures=$gmsConsecutiveCampaignFailures nextRetryMs=" +
+                RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(gmsConsecutiveCampaignFailures)
         )
         persistStatusLocked(force = true)
     }
@@ -2895,6 +3314,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val historyCutoff = (now - RECOVERY_HISTORY_WINDOW_MS).coerceAtLeast(0L)
         while (gmsRecoveryHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
             gmsRecoveryHistory.removeFirst()
+        }
+        while (gmsForceStopHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
+            gmsForceStopHistory.removeFirst()
         }
     }
 
@@ -3242,6 +3664,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 put(packageName, elapsed)
             }
         })
+        .put("deliveryProtectionStartCount", deliveryProtectionStartCount)
+        .put("deliveryProtectionCompletionCount", deliveryProtectionCompletionCount)
+        .put("deliveryProtectionKillCount", deliveryProtectionKillCount)
+        .put("deliveryProtectionLeases", JSONObject().apply {
+            deliveryProtectionByPackage.forEach { (packageName, lease) ->
+                put(packageName, lease.toJson())
+            }
+        })
         .put("lastPackageRebuild", lastPackageRebuildOutcome.toJson())
         .put("deliveryFailureEpisodes", JSONObject().apply {
             deliveryFailureEpisodesByPackage.forEach { (packageName, episodes) ->
@@ -3287,6 +3717,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsPidRestartCount", gmsPidRestartCount)
         .put("gmsTransportVerifiedRecoveryCount", gmsTransportVerifiedRecoveryCount)
         .put("lastGmsRecoveryElapsed", lastGmsRecoveryElapsed)
+        .put("lastGmsRecoveryCompletedElapsed", lastGmsRecoveryCompletedElapsed)
+        .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
+        .put(
+            "gmsNextAutomaticRetryIntervalMs",
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(gmsConsecutiveCampaignFailures)
+        )
+        .put("gmsForceStopHistoryCount", gmsForceStopHistory.size)
         .put("lastGmsRecovery", lastGmsRecoveryOutcome.toJson())
         .put("gmsTransport", JSONObject()
             .put("observable", lastGmsTransportProbe.observable)
@@ -3335,7 +3772,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             frozen.isNotEmpty() || (transportDegraded && gmsTransportConsecutiveMissing >= 3) -> "RED"
             !eventWatcherAlive || gmsRecoveryInProgress ||
                 packageRebuildInProgress.isNotEmpty() ||
-                packageSuccessorGuardByPackage.isNotEmpty() || transportDegraded -> "YELLOW"
+                packageSuccessorGuardByPackage.isNotEmpty() ||
+                deliveryProtectionByPackage.isNotEmpty() || transportDegraded -> "YELLOW"
             else -> "GREEN"
         }
         return JSONObject()
@@ -3348,7 +3786,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put(
                 "recoveryInProgress",
                 gmsRecoveryInProgress || packageRebuildInProgress.isNotEmpty() ||
-                    packageSuccessorGuardByPackage.isNotEmpty()
+                    packageSuccessorGuardByPackage.isNotEmpty() ||
+                    deliveryProtectionByPackage.isNotEmpty()
             )
     }
 
@@ -3367,6 +3806,31 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val commandDetail: String,
         val result: String
     )
+
+    private data class DeliveryProtectionLease(
+        val packageName: String,
+        val generation: Long,
+        val startedElapsed: Long,
+        var deadlineElapsed: Long,
+        var lastSignalElapsed: Long,
+        var deliveryEpisodeCount: Int,
+        var killCount: Int = 0,
+        var lastTuneElapsed: Long = 0L,
+        var lastBinderPulseElapsed: Long = 0L,
+        var lastLauncherElapsed: Long = 0L
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("packageName", packageName)
+            .put("generation", generation)
+            .put("startedElapsed", startedElapsed)
+            .put("deadlineElapsed", deadlineElapsed)
+            .put("lastSignalElapsed", lastSignalElapsed)
+            .put("deliveryEpisodeCount", deliveryEpisodeCount)
+            .put("killCount", killCount)
+            .put("lastTuneElapsed", lastTuneElapsed)
+            .put("lastBinderPulseElapsed", lastBinderPulseElapsed)
+            .put("lastLauncherElapsed", lastLauncherElapsed)
+    }
 
     private data class PackageSuccessorGuard(
         val packageName: String,
@@ -3423,6 +3887,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var resetCount: Int = 0,
         var refreezeCount: Int = 0,
         var forceStopCount: Int = 0,
+        var stabilizationStartedElapsed: Long = 0L,
+        var stabilizationDegradedSinceElapsed: Long = 0L,
+        var stabilizationLeaseRequestedElapsed: Long = 0L,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -3439,6 +3906,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("resetCount", resetCount)
             .put("refreezeCount", refreezeCount)
             .put("forceStopCount", forceStopCount)
+            .put("stabilizationStartedElapsed", stabilizationStartedElapsed)
+            .put("stabilizationDegradedSinceElapsed", stabilizationDegradedSinceElapsed)
+            .put("stabilizationLeaseRequestedElapsed", stabilizationLeaseRequestedElapsed)
     }
 
     private data class GuardianProcessState(
@@ -3535,14 +4005,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 11
+        private const val STATUS_SCHEMA = 12
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L
         private const val GMS_UNSTOP_TIMEOUT_MS = 8_000L
         private const val GMS_UNSTOP_MAX_ATTEMPTS = 3
         private const val GMS_UNSTOP_RETRY_DELAY_MS = 500L
-        private const val GMS_FORCE_STOP_MAX_ATTEMPTS = 2
+        private const val GMS_FORCE_STOP_MAX_ATTEMPTS = 1
         private const val GMS_FORCE_STOP_RETRY_DELAY_MS = 500L
         private const val GMS_FORCE_STOP_SETTLE_MS = 2_000L
         private const val GMS_POST_UNSTOP_SETTLE_MS = 750L
@@ -3552,6 +4022,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_BINDER_PULSE_TIMEOUT_MS = 10_000L
         private const val GMS_BINDER_PULSE_ACTION =
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_PULSE_TEST"
+        private const val GMS_BINDER_STABILIZATION_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_STABILIZATION_LEASE"
         private const val GMS_BINDER_PULSE_COMPONENT =
             "com.yubegreen.luonnotar/.receiver.AdbGmsBinderPulseReceiver"
         private const val GMS_FREEZE_EVENT_DEBOUNCE_MS = 5_000L
@@ -3571,6 +4043,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val PACKAGE_LAUNCH_RESOLVE_TIMEOUT_MS = 5_000L
         private const val PACKAGE_LAUNCH_TIMEOUT_MS = 8_000L
         private const val PACKAGE_LAUNCH_HOME_DELAY_MS = 750L
+        private const val DELIVERY_PROTECTION_TUNE_INTERVAL_MS = 10_000L
+        private const val DELIVERY_PROTECTION_BINDER_PULSE_INTERVAL_MS = 15_000L
         private const val DIAGNOSTIC_STATUS_INTERVAL_MS = 30_000L
         private const val INITIAL_CYCLE_DELAY_MS = 1_000L
         private const val RECOVERY_HISTORY_WINDOW_MS = 24L * 60L * 60L * 1_000L
