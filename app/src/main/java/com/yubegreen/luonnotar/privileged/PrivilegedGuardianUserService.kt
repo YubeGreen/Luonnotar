@@ -141,6 +141,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsFastThawFinalVerifiedCount = 0L
     private var gmsFastThawLastLatencyMs = 0L
     private var gmsFastThawMaxLatencyMs = 0L
+    private var gmsFastThawDeadlineOverrunCount = 0L
+    private var gmsFastThawMaxDeadlineOverrunMs = 0L
     private var gmsFastThawLastCompletedElapsed = 0L
     private var gmsFastThawAwaitingReconnectSinceElapsed = 0L
     private var gmsFastThawPostReconnectCount = 0L
@@ -148,6 +150,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsFastThawMaxPostReconnectLatencyMs = 0L
     private var gmsTransportCollapseCount = 0L
     private var gmsTransportLongestContinuousMs = 0L
+    private var gmsImportanceFenceProbeCount = 0L
+    private var gmsImportanceFenceStatusFailureCount = 0L
+    private var gmsImportanceFenceActive = false
+    private var gmsImportanceFenceAnyConnected = false
+    private var gmsImportanceFenceBothConnected = false
+    private var gmsImportanceFenceGeneration = 0L
+    private var gmsImportanceFenceMainState = "never"
+    private var gmsImportanceFenceMainAction = ""
+    private var gmsImportanceFenceMainComponent = ""
+    private var gmsImportanceFencePersistentState = "never"
+    private var gmsImportanceFencePersistentAction = ""
+    private var gmsImportanceFencePersistentComponent = ""
+    private var gmsImportanceFenceLastProbeElapsed = 0L
+    private var gmsImportanceFenceFreezeWhileAnyConnectedCount = 0L
+    private var gmsImportanceFenceFreezeWhileBothConnectedCount = 0L
+    private var gmsImportanceFenceUid = -1
+    private var gmsImportanceFenceUidState = "unobserved"
+    private var gmsImportanceFenceLastRawStatus = ""
+    private val gmsImportanceFenceBaselineOomAdj = linkedMapOf<String, Int>()
+    private val gmsImportanceFenceLastOomAdj = linkedMapOf<String, Int>()
+    private val gmsImportanceFenceLowestOomAdj = linkedMapOf<String, Int>()
+    private val gmsImportanceFenceHighestOomAdj = linkedMapOf<String, Int>()
     private var lastGmsRecoveryOutcome = GmsRecoveryOutcome()
     private var lastGmsTransportProbeElapsed = 0L
     private var lastGmsTransportHealthyElapsed = 0L
@@ -493,6 +517,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
         ) {
             recordGmsFreezeEventLocked(now, signal.rawLine)
+            if (gmsImportanceFenceActive && gmsImportanceFenceAnyConnected) {
+                gmsImportanceFenceFreezeWhileAnyConnectedCount += 1
+                if (gmsImportanceFenceBothConnected) {
+                    gmsImportanceFenceFreezeWhileBothConnectedCount += 1
+                }
+                eventLocked(
+                    "gms_importance_fence_freeze_observed",
+                    "anyConnected=$gmsImportanceFenceAnyConnected " +
+                        "bothConnected=$gmsImportanceFenceBothConnected " +
+                        "mainState=$gmsImportanceFenceMainState " +
+                        "persistentState=$gmsImportanceFencePersistentState " +
+                        "uidState=$gmsImportanceFenceUidState"
+                )
+            }
         }
         if (
             signal.deliveryCritical &&
@@ -1710,9 +1748,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                             SystemClock.sleep(minOf(requestedDelay, remaining))
                         }
 
+                        val beforeCommand = SystemClock.elapsedRealtime()
+                        if (beforeCommand >= deadline) break
                         passCount += 1
                         val remainingForCommand =
-                            (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+                            (deadline - beforeCommand).coerceAtLeast(1L)
                         val passResult = runGmsFastThawPass(
                             sticky = sticky,
                             secondarySupported = secondarySupported,
@@ -1721,13 +1761,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                                 remainingForCommand
                             )
                         )
+                        val afterCommand = SystemClock.elapsedRealtime()
                         val remainingForVerify =
-                            (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                            (deadline - afterCommand).coerceAtLeast(0L)
                         if (remainingForVerify > 0L) {
                             SystemClock.sleep(
                                 minOf(GMS_FAST_THAW_VERIFY_DELAY_MS, remainingForVerify)
                             )
                         }
+                        // Always perform one final verification read, but never
+                        // schedule another retry after the hard deadline.
                         frozenAfter = fastReadFrozenGmsProcesses()
                         passDetails +=
                             "pass=$passCount accepted=${passResult.success} " +
@@ -1736,6 +1779,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     }
 
                     val commandCompleted = SystemClock.elapsedRealtime()
+                    val deadlineOverrunMs =
+                        (commandCompleted - deadline).coerceAtLeast(0L)
                     val latency = (commandCompleted - signalElapsed).coerceAtLeast(0L)
                     val finalVerified = frozenAfter.isEmpty()
                     var shouldRefreshAnchor = false
@@ -1758,6 +1803,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         }
                         gmsFastThawLastLatencyMs = latency
                         gmsFastThawMaxLatencyMs = maxOf(gmsFastThawMaxLatencyMs, latency)
+                        if (deadlineOverrunMs > 0L) {
+                            gmsFastThawDeadlineOverrunCount += 1
+                            gmsFastThawMaxDeadlineOverrunMs = maxOf(
+                                gmsFastThawMaxDeadlineOverrunMs,
+                                deadlineOverrunMs
+                            )
+                        }
                         gmsFastThawLastCompletedElapsed = commandCompleted
                         eventLocked(
                             if (finalVerified) {
@@ -1767,6 +1819,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                             },
                             "freezeToUnfreezeLatencyMs=$latency passes=$passCount " +
                                 "burstDurationMs=${commandCompleted - burstStarted} " +
+                                "deadlineOverrunMs=$deadlineOverrunMs " +
                                 "remainingFrozen=${frozenAfter.map { "${it.first}:${it.second}" }} " +
                                 "details=${passDetails.joinToString(" | ")}"
                         )
@@ -2966,6 +3019,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val generation = gmsRecoveryGeneration + 1L
         gmsRecoveryGeneration = generation
         val oldPids = gmsProcesses.mapTo(linkedSetOf()) { it.pid }
+        resetGmsImportanceFenceCampaignMetricsLocked(gmsProcesses)
         val campaign = GmsRecoveryCampaign(
             trigger = trigger,
             manual = manual,
@@ -2995,6 +3049,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             reason = "campaign_started",
             force = true
         )
+        probeGmsImportanceFenceLocked(now, force = true)
         persistStatusLocked(force = true)
 
         gmsRecoveryCampaignFuture?.cancel(false)
@@ -3030,6 +3085,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val campaign = gmsRecoveryCampaign ?: return
         if (campaign.generation != generation) return
         val now = SystemClock.elapsedRealtime()
+        probeGmsImportanceFenceLocked(now, force = false)
         val processesBefore = listGmsProcessesLocked()
         val pidsBefore = processesBefore.mapTo(linkedSetOf()) { it.pid }
         if (pidsBefore != campaign.lastObservedPids) {
@@ -3289,13 +3345,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             campaign.resetWaitReportedForCount != campaign.resetCount
         ) {
             campaign.resetWaitReportedForCount = campaign.resetCount
-            eventLocked(
-                "gms_recovery_reset_deferred_preconnection_lease",
-                "generation=$generation resetCount=${campaign.resetCount} " +
-                    "waitRemainingMs=" +
-                    (campaign.nextResetEligibleElapsed - now).coerceAtLeast(0L) +
-                    " frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
-            )
+            if (campaign.anchorOnlyAfterForceStopGate) {
+                eventLocked(
+                    "gms_recovery_anchor_only_active",
+                    "generation=$generation resetCount=${campaign.resetCount} " +
+                        "reason=force_stop_gate_closed frozen=$anyFrozen " +
+                        "ports=${probe.establishedPorts.sorted()}"
+                )
+            } else {
+                val waitRemaining =
+                    (campaign.nextResetEligibleElapsed - now).coerceAtLeast(0L)
+                eventLocked(
+                    "gms_recovery_reset_deferred_preconnection_lease",
+                    "generation=$generation resetCount=${campaign.resetCount} " +
+                        "waitRemainingMs=$waitRemaining frozen=$anyFrozen " +
+                        "ports=${probe.establishedPorts.sorted()}"
+                )
+            }
         }
 
         if (now >= campaign.deadlineElapsed) {
@@ -3662,6 +3728,156 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (!result.success) commandFailureCount += 1
         eventLocked("gms_recovery_stabilization_lease_requested", result.summary())
         return result
+    }
+
+    private fun resetGmsImportanceFenceCampaignMetricsLocked(
+        processes: List<GuardianProcess>
+    ) {
+        gmsImportanceFenceProbeCount = 0L
+        gmsImportanceFenceStatusFailureCount = 0L
+        gmsImportanceFenceActive = false
+        gmsImportanceFenceAnyConnected = false
+        gmsImportanceFenceBothConnected = false
+        gmsImportanceFenceGeneration = 0L
+        gmsImportanceFenceMainState = "waiting"
+        gmsImportanceFenceMainAction = ""
+        gmsImportanceFenceMainComponent = ""
+        gmsImportanceFencePersistentState = "waiting"
+        gmsImportanceFencePersistentAction = ""
+        gmsImportanceFencePersistentComponent = ""
+        gmsImportanceFenceLastProbeElapsed = 0L
+        gmsImportanceFenceFreezeWhileAnyConnectedCount = 0L
+        gmsImportanceFenceFreezeWhileBothConnectedCount = 0L
+        gmsImportanceFenceUid = packageUid(GMS_PACKAGE) ?: -1
+        gmsImportanceFenceUidState = "unobserved"
+        gmsImportanceFenceLastRawStatus = ""
+        gmsImportanceFenceBaselineOomAdj.clear()
+        gmsImportanceFenceLastOomAdj.clear()
+        gmsImportanceFenceLowestOomAdj.clear()
+        gmsImportanceFenceHighestOomAdj.clear()
+        readGmsOomScoreAdjLocked(processes).forEach { (name, value) ->
+            gmsImportanceFenceBaselineOomAdj[name] = value
+            gmsImportanceFenceLastOomAdj[name] = value
+            gmsImportanceFenceLowestOomAdj[name] = value
+            gmsImportanceFenceHighestOomAdj[name] = value
+        }
+        gmsImportanceFenceUidState = readGmsUidStateLocked()
+        eventLocked(
+            "gms_importance_fence_baseline_captured",
+            "oomAdj=$gmsImportanceFenceBaselineOomAdj uidState=$gmsImportanceFenceUidState"
+        )
+    }
+
+    private fun probeGmsImportanceFenceLocked(now: Long, force: Boolean) {
+        if (
+            !force &&
+            gmsImportanceFenceLastProbeElapsed > 0L &&
+            now >= gmsImportanceFenceLastProbeElapsed &&
+            now - gmsImportanceFenceLastProbeElapsed <
+                GMS_IMPORTANCE_FENCE_STATUS_PROBE_INTERVAL_MS
+        ) {
+            return
+        }
+        val result = runner.run(
+            "am", "broadcast", "--user", "0", "--receiver-foreground",
+            "-a", GMS_IMPORTANCE_FENCE_STATUS_ACTION,
+            "-n", GMS_BINDER_PULSE_COMPONENT,
+            timeoutMs = GMS_IMPORTANCE_FENCE_STATUS_TIMEOUT_MS
+        )
+        gmsImportanceFenceProbeCount += 1
+        gmsImportanceFenceLastProbeElapsed = now
+        actionCount += 1
+        if (!result.success) commandFailureCount += 1
+        val parsed = GmsImportanceFenceStatusParser.parseCommandOutput(result.stdout)
+        if (parsed == null) {
+            gmsImportanceFenceStatusFailureCount += 1
+            eventLocked(
+                "gms_importance_fence_status_unavailable",
+                result.summary()
+            )
+            return
+        }
+        val changed =
+            parsed.active != gmsImportanceFenceActive ||
+                parsed.anyConnected != gmsImportanceFenceAnyConnected ||
+                parsed.bothConnected != gmsImportanceFenceBothConnected ||
+                parsed.mainState != gmsImportanceFenceMainState ||
+                parsed.persistentState != gmsImportanceFencePersistentState ||
+                parsed.mainComponent != gmsImportanceFenceMainComponent ||
+                parsed.persistentComponent != gmsImportanceFencePersistentComponent
+        gmsImportanceFenceActive = parsed.active
+        gmsImportanceFenceAnyConnected = parsed.anyConnected
+        gmsImportanceFenceBothConnected = parsed.bothConnected
+        gmsImportanceFenceGeneration = parsed.generation
+        gmsImportanceFenceMainState = parsed.mainState
+        gmsImportanceFenceMainAction = parsed.mainAction
+        gmsImportanceFenceMainComponent = parsed.mainComponent
+        gmsImportanceFencePersistentState = parsed.persistentState
+        gmsImportanceFencePersistentAction = parsed.persistentAction
+        gmsImportanceFencePersistentComponent = parsed.persistentComponent
+        gmsImportanceFenceLastRawStatus = parsed.rawData.take(2_000)
+
+        val importance = if (parsed.active || force) {
+            readGmsOomScoreAdjLocked(listGmsProcessesLocked())
+        } else {
+            emptyMap()
+        }
+        importance.forEach { (name, value) ->
+            gmsImportanceFenceLastOomAdj[name] = value
+            gmsImportanceFenceLowestOomAdj[name] = minOf(
+                gmsImportanceFenceLowestOomAdj[name] ?: value,
+                value
+            )
+            gmsImportanceFenceHighestOomAdj[name] = maxOf(
+                gmsImportanceFenceHighestOomAdj[name] ?: value,
+                value
+            )
+        }
+        if (parsed.active || force) {
+            gmsImportanceFenceUidState = readGmsUidStateLocked()
+        }
+        if (changed || force) {
+            eventLocked(
+                "gms_importance_fence_status",
+                "active=${parsed.active} anyConnected=${parsed.anyConnected} " +
+                    "bothConnected=${parsed.bothConnected} " +
+                    "main=${parsed.mainState}:${parsed.mainComponent} " +
+                    "persistent=${parsed.persistentState}:${parsed.persistentComponent} " +
+                    "oomAdj=$importance uidState=$gmsImportanceFenceUidState"
+            )
+        }
+    }
+
+    private fun readGmsOomScoreAdjLocked(
+        processes: List<GuardianProcess>
+    ): Map<String, Int> {
+        val result = linkedMapOf<String, Int>()
+        processes.forEach { process ->
+            val value = runner.run(
+                "cat", "/proc/${process.pid}/oom_score_adj",
+                timeoutMs = GMS_IMPORTANCE_FENCE_PROC_TIMEOUT_MS
+            ).stdout.trim().toIntOrNull()
+            if (value != null) result[process.name] = value
+        }
+        return result
+    }
+
+    private fun readGmsUidStateLocked(): String {
+        val uid = if (gmsImportanceFenceUid >= 0) {
+            gmsImportanceFenceUid
+        } else {
+            packageUid(GMS_PACKAGE)?.also { gmsImportanceFenceUid = it }
+                ?: return "uid_unavailable"
+        }
+        val result = runner.run(
+            "cmd", "activity", "get-uid-state", uid.toString(),
+            timeoutMs = GMS_IMPORTANCE_FENCE_PROC_TIMEOUT_MS
+        )
+        return if (result.success) {
+            result.stdout.replace('\n', ' ').trim().take(240).ifBlank { "empty" }
+        } else {
+            "unobservable:${result.summary(160)}"
+        }
     }
 
     private fun finishGmsRecoveryCampaignLocked(generation: Long, result: String) {
@@ -4179,6 +4395,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("finalVerifiedCount", gmsFastThawFinalVerifiedCount)
             .put("lastLatencyMs", gmsFastThawLastLatencyMs)
             .put("maxLatencyMs", gmsFastThawMaxLatencyMs)
+            .put("deadlineOverrunCount", gmsFastThawDeadlineOverrunCount)
+            .put("maxDeadlineOverrunMs", gmsFastThawMaxDeadlineOverrunMs)
             .put("lastCompletedElapsed", gmsFastThawLastCompletedElapsed)
             .put("awaitingReconnectSinceElapsed", gmsFastThawAwaitingReconnectSinceElapsed)
             .put("postThawReconnectCount", gmsFastThawPostReconnectCount)
@@ -4187,6 +4405,52 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
         .put("gmsTransportCollapseCount", gmsTransportCollapseCount)
         .put("gmsTransportLongestContinuousMs", gmsTransportLongestContinuousMs)
+        .put("gmsImportanceFence", JSONObject()
+            .put("probeCount", gmsImportanceFenceProbeCount)
+            .put("statusFailureCount", gmsImportanceFenceStatusFailureCount)
+            .put("active", gmsImportanceFenceActive)
+            .put("anyConnected", gmsImportanceFenceAnyConnected)
+            .put("bothConnected", gmsImportanceFenceBothConnected)
+            .put("generation", gmsImportanceFenceGeneration)
+            .put("mainState", gmsImportanceFenceMainState)
+            .put("mainAction", gmsImportanceFenceMainAction)
+            .put("mainComponent", gmsImportanceFenceMainComponent)
+            .put("persistentState", gmsImportanceFencePersistentState)
+            .put("persistentAction", gmsImportanceFencePersistentAction)
+            .put("persistentComponent", gmsImportanceFencePersistentComponent)
+            .put("lastProbeElapsed", gmsImportanceFenceLastProbeElapsed)
+            .put(
+                "freezeWhileAnyConnectedCount",
+                gmsImportanceFenceFreezeWhileAnyConnectedCount
+            )
+            .put(
+                "freezeWhileBothConnectedCount",
+                gmsImportanceFenceFreezeWhileBothConnectedCount
+            )
+            .put("uid", gmsImportanceFenceUid)
+            .put("uidState", gmsImportanceFenceUidState)
+            .put("baselineOomScoreAdj", JSONObject().apply {
+                gmsImportanceFenceBaselineOomAdj.forEach { (name, value) ->
+                    put(name, value)
+                }
+            })
+            .put("lastOomScoreAdj", JSONObject().apply {
+                gmsImportanceFenceLastOomAdj.forEach { (name, value) ->
+                    put(name, value)
+                }
+            })
+            .put("lowestOomScoreAdj", JSONObject().apply {
+                gmsImportanceFenceLowestOomAdj.forEach { (name, value) ->
+                    put(name, value)
+                }
+            })
+            .put("highestOomScoreAdj", JSONObject().apply {
+                gmsImportanceFenceHighestOomAdj.forEach { (name, value) ->
+                    put(name, value)
+                }
+            })
+            .put("rawStatus", gmsImportanceFenceLastRawStatus)
+        )
         .put("lastGmsRecoveryElapsed", lastGmsRecoveryElapsed)
         .put("lastGmsRecoveryCompletedElapsed", lastGmsRecoveryCompletedElapsed)
         .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
@@ -4507,7 +4771,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 15
+        private const val STATUS_SCHEMA = 16
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L
@@ -4528,6 +4792,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_STABILIZATION_LEASE"
         private const val GMS_BINDER_PULSE_COMPONENT =
             "com.yubegreen.luonnotar/.receiver.AdbGmsBinderPulseReceiver"
+        private const val GMS_IMPORTANCE_FENCE_STATUS_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_GMS_IMPORTANCE_FENCE_STATUS"
+        private const val GMS_IMPORTANCE_FENCE_STATUS_PROBE_INTERVAL_MS = 2_000L
+        private const val GMS_IMPORTANCE_FENCE_STATUS_TIMEOUT_MS = 3_000L
+        private const val GMS_IMPORTANCE_FENCE_PROC_TIMEOUT_MS = 1_000L
         private const val GMS_FREEZE_EVENT_DEBOUNCE_MS = 5_000L
         private const val GMS_FAST_THAW_BURST_DURATION_MS = 1_500L
         private const val GMS_FAST_THAW_COMMAND_TIMEOUT_MS = 700L

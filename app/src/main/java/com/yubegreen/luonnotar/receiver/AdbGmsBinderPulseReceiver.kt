@@ -5,6 +5,7 @@ import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
 import androidx.core.content.ContextCompat
+import com.yubegreen.luonnotar.notification.GmsImportanceFenceCoordinator
 import com.yubegreen.luonnotar.service.FcmGuardianService
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
@@ -20,9 +21,16 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent?) {
         val action = intent?.action ?: return
         if (action !in SUPPORTED_ACTIONS) return
-        val stabilization = action == ACTION_STABILIZATION_LEASE
 
         val appContext = context.applicationContext
+        if (action == ACTION_IMPORTANCE_FENCE_STATUS) {
+            val snapshot = GmsImportanceFenceCoordinator.snapshot()
+            setResultCode(Activity.RESULT_OK)
+            setResultData("ok=true;${snapshot.compact()}")
+            return
+        }
+
+        val stabilization = action == ACTION_STABILIZATION_LEASE
         val prefs = LuonnotarPreferences.deviceProtected(appContext)
         val guardianActive =
             prefs.getBoolean(LuonnotarPreferences.KEY_ENABLED, false) &&
@@ -72,12 +80,19 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
             false
         }
 
+        val importanceFenceRequested =
+            stabilization && started && GmsImportanceFenceCoordinator.startOrExtend(
+                appContext,
+                "adb_stabilization_receiver"
+            )
+
         setResultCode(
             if (started) Activity.RESULT_OK else Activity.RESULT_CANCELED
         )
         setResultData(
             "ok=$started;reason=${if (started) "" else "dispatch_failed"};" +
-                "guardianActive=true;serviceDispatchStarted=$started"
+                "guardianActive=true;serviceDispatchStarted=$started;" +
+                "importanceFenceRequested=$importanceFenceRequested"
         )
         LogManager.event(
             appContext,
@@ -88,7 +103,8 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
             },
             mapOf(
                 "guardianActive" to guardianActive,
-                "serviceDispatchStarted" to started
+                "serviceDispatchStarted" to started,
+                "importanceFenceRequested" to importanceFenceRequested
             )
         )
     }
@@ -98,6 +114,12 @@ class AdbGmsBinderPulseReceiver : BroadcastReceiver() {
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_PULSE_TEST"
         const val ACTION_STABILIZATION_LEASE =
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_STABILIZATION_LEASE"
-        private val SUPPORTED_ACTIONS = setOf(ACTION_TRIGGER, ACTION_STABILIZATION_LEASE)
+        const val ACTION_IMPORTANCE_FENCE_STATUS =
+            "com.yubegreen.luonnotar.action.ADB_GMS_IMPORTANCE_FENCE_STATUS"
+        private val SUPPORTED_ACTIONS = setOf(
+            ACTION_TRIGGER,
+            ACTION_STABILIZATION_LEASE,
+            ACTION_IMPORTANCE_FENCE_STATUS
+        )
     }
 }

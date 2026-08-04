@@ -57,6 +57,7 @@ import com.yubegreen.luonnotar.notification.ControlledPushDeliveryState
 import com.yubegreen.luonnotar.notification.PushTestDeliveryPolicy
 import com.yubegreen.luonnotar.notification.GmsBinderAnchorCoordinator
 import com.yubegreen.luonnotar.notification.GmsBinderPulseCoordinator
+import com.yubegreen.luonnotar.notification.GmsImportanceFenceCoordinator
 import com.yubegreen.luonnotar.notification.NotificationListenerRecoveryCoordinator
 import com.yubegreen.luonnotar.receiver.GuardianCleanupReceiver
 import com.yubegreen.luonnotar.receiver.LabAlarmScheduler
@@ -897,16 +898,23 @@ class FcmGuardianService : Service() {
             }
             ACTION_GMS_BINDER_STABILIZATION_LEASE -> {
                 val active = isActivelyEnabled()
+                val leaseReason = reason.ifBlank { "privileged_gms_recovery" }
                 val started = active && GmsBinderPulseCoordinator.startStabilization(
                     this,
-                    reason.ifBlank { "privileged_gms_recovery" }
+                    leaseReason
                 )
+                val importanceFenceStarted =
+                    active && GmsImportanceFenceCoordinator.startOrExtend(
+                        this,
+                        leaseReason
+                    )
                 LogManager.event(
                     this,
                     "gms_binder_stabilization_lease_requested",
                     mapOf(
                         "guardianActive" to active,
                         "started" to started,
+                        "importanceFenceStarted" to importanceFenceStarted,
                         "durationMs" to
                             GmsBinderPulseCoordinator.STABILIZATION_DURATION_MS
                     )
@@ -956,6 +964,7 @@ class FcmGuardianService : Service() {
         }
         GmsBinderAnchorCoordinator.stop(this, "service_destroyed")
         GmsBinderPulseCoordinator.stop(this, "service_destroyed")
+        GmsImportanceFenceCoordinator.stop(this, "service_destroyed")
         var connectionToDisconnect: HttpsURLConnection? = null
         var dnsSocketToClose: DatagramSocket? = null
         var dnsCancellationToCancel: CancellationSignal? = null
@@ -4088,6 +4097,7 @@ class FcmGuardianService : Service() {
     private fun quiesceGuardianExecution(reason: String) {
         GmsBinderAnchorCoordinator.stop(this, reason)
         GmsBinderPulseCoordinator.stop(this, reason)
+        GmsImportanceFenceCoordinator.stop(this, reason)
         var connectionToDisconnect: HttpsURLConnection? = null
         var dnsSocketToClose: DatagramSocket? = null
         var dnsCancellationToCancel: CancellationSignal? = null
