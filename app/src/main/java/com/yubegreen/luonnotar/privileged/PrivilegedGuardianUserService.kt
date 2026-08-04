@@ -137,9 +137,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsFastThawAttemptCount = 0L
     private var gmsFastThawSuccessCount = 0L
     private var gmsFastThawCoalescedCount = 0L
+    private var gmsFastThawRetryCount = 0L
+    private var gmsFastThawFinalVerifiedCount = 0L
     private var gmsFastThawLastLatencyMs = 0L
     private var gmsFastThawMaxLatencyMs = 0L
     private var gmsFastThawLastCompletedElapsed = 0L
+    private var gmsFastThawAwaitingReconnectSinceElapsed = 0L
+    private var gmsFastThawPostReconnectCount = 0L
+    private var gmsFastThawLastPostReconnectLatencyMs = 0L
+    private var gmsFastThawMaxPostReconnectLatencyMs = 0L
+    private var gmsTransportCollapseCount = 0L
+    private var gmsTransportLongestContinuousMs = 0L
     private var lastGmsRecoveryOutcome = GmsRecoveryOutcome()
     private var lastGmsTransportProbeElapsed = 0L
     private var lastGmsTransportHealthyElapsed = 0L
@@ -1684,68 +1692,88 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     val secondarySupported = synchronized(lock) {
                         supportsSecondaryProcessUnfreeze
                     }
-                    val mainCommand = mutableListOf("am", "unfreeze").apply {
-                        if (sticky) add("--sticky")
-                        add(GMS_PACKAGE)
-                        addAll(listOf("--user", "0"))
-                    }
-                    val commandStarted = SystemClock.elapsedRealtime()
-                    val mainResult = runner.run(
-                        mainCommand,
-                        timeoutMs = GMS_FAST_THAW_COMMAND_TIMEOUT_MS
-                    )
-                    var secondaryResult: GuardianCommandResult? = null
-                    var frozenAfterMain = fastReadFrozenGmsProcesses()
-                    if (
-                        secondarySupported &&
-                        frozenAfterMain.any { it.first == "$GMS_PACKAGE.persistent" }
+                    val burstStarted = SystemClock.elapsedRealtime()
+                    val deadline = burstStarted + GMS_FAST_THAW_BURST_DURATION_MS
+                    var passCount = 0
+                    var frozenAfter = fastReadFrozenGmsProcesses()
+                    val passDetails = mutableListOf<String>()
+
+                    while (
+                        frozenAfter.isNotEmpty() &&
+                        passCount < GMS_FAST_THAW_MAX_PASSES &&
+                        SystemClock.elapsedRealtime() < deadline
                     ) {
-                        val secondaryCommand = mutableListOf("am", "unfreeze").apply {
-                            if (sticky) add("--sticky")
-                            add("$GMS_PACKAGE.persistent")
-                            addAll(listOf("--user", "0"))
+                        if (passCount > 0) {
+                            val requestedDelay = GMS_FAST_THAW_RETRY_DELAYS_MS[passCount - 1]
+                            val remaining = deadline - SystemClock.elapsedRealtime()
+                            if (remaining <= 0L) break
+                            SystemClock.sleep(minOf(requestedDelay, remaining))
                         }
-                        secondaryResult = runner.run(
-                            secondaryCommand,
-                            timeoutMs = GMS_FAST_THAW_COMMAND_TIMEOUT_MS
+
+                        passCount += 1
+                        val remainingForCommand =
+                            (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+                        val passResult = runGmsFastThawPass(
+                            sticky = sticky,
+                            secondarySupported = secondarySupported,
+                            timeoutMs = minOf(
+                                GMS_FAST_THAW_COMMAND_TIMEOUT_MS,
+                                remainingForCommand
+                            )
                         )
-                        frozenAfterMain = fastReadFrozenGmsProcesses()
+                        val remainingForVerify =
+                            (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+                        if (remainingForVerify > 0L) {
+                            SystemClock.sleep(
+                                minOf(GMS_FAST_THAW_VERIFY_DELAY_MS, remainingForVerify)
+                            )
+                        }
+                        frozenAfter = fastReadFrozenGmsProcesses()
+                        passDetails +=
+                            "pass=$passCount accepted=${passResult.success} " +
+                                "durationMs=${passResult.durationMs} " +
+                                "remaining=${frozenAfter.map { "${it.first}:${it.second}" }}"
                     }
+
                     val commandCompleted = SystemClock.elapsedRealtime()
                     val latency = (commandCompleted - signalElapsed).coerceAtLeast(0L)
-                    val commandDuration = (commandCompleted - commandStarted).coerceAtLeast(0L)
-                    val success = frozenAfterMain.isEmpty() &&
-                        (mainResult.success || secondaryResult?.success == true)
-
+                    val finalVerified = frozenAfter.isEmpty()
+                    var shouldRefreshAnchor = false
                     synchronized(lock) {
                         gmsFastThawAttemptCount += 1
-                        actionCount += if (secondaryResult == null) 1 else 2
-                        if (!mainResult.success) commandFailureCount += 1
-                        if (secondaryResult != null && secondaryResult.success != true) {
-                            commandFailureCount += 1
-                        }
-                        if (success) {
+                        gmsFastThawRetryCount += (passCount - 1).coerceAtLeast(0).toLong()
+                        actionCount += passCount.toLong()
+                        if (finalVerified) {
                             gmsFastThawSuccessCount += 1
+                            gmsFastThawFinalVerifiedCount += 1
                             effectiveThawCount += 1
-                        } else if (frozenAfterMain.isNotEmpty()) {
+                            if (!lastGmsTransportProbe.healthy) {
+                                if (gmsFastThawAwaitingReconnectSinceElapsed <= 0L) {
+                                    gmsFastThawAwaitingReconnectSinceElapsed = commandCompleted
+                                }
+                                shouldRefreshAnchor = true
+                            }
+                        } else {
                             verificationFailureCount += 1
                         }
                         gmsFastThawLastLatencyMs = latency
                         gmsFastThawMaxLatencyMs = maxOf(gmsFastThawMaxLatencyMs, latency)
                         gmsFastThawLastCompletedElapsed = commandCompleted
                         eventLocked(
-                            if (success) {
-                                "gms_fast_thaw_verified"
+                            if (finalVerified) {
+                                "gms_fast_thaw_burst_verified"
                             } else {
-                                "gms_fast_thaw_unverified"
+                                "gms_fast_thaw_burst_exhausted"
                             },
-                            "freezeToUnfreezeLatencyMs=$latency commandDurationMs=$commandDuration " +
-                                "mainAccepted=${mainResult.success} main=${mainResult.summary()} " +
-                                "secondaryAccepted=${secondaryResult?.success} " +
-                                "secondary=${secondaryResult?.summary().orEmpty()} " +
-                                "remainingFrozen=${frozenAfterMain.map { "${it.first}:${it.second}" }}"
+                            "freezeToUnfreezeLatencyMs=$latency passes=$passCount " +
+                                "burstDurationMs=${commandCompleted - burstStarted} " +
+                                "remainingFrozen=${frozenAfter.map { "${it.first}:${it.second}" }} " +
+                                "details=${passDetails.joinToString(" | ")}"
                         )
                         persistStatusLocked(force = true)
+                    }
+                    if (shouldRefreshAnchor) {
+                        requestPostThawAnchorQuery()
                     }
                 } catch (error: Throwable) {
                     synchronized(lock) {
@@ -1771,6 +1799,57 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun runGmsFastThawPass(
+        sticky: Boolean,
+        secondarySupported: Boolean,
+        timeoutMs: Long
+    ): FastThawPassResult {
+        val stickyArg = if (sticky) "--sticky " else ""
+        val commands = mutableListOf(
+            "am unfreeze ${stickyArg}${GMS_PACKAGE} --user 0"
+        )
+        if (secondarySupported) {
+            commands +=
+                "am unfreeze ${stickyArg}${GMS_PACKAGE}.persistent --user 0"
+        }
+        val shellCommand = commands.joinToString(
+            separator = " & ",
+            postfix = " & wait"
+        ) { "($it)" }
+        val started = SystemClock.elapsedRealtime()
+        val result = runner.run(
+            "sh", "-c", shellCommand,
+            timeoutMs = timeoutMs.coerceAtLeast(1L)
+        )
+        val duration =
+            (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+        synchronized(lock) {
+            if (!result.success) commandFailureCount += 1
+            eventLocked(
+                "gms_fast_thaw_pass",
+                "accepted=${result.success} durationMs=$duration result=${result.summary()}"
+            )
+        }
+        return FastThawPassResult(result.success, duration)
+    }
+
+    private fun requestPostThawAnchorQuery() {
+        val result = runner.run(
+            "am", "broadcast", "--user", "0", "--receiver-foreground",
+            "-a", GMS_BINDER_STABILIZATION_ACTION,
+            "-n", GMS_BINDER_PULSE_COMPONENT,
+            timeoutMs = GMS_BINDER_PULSE_TIMEOUT_MS
+        )
+        synchronized(lock) {
+            actionCount += 1
+            if (!result.success) commandFailureCount += 1
+            eventLocked(
+                "gms_fast_thaw_anchor_query_requested",
+                result.summary()
+            )
+        }
+    }
+
     private fun fastReadFrozenGmsProcesses(): List<Pair<String, Int>> {
         val preferred = runner.run(
             "ps", "-A", "-o", "PID,NAME,ARGS",
@@ -1783,7 +1862,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "ps", "-A",
                 timeoutMs = GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS
             )
-            if (fallback.success) GuardianProcessParser.parse(fallback.stdout) else emptyList()
+            if (fallback.success) {
+                GuardianProcessParser.parse(fallback.stdout)
+            } else {
+                return listOf("scan_unobservable" to -1)
+            }
         }
         return GuardianProcessParser.matching(
             processes,
@@ -2966,7 +3049,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             campaign.stableSinceElapsed = 0L
             campaign.stabilizationStartedElapsed = 0L
             campaign.stabilizationDegradedSinceElapsed = 0L
+            campaign.stabilizationGraceDeadlineElapsed = 0L
             campaign.stabilizationLeaseRequestedElapsed = 0L
+            gmsFastThawAwaitingReconnectSinceElapsed = 0L
             if (pidsBefore.isNotEmpty()) {
                 ensureGmsPreconnectionLeaseLocked(
                     campaign = campaign,
@@ -3037,6 +3122,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 )
             }
             campaign.stabilizationDegradedSinceElapsed = 0L
+            campaign.stabilizationGraceDeadlineElapsed = 0L
             if (campaign.stableSinceElapsed <= 0L || campaign.stableSinceElapsed > now) {
                 campaign.stableSinceElapsed = now
                 eventLocked(
@@ -3044,6 +3130,36 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     "generation=$generation ports=${probe.establishedPorts.sorted()} " +
                         "requiredMs=${RecoveryCampaignPolicy.GMS_CAMPAIGN_STABLE_MS}"
                 )
+            }
+            val continuousHealthyMs =
+                (now - campaign.stableSinceElapsed).coerceAtLeast(0L)
+            campaign.longestContinuousTransportMs = maxOf(
+                campaign.longestContinuousTransportMs,
+                continuousHealthyMs
+            )
+            campaign.phaseLongestContinuousTransportMs = maxOf(
+                campaign.phaseLongestContinuousTransportMs,
+                continuousHealthyMs
+            )
+            gmsTransportLongestContinuousMs = maxOf(
+                gmsTransportLongestContinuousMs,
+                continuousHealthyMs
+            )
+            if (gmsFastThawAwaitingReconnectSinceElapsed > 0L) {
+                val reconnectLatency =
+                    (now - gmsFastThawAwaitingReconnectSinceElapsed).coerceAtLeast(0L)
+                gmsFastThawPostReconnectCount += 1
+                gmsFastThawLastPostReconnectLatencyMs = reconnectLatency
+                gmsFastThawMaxPostReconnectLatencyMs = maxOf(
+                    gmsFastThawMaxPostReconnectLatencyMs,
+                    reconnectLatency
+                )
+                eventLocked(
+                    "gms_fast_thaw_transport_reconnected",
+                    "postThawReconnectLatencyMs=$reconnectLatency " +
+                        "ports=${probe.establishedPorts.sorted()}"
+                )
+                gmsFastThawAwaitingReconnectSinceElapsed = 0L
             }
             if (
                 RecoveryCampaignPolicy.campaignStable(
@@ -3057,6 +3173,41 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 return
             }
         } else {
+            if (campaign.stableSinceElapsed > 0L && campaign.stableSinceElapsed <= now) {
+                val continuousHealthyMs =
+                    (now - campaign.stableSinceElapsed).coerceAtLeast(0L)
+                campaign.longestContinuousTransportMs = maxOf(
+                    campaign.longestContinuousTransportMs,
+                    continuousHealthyMs
+                )
+                campaign.phaseLongestContinuousTransportMs = maxOf(
+                    campaign.phaseLongestContinuousTransportMs,
+                    continuousHealthyMs
+                )
+                gmsTransportLongestContinuousMs = maxOf(
+                    gmsTransportLongestContinuousMs,
+                    continuousHealthyMs
+                )
+                campaign.transportCollapseCount += 1
+                gmsTransportCollapseCount += 1
+                if (
+                    campaign.collapseWindowStartedElapsed <= 0L ||
+                    campaign.collapseWindowStartedElapsed > now ||
+                    now - campaign.collapseWindowStartedElapsed >
+                        RecoveryCampaignPolicy.GMS_TRANSPORT_COLLAPSE_WINDOW_MS
+                ) {
+                    campaign.collapseWindowStartedElapsed = now
+                    campaign.collapseCountInWindow = 1
+                } else {
+                    campaign.collapseCountInWindow += 1
+                }
+                eventLocked(
+                    "gms_recovery_transport_collapsed",
+                    "generation=$generation continuousHealthyMs=$continuousHealthyMs " +
+                        "total=${campaign.transportCollapseCount} " +
+                        "windowCount=${campaign.collapseCountInWindow}"
+                )
+            }
             campaign.stableSinceElapsed = 0L
             if (campaign.stabilizationStartedElapsed > 0L) {
                 if (
@@ -3064,6 +3215,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     campaign.stabilizationDegradedSinceElapsed > now
                 ) {
                     campaign.stabilizationDegradedSinceElapsed = now
+                    if (!campaign.stabilizationGraceConsumed) {
+                        campaign.stabilizationGraceConsumed = true
+                        campaign.stabilizationGraceDeadlineElapsed =
+                            now + RecoveryCampaignPolicy.GMS_STABILIZATION_DEGRADED_GRACE_MS
+                        eventLocked(
+                            "gms_recovery_stabilization_grace_consumed",
+                            "generation=$generation deadlineElapsed=" +
+                                campaign.stabilizationGraceDeadlineElapsed
+                        )
+                    }
                     eventLocked(
                         "gms_recovery_stabilization_degraded",
                         "generation=$generation frozen=$anyFrozen ports=${probe.establishedPorts.sorted()}"
@@ -3072,14 +3233,34 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         }
 
+        val flappingEscalation =
+            RecoveryCampaignPolicy.shouldEscalateGmsTransportFlapping(
+                nowElapsed = now,
+                phaseStartedElapsed = campaign.phaseStartedElapsed,
+                longestContinuousTransportMs =
+                    campaign.phaseLongestContinuousTransportMs,
+                collapseWindowStartedElapsed =
+                    campaign.collapseWindowStartedElapsed,
+                collapseCountInWindow = campaign.collapseCountInWindow
+            )
+        if (flappingEscalation && !campaign.flappingEscalationReported) {
+            campaign.flappingEscalationReported = true
+            eventLocked(
+                "gms_recovery_transport_flapping_escalation",
+                "generation=$generation phaseElapsedMs=" +
+                    (now - campaign.phaseStartedElapsed).coerceAtLeast(0L) +
+                    " longestContinuousMs=${campaign.phaseLongestContinuousTransportMs} " +
+                    "collapseWindowCount=${campaign.collapseCountInWindow}"
+            )
+        }
         val stabilizationGraceActive =
-            campaign.stabilizationStartedElapsed > 0L &&
-                campaign.stabilizationDegradedSinceElapsed > 0L &&
-                now - campaign.stabilizationDegradedSinceElapsed <
-                    RecoveryCampaignPolicy.GMS_STABILIZATION_DEGRADED_GRACE_MS
+            !flappingEscalation &&
+                campaign.stabilizationGraceDeadlineElapsed > now
 
         val vendorFamily = currentVendorFamilyLocked()
-        val resetEligible = now >= campaign.nextResetEligibleElapsed
+        val resetEligible =
+            !campaign.anchorOnlyAfterForceStopGate &&
+                (now >= campaign.nextResetEligibleElapsed || flappingEscalation)
         if (
             !stabilizationGraceActive &&
             resetEligible &&
@@ -3159,6 +3340,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             campaign.nextResetEligibleElapsed = Long.MAX_VALUE
             campaign.resetWaitReportedForCount = campaign.resetCount
+            campaign.anchorOnlyAfterForceStopGate = true
             ensureGmsPreconnectionLeaseLocked(
                 campaign = campaign,
                 nowElapsed = now,
@@ -3177,6 +3359,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         campaign.resetCount = nextResetCount
         campaign.lastResetElapsed = now
+        campaign.phaseStartedElapsed = now
+        campaign.phaseLongestContinuousTransportMs = 0L
+        campaign.collapseWindowStartedElapsed = 0L
+        campaign.collapseCountInWindow = 0
+        campaign.stabilizationGraceConsumed = false
+        campaign.stabilizationGraceDeadlineElapsed = 0L
+        campaign.flappingEscalationReported = false
+        campaign.anchorOnlyAfterForceStopGate = false
+        gmsFastThawAwaitingReconnectSinceElapsed = 0L
         gmsRecoveryResetCount += 1
         val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
         val details = mutableListOf<String>()
@@ -3984,10 +4175,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("attemptCount", gmsFastThawAttemptCount)
             .put("successCount", gmsFastThawSuccessCount)
             .put("coalescedCount", gmsFastThawCoalescedCount)
+            .put("retryCount", gmsFastThawRetryCount)
+            .put("finalVerifiedCount", gmsFastThawFinalVerifiedCount)
             .put("lastLatencyMs", gmsFastThawLastLatencyMs)
             .put("maxLatencyMs", gmsFastThawMaxLatencyMs)
             .put("lastCompletedElapsed", gmsFastThawLastCompletedElapsed)
+            .put("awaitingReconnectSinceElapsed", gmsFastThawAwaitingReconnectSinceElapsed)
+            .put("postThawReconnectCount", gmsFastThawPostReconnectCount)
+            .put("postThawReconnectLatencyMs", gmsFastThawLastPostReconnectLatencyMs)
+            .put("maxPostThawReconnectLatencyMs", gmsFastThawMaxPostReconnectLatencyMs)
         )
+        .put("gmsTransportCollapseCount", gmsTransportCollapseCount)
+        .put("gmsTransportLongestContinuousMs", gmsTransportLongestContinuousMs)
         .put("lastGmsRecoveryElapsed", lastGmsRecoveryElapsed)
         .put("lastGmsRecoveryCompletedElapsed", lastGmsRecoveryCompletedElapsed)
         .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
@@ -4164,7 +4363,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var preconnectionLeaseRequestedElapsed: Long = 0L,
         var stabilizationStartedElapsed: Long = 0L,
         var stabilizationDegradedSinceElapsed: Long = 0L,
+        var stabilizationGraceConsumed: Boolean = false,
+        var stabilizationGraceDeadlineElapsed: Long = 0L,
         var stabilizationLeaseRequestedElapsed: Long = 0L,
+        var transportCollapseCount: Int = 0,
+        var longestContinuousTransportMs: Long = 0L,
+        var phaseStartedElapsed: Long = startedElapsed,
+        var phaseLongestContinuousTransportMs: Long = 0L,
+        var collapseWindowStartedElapsed: Long = 0L,
+        var collapseCountInWindow: Int = 0,
+        var flappingEscalationReported: Boolean = false,
+        var anchorOnlyAfterForceStopGate: Boolean = false,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -4186,7 +4395,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("preconnectionLeaseRequestedElapsed", preconnectionLeaseRequestedElapsed)
             .put("stabilizationStartedElapsed", stabilizationStartedElapsed)
             .put("stabilizationDegradedSinceElapsed", stabilizationDegradedSinceElapsed)
+            .put("stabilizationGraceConsumed", stabilizationGraceConsumed)
+            .put("stabilizationGraceDeadlineElapsed", stabilizationGraceDeadlineElapsed)
             .put("stabilizationLeaseRequestedElapsed", stabilizationLeaseRequestedElapsed)
+            .put("transportCollapseCount", transportCollapseCount)
+            .put("longestContinuousTransportMs", longestContinuousTransportMs)
+            .put("phaseStartedElapsed", phaseStartedElapsed)
+            .put("phaseLongestContinuousTransportMs", phaseLongestContinuousTransportMs)
+            .put("collapseWindowStartedElapsed", collapseWindowStartedElapsed)
+            .put("collapseCountInWindow", collapseCountInWindow)
+            .put("flappingEscalationReported", flappingEscalationReported)
+            .put("anchorOnlyAfterForceStopGate", anchorOnlyAfterForceStopGate)
     }
 
     private data class GuardianProcessState(
@@ -4275,6 +4494,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("completedElapsed", completedElapsed)
     }
 
+    private data class FastThawPassResult(
+        val success: Boolean,
+        val durationMs: Long
+    )
+
     private data class FreezeEvidence(
         val frozen: Boolean?,
         val detail: String,
@@ -4283,7 +4507,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 14
+        private const val STATUS_SCHEMA = 15
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L
@@ -4305,8 +4529,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_BINDER_PULSE_COMPONENT =
             "com.yubegreen.luonnotar/.receiver.AdbGmsBinderPulseReceiver"
         private const val GMS_FREEZE_EVENT_DEBOUNCE_MS = 5_000L
-        private const val GMS_FAST_THAW_COMMAND_TIMEOUT_MS = 1_500L
-        private const val GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS = 1_000L
+        private const val GMS_FAST_THAW_BURST_DURATION_MS = 1_500L
+        private const val GMS_FAST_THAW_COMMAND_TIMEOUT_MS = 700L
+        private const val GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS = 350L
+        private const val GMS_FAST_THAW_VERIFY_DELAY_MS = 80L
+        private const val GMS_FAST_THAW_MAX_PASSES = 3
+        private val GMS_FAST_THAW_RETRY_DELAYS_MS = longArrayOf(200L, 500L)
         private const val GMS_LOG_SIGNAL_DEBOUNCE_MS = 5_000L
         private const val GMS_FROZEN_TRANSPORT_PROBE_INTERVAL_MS = 10_000L
         private const val SOCKET_PROBE_TIMEOUT_MS = 4_000L

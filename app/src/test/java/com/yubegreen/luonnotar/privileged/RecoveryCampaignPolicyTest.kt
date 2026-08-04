@@ -429,6 +429,46 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
+    fun vivoTransportFlappingEscalatesAfterThreeCollapsesOrThirtySecondsWithoutStability() {
+        assertTrue(
+            RecoveryCampaignPolicy.shouldEscalateGmsTransportFlapping(
+                nowElapsed = 119_000L,
+                phaseStartedElapsed = 100_000L,
+                longestContinuousTransportMs = 7_000L,
+                collapseWindowStartedElapsed = 100_000L,
+                collapseCountInWindow = 3
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldEscalateGmsTransportFlapping(
+                nowElapsed = 121_000L,
+                phaseStartedElapsed = 100_000L,
+                longestContinuousTransportMs = 7_000L,
+                collapseWindowStartedElapsed = 100_000L,
+                collapseCountInWindow = 3
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldEscalateGmsTransportFlapping(
+                nowElapsed = 130_000L,
+                phaseStartedElapsed = 100_000L,
+                longestContinuousTransportMs = 14_999L,
+                collapseWindowStartedElapsed = 0L,
+                collapseCountInWindow = 0
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldEscalateGmsTransportFlapping(
+                nowElapsed = 130_000L,
+                phaseStartedElapsed = 100_000L,
+                longestContinuousTransportMs = 15_000L,
+                collapseWindowStartedElapsed = 0L,
+                collapseCountInWindow = 0
+            )
+        )
+    }
+
+    @Test
     fun nonVivoGmsForceStopStillRequiresEscalationAndBudget() {
         assertTrue(
             RecoveryCampaignPolicy.shouldUseForceStopForGms(

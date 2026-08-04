@@ -311,9 +311,15 @@ object GmsBinderPulseCoordinator {
                 maxOf(previousDeadline, now + durationMs.coerceAtLeast(0L))
             )
             scheduleDeadline(generation)
-            if (
-                activeClient?.isConnected != true &&
-                activeClient?.isConnecting != true &&
+            val currentClient = activeClient
+            if (currentClient?.isConnected == true) {
+                // A recovery-side lease refresh after a verified thaw doubles as
+                // an immediate read-only Binder poke. Cancel the pending timer
+                // and query now, then resume the normal 750 ms cadence.
+                clearQueryRunnable()
+                runStabilizationQuery(generation, currentClient)
+            } else if (
+                currentClient?.isConnecting != true &&
                 reconnectRunnable == null
             ) {
                 scheduleStabilizationReconnect(generation, "lease_extended_disconnected", 0L)

@@ -53,6 +53,10 @@ object RecoveryCampaignPolicy {
     const val GMS_VIVO_AFTER_STOP_APP_WAIT_MS = 45_000L
     const val GMS_VIVO_AFTER_FORCE_STOP_WAIT_MS = 120_000L
     const val GMS_STABILIZATION_DEGRADED_GRACE_MS = 20_000L
+    const val GMS_TRANSPORT_COLLAPSE_WINDOW_MS = 20_000L
+    const val GMS_TRANSPORT_COLLAPSE_LIMIT = 3
+    const val GMS_PHASE_EVALUATION_MS = 30_000L
+    const val GMS_PHASE_REQUIRED_CONTINUOUS_HEALTHY_MS = 15_000L
     const val GMS_MIN_RESET_INTERVAL_MS = 10_000L
     const val GMS_MAX_RESETS_PER_CAMPAIGN = 4
     const val GMS_VIVO_MAX_RESETS_PER_CAMPAIGN = 2
@@ -246,6 +250,34 @@ object RecoveryCampaignPolicy {
             nextResetCount >= 2 &&
             forceStopWanted &&
             !forceStopAllowed
+
+    fun shouldEscalateGmsTransportFlapping(
+        nowElapsed: Long,
+        phaseStartedElapsed: Long,
+        longestContinuousTransportMs: Long,
+        collapseWindowStartedElapsed: Long,
+        collapseCountInWindow: Int
+    ): Boolean {
+        if (
+            nowElapsed < 0L ||
+            phaseStartedElapsed <= 0L ||
+            phaseStartedElapsed > nowElapsed ||
+            longestContinuousTransportMs < 0L ||
+            collapseCountInWindow < 0
+        ) {
+            return false
+        }
+        val repeatedCollapse =
+            collapseCountInWindow >= GMS_TRANSPORT_COLLAPSE_LIMIT &&
+                collapseWindowStartedElapsed in 1L..nowElapsed &&
+                nowElapsed - collapseWindowStartedElapsed <=
+                    GMS_TRANSPORT_COLLAPSE_WINDOW_MS
+        val neverReachedUsefulStability =
+            nowElapsed - phaseStartedElapsed >= GMS_PHASE_EVALUATION_MS &&
+                longestContinuousTransportMs <
+                    GMS_PHASE_REQUIRED_CONTINUOUS_HEALTHY_MS
+        return repeatedCollapse || neverReachedUsefulStability
+    }
 
     fun packageSuccessorResetIntervalMs(resetCount: Int): Long = when {
         resetCount < PACKAGE_SUCCESSOR_FAST_RESETS -> PACKAGE_SUCCESSOR_FAST_RESET_INTERVAL_MS
