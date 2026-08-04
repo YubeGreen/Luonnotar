@@ -10,6 +10,7 @@ import java.util.ArrayDeque
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -36,6 +37,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val longOperationExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "luonnotar-privileged-long-operation").apply { isDaemon = true }
     }
+    private val gmsFastThawExecutor = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "luonnotar-gms-fast-thaw").apply { isDaemon = true }
+    }
+    private val gmsFastThawWorkerActive = AtomicBoolean(false)
     private val recentEvents = ArrayDeque<GuardianEvent>()
     private var scheduled: ScheduledFuture<*>? = null
     private var initialCycleFuture: ScheduledFuture<*>? = null
@@ -129,6 +134,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsRecoverySuccessorRefreezeCount = 0L
     private var gmsPidRestartCount = 0L
     private var gmsTransportVerifiedRecoveryCount = 0L
+    private var gmsFastThawAttemptCount = 0L
+    private var gmsFastThawSuccessCount = 0L
+    private var gmsFastThawCoalescedCount = 0L
+    private var gmsFastThawLastLatencyMs = 0L
+    private var gmsFastThawMaxLatencyMs = 0L
+    private var gmsFastThawLastCompletedElapsed = 0L
     private var lastGmsRecoveryOutcome = GmsRecoveryOutcome()
     private var lastGmsTransportProbeElapsed = 0L
     private var lastGmsTransportHealthyElapsed = 0L
@@ -304,6 +315,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             stopEventWatcherLocked()
             executor.shutdownNow()
             longOperationExecutor.shutdownNow()
+            gmsFastThawExecutor.shutdownNow()
             gmsManualRecoveryQueued = false
             gmsManualRecoveryState = "destroyed"
             eventLocked("engine_destroyed", "user_service_replaced_or_removed")
@@ -371,8 +383,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                                 packageTargets = config.packageTargets
                             )
                         } ?: return@forEach
+                        var fastThawRequested = false
                         val accepted = synchronized(lock) {
                             recordVendorSignalLocked(signal, now)
+                            fastThawRequested =
+                                running &&
+                                    gmsRecoveryInProgress &&
+                                    signal.packageName == GMS_PACKAGE &&
+                                    signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
                             if (!running) {
                                 false
                             } else {
@@ -388,6 +406,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                                     true
                                 }
                             }
+                        }
+                        if (fastThawRequested) {
+                            scheduleGmsFastThaw(signalElapsed = now)
                         }
                         if (accepted) {
                             runCatching {
@@ -1638,6 +1659,140 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         packageRebuildHistoryByPackage[packageName]?.let { history ->
             while (history.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
                 history.removeFirst()
+            }
+        }
+    }
+
+    private fun scheduleGmsFastThaw(signalElapsed: Long) {
+        if (!gmsFastThawWorkerActive.compareAndSet(false, true)) {
+            synchronized(lock) {
+                gmsFastThawCoalescedCount += 1
+                eventLocked(
+                    "gms_fast_thaw_coalesced",
+                    "signalElapsed=$signalElapsed active=true count=$gmsFastThawCoalescedCount"
+                )
+            }
+            return
+        }
+
+        runCatching {
+            gmsFastThawExecutor.execute {
+                try {
+                    val sticky = synchronized(lock) {
+                        config.stickyUnfreeze && supportsStickyUnfreeze
+                    }
+                    val secondarySupported = synchronized(lock) {
+                        supportsSecondaryProcessUnfreeze
+                    }
+                    val mainCommand = mutableListOf("am", "unfreeze").apply {
+                        if (sticky) add("--sticky")
+                        add(GMS_PACKAGE)
+                        addAll(listOf("--user", "0"))
+                    }
+                    val commandStarted = SystemClock.elapsedRealtime()
+                    val mainResult = runner.run(
+                        mainCommand,
+                        timeoutMs = GMS_FAST_THAW_COMMAND_TIMEOUT_MS
+                    )
+                    var secondaryResult: GuardianCommandResult? = null
+                    var frozenAfterMain = fastReadFrozenGmsProcesses()
+                    if (
+                        secondarySupported &&
+                        frozenAfterMain.any { it.first == "$GMS_PACKAGE.persistent" }
+                    ) {
+                        val secondaryCommand = mutableListOf("am", "unfreeze").apply {
+                            if (sticky) add("--sticky")
+                            add("$GMS_PACKAGE.persistent")
+                            addAll(listOf("--user", "0"))
+                        }
+                        secondaryResult = runner.run(
+                            secondaryCommand,
+                            timeoutMs = GMS_FAST_THAW_COMMAND_TIMEOUT_MS
+                        )
+                        frozenAfterMain = fastReadFrozenGmsProcesses()
+                    }
+                    val commandCompleted = SystemClock.elapsedRealtime()
+                    val latency = (commandCompleted - signalElapsed).coerceAtLeast(0L)
+                    val commandDuration = (commandCompleted - commandStarted).coerceAtLeast(0L)
+                    val success = frozenAfterMain.isEmpty() &&
+                        (mainResult.success || secondaryResult?.success == true)
+
+                    synchronized(lock) {
+                        gmsFastThawAttemptCount += 1
+                        actionCount += if (secondaryResult == null) 1 else 2
+                        if (!mainResult.success) commandFailureCount += 1
+                        if (secondaryResult != null && secondaryResult.success != true) {
+                            commandFailureCount += 1
+                        }
+                        if (success) {
+                            gmsFastThawSuccessCount += 1
+                            effectiveThawCount += 1
+                        } else if (frozenAfterMain.isNotEmpty()) {
+                            verificationFailureCount += 1
+                        }
+                        gmsFastThawLastLatencyMs = latency
+                        gmsFastThawMaxLatencyMs = maxOf(gmsFastThawMaxLatencyMs, latency)
+                        gmsFastThawLastCompletedElapsed = commandCompleted
+                        eventLocked(
+                            if (success) {
+                                "gms_fast_thaw_verified"
+                            } else {
+                                "gms_fast_thaw_unverified"
+                            },
+                            "freezeToUnfreezeLatencyMs=$latency commandDurationMs=$commandDuration " +
+                                "mainAccepted=${mainResult.success} main=${mainResult.summary()} " +
+                                "secondaryAccepted=${secondaryResult?.success} " +
+                                "secondary=${secondaryResult?.summary().orEmpty()} " +
+                                "remainingFrozen=${frozenAfterMain.map { "${it.first}:${it.second}" }}"
+                        )
+                        persistStatusLocked(force = true)
+                    }
+                } catch (error: Throwable) {
+                    synchronized(lock) {
+                        errorCount += 1
+                        eventLocked(
+                            "gms_fast_thaw_failed",
+                            "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                        )
+                    }
+                } finally {
+                    gmsFastThawWorkerActive.set(false)
+                }
+            }
+        }.onFailure { error ->
+            gmsFastThawWorkerActive.set(false)
+            synchronized(lock) {
+                errorCount += 1
+                eventLocked(
+                    "gms_fast_thaw_schedule_failed",
+                    "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
+        }
+    }
+
+    private fun fastReadFrozenGmsProcesses(): List<Pair<String, Int>> {
+        val preferred = runner.run(
+            "ps", "-A", "-o", "PID,NAME,ARGS",
+            timeoutMs = GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS
+        )
+        val processes = if (preferred.success) {
+            GuardianProcessParser.parse(preferred.stdout)
+        } else {
+            val fallback = runner.run(
+                "ps", "-A",
+                timeoutMs = GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS
+            )
+            if (fallback.success) GuardianProcessParser.parse(fallback.stdout) else emptyList()
+        }
+        return GuardianProcessParser.matching(
+            processes,
+            listOf(GMS_PACKAGE, "$GMS_PACKAGE.persistent")
+        ).mapNotNull { process ->
+            if (readFreezeState(process.pid).frozen == true) {
+                process.name to process.pid
+            } else {
+                null
             }
         }
     }
@@ -2982,15 +3137,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         transportProbe: GmsTransportProbe
     ) {
         val now = SystemClock.elapsedRealtime()
-        campaign.resetCount += 1
-        campaign.lastResetElapsed = now
-        gmsRecoveryResetCount += 1
-        val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
-        val details = mutableListOf<String>()
         val vendorFamily = currentVendorFamilyLocked()
+        val nextResetCount = campaign.resetCount + 1
         val campaignForceStopAllowed = RecoveryCampaignPolicy.shouldUseForceStopForGms(
             vendorFamily = vendorFamily,
-            resetCount = campaign.resetCount,
+            resetCount = nextResetCount,
             refreezeCount = campaign.refreezeCount,
             forceStopCount = campaign.forceStopCount
         )
@@ -2998,6 +3149,37 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             nowElapsed = now,
             forceStopHistory = gmsForceStopHistory.toList()
         )
+        if (
+            RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
+                vendorFamily = vendorFamily,
+                nextResetCount = nextResetCount,
+                forceStopWanted = campaignForceStopAllowed,
+                forceStopAllowed = forceStopDecision.allowed
+            )
+        ) {
+            campaign.nextResetEligibleElapsed = Long.MAX_VALUE
+            campaign.resetWaitReportedForCount = campaign.resetCount
+            ensureGmsPreconnectionLeaseLocked(
+                campaign = campaign,
+                nowElapsed = now,
+                reason = "force_stop_gate_anchor_only",
+                force = true
+            )
+            eventLocked(
+                "gms_recovery_reset_deferred_force_stop_gate_anchor_only",
+                "generation=${campaign.generation} nextReset=$nextResetCount " +
+                    "vendor=$vendorFamily reason=${forceStopDecision.reason} " +
+                    "ports=${transportProbe.establishedPorts.sorted()} " +
+                    "frozen=${frozenProcesses.map { "${it.name}:${it.pid}" }}"
+            )
+            return
+        }
+
+        campaign.resetCount = nextResetCount
+        campaign.lastResetElapsed = now
+        gmsRecoveryResetCount += 1
+        val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
+        val details = mutableListOf<String>()
         val forceStopAllowed = campaignForceStopAllowed && forceStopDecision.allowed
         val forceStopBlockReason = when {
             !campaignForceStopAllowed -> "campaign_escalation_or_budget"
@@ -3797,6 +3979,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsRecoveryCampaign", gmsRecoveryCampaign?.toJson() ?: JSONObject.NULL)
         .put("gmsPidRestartCount", gmsPidRestartCount)
         .put("gmsTransportVerifiedRecoveryCount", gmsTransportVerifiedRecoveryCount)
+        .put("gmsFastThaw", JSONObject()
+            .put("workerActive", gmsFastThawWorkerActive.get())
+            .put("attemptCount", gmsFastThawAttemptCount)
+            .put("successCount", gmsFastThawSuccessCount)
+            .put("coalescedCount", gmsFastThawCoalescedCount)
+            .put("lastLatencyMs", gmsFastThawLastLatencyMs)
+            .put("maxLatencyMs", gmsFastThawMaxLatencyMs)
+            .put("lastCompletedElapsed", gmsFastThawLastCompletedElapsed)
+        )
         .put("lastGmsRecoveryElapsed", lastGmsRecoveryElapsed)
         .put("lastGmsRecoveryCompletedElapsed", lastGmsRecoveryCompletedElapsed)
         .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
@@ -4092,7 +4283,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 13
+        private const val STATUS_SCHEMA = 14
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L
@@ -4114,6 +4305,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_BINDER_PULSE_COMPONENT =
             "com.yubegreen.luonnotar/.receiver.AdbGmsBinderPulseReceiver"
         private const val GMS_FREEZE_EVENT_DEBOUNCE_MS = 5_000L
+        private const val GMS_FAST_THAW_COMMAND_TIMEOUT_MS = 1_500L
+        private const val GMS_FAST_THAW_PROCESS_SCAN_TIMEOUT_MS = 1_000L
         private const val GMS_LOG_SIGNAL_DEBOUNCE_MS = 5_000L
         private const val GMS_FROZEN_TRANSPORT_PROBE_INTERVAL_MS = 10_000L
         private const val SOCKET_PROBE_TIMEOUT_MS = 4_000L

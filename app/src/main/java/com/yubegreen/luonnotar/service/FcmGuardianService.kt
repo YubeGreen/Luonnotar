@@ -897,9 +897,6 @@ class FcmGuardianService : Service() {
             }
             ACTION_GMS_BINDER_STABILIZATION_LEASE -> {
                 val active = isActivelyEnabled()
-                if (active) {
-                    GmsBinderAnchorCoordinator.manualRetry(this, true)
-                }
                 val started = active && GmsBinderPulseCoordinator.startStabilization(
                     this,
                     reason.ifBlank { "privileged_gms_recovery" }

@@ -3,6 +3,7 @@ package com.yubegreen.luonnotar.notification
 import android.content.Context
 import android.os.Handler
 import android.os.Looper
+import android.os.PowerManager
 import android.os.Process
 import android.os.SystemClock
 import com.google.android.gms.common.ConnectionResult
@@ -14,13 +15,15 @@ import com.yubegreen.luonnotar.util.LogManager
 import kotlin.math.max
 
 /**
- * Repeatedly creates a public GMS location Binder connection, performs a
- * read-only location-settings query, and disconnects.
+ * Public-GMS Binder activity used by the manual laboratory probe and bounded
+ * recovery leases.
  *
- * The short LAB_TEST mode remains a manual diagnostic. The bounded
- * STABILIZATION_LEASE mode is also started before MCS exists and is refreshed
- * across GMS PID replacements. This keeps public Binder traffic flowing during
- * both connection bootstrap and the post-recovery refreeze window.
+ * LAB_TEST intentionally keeps the historical connect/query/disconnect pulse.
+ * STABILIZATION_LEASE is different: it owns one GoogleApiClient for the whole
+ * lease, continuously keeps that Binder connected, issues a read-only query on
+ * the same client, and reconnects rapidly only after an actual suspension or
+ * failure. Repeated lease requests extend the deadline without replacing or
+ * disconnecting a healthy client.
  */
 @Suppress("DEPRECATION")
 object GmsBinderPulseCoordinator {
@@ -29,8 +32,12 @@ object GmsBinderPulseCoordinator {
     const val STABILIZATION_MAX_TOTAL_MS = 4 * 60_000L
     const val PULSE_INTERVAL_MS = 2_000L
     const val CONNECTED_HOLD_MS = 750L
-    const val STABILIZATION_CONNECTED_HOLD_MS = 1_500L
-    private const val CONNECT_TIMEOUT_MS = 1_600L
+    const val STABILIZATION_QUERY_INTERVAL_MS = 750L
+    const val STABILIZATION_RECONNECT_DELAY_MS = 250L
+    private const val LAB_CONNECT_TIMEOUT_MS = 1_600L
+    private const val STABILIZATION_CONNECT_TIMEOUT_MS = 3_000L
+    private const val STABILIZATION_HEALTH_LOG_INTERVAL_MS = 10_000L
+    private const val WAKE_LOCK_TAG = "Luonnotar:GmsBinderStabilization"
 
     private enum class PulseMode {
         LAB_TEST,
@@ -70,8 +77,8 @@ object GmsBinderPulseCoordinator {
                 mode = PulseMode.STABILIZATION_LEASE,
                 reason = reason,
                 durationMs = STABILIZATION_DURATION_MS,
-                intervalMs = PULSE_INTERVAL_MS,
-                connectedHoldMs = STABILIZATION_CONNECTED_HOLD_MS
+                intervalMs = STABILIZATION_QUERY_INTERVAL_MS,
+                connectedHoldMs = Long.MAX_VALUE
             )
         )
 
@@ -105,8 +112,6 @@ object GmsBinderPulseCoordinator {
                 if (active?.modeName == PulseMode.STABILIZATION_LEASE.name) {
                     runToExtend = active
                 } else {
-                    // A short diagnostic pulse must never block the recovery
-                    // lease. Replace it before claiming the long-lived run.
                     pendingRequestId = 0L
                     if (active != null) {
                         runToReplace = active
@@ -139,9 +144,7 @@ object GmsBinderPulseCoordinator {
         }
 
         runToExtend?.let { existing ->
-            runOnMain {
-                existing.extend(spec.reason, spec.durationMs)
-            }
+            runOnMain { existing.extend(spec.reason, spec.durationMs) }
             return true
         }
 
@@ -210,9 +213,20 @@ object GmsBinderPulseCoordinator {
         private var pulseCount = 0
         private var connectedCount = 0
         private var queryResultCount = 0
+        private var queryAttemptCount = 0
+        private var reconnectCount = 0
         private var activeClient: GoogleApiClient? = null
         private var nextPulseRunnable: Runnable? = null
         private var cycleRunnable: Runnable? = null
+        private var queryRunnable: Runnable? = null
+        private var reconnectRunnable: Runnable? = null
+        private var connectTimeoutRunnable: Runnable? = null
+        private var deadlineRunnable: Runnable? = null
+        private var connectedSinceElapsed = 0L
+        private var totalConnectedMs = 0L
+        private var longestConnectedMs = 0L
+        private var lastHealthLogElapsed = 0L
+        private var wakeLock: PowerManager.WakeLock? = null
 
         fun start(): Boolean {
             check(Looper.myLooper() == Looper.getMainLooper())
@@ -240,19 +254,44 @@ object GmsBinderPulseCoordinator {
             pulseCount = 0
             connectedCount = 0
             queryResultCount = 0
-            LogManager.event(
-                context,
-                "gms_binder_pulse_started",
-                mapOf(
-                    "mode" to spec.mode.name,
-                    "requestReason" to spec.reason,
-                    "durationMs" to spec.durationMs,
-                    "intervalMs" to spec.intervalMs,
-                    "connectedHoldMs" to spec.connectedHoldMs,
-                    "hostPid" to Process.myPid()
+            queryAttemptCount = 0
+            reconnectCount = 0
+            connectedSinceElapsed = 0L
+            totalConnectedMs = 0L
+            longestConnectedMs = 0L
+            lastHealthLogElapsed = 0L
+
+            if (spec.mode == PulseMode.STABILIZATION_LEASE) {
+                acquireWakeLock()
+                LogManager.event(
+                    context,
+                    "gms_binder_stabilization_anchor_started",
+                    stabilizationMetrics(
+                        extra = mapOf(
+                            "requestReason" to spec.reason,
+                            "durationMs" to spec.durationMs,
+                            "queryIntervalMs" to spec.intervalMs,
+                            "reconnectDelayMs" to STABILIZATION_RECONNECT_DELAY_MS
+                        )
+                    )
                 )
-            )
-            runPulse(generation)
+                scheduleDeadline(generation)
+                connectStabilizationClient(generation, "initial")
+            } else {
+                LogManager.event(
+                    context,
+                    "gms_binder_pulse_started",
+                    mapOf(
+                        "mode" to spec.mode.name,
+                        "requestReason" to spec.reason,
+                        "durationMs" to spec.durationMs,
+                        "intervalMs" to spec.intervalMs,
+                        "connectedHoldMs" to spec.connectedHoldMs,
+                        "hostPid" to Process.myPid()
+                    )
+                )
+                runLabPulse(generation)
+            }
             return true
         }
 
@@ -271,21 +310,30 @@ object GmsBinderPulseCoordinator {
                 hardDeadline,
                 maxOf(previousDeadline, now + durationMs.coerceAtLeast(0L))
             )
+            scheduleDeadline(generation)
+            if (
+                activeClient?.isConnected != true &&
+                activeClient?.isConnecting != true &&
+                reconnectRunnable == null
+            ) {
+                scheduleStabilizationReconnect(generation, "lease_extended_disconnected", 0L)
+            }
             LogManager.event(
                 context,
                 "gms_binder_stabilization_lease_extended",
-                mapOf(
-                    "requestReason" to reason,
-                    "previousDeadlineElapsed" to previousDeadline,
-                    "deadlineElapsed" to deadlineElapsed,
-                    "remainingMs" to (deadlineElapsed - now).coerceAtLeast(0L),
-                    "hardDeadlineElapsed" to hardDeadline,
-                    "hostPid" to Process.myPid()
+                stabilizationMetrics(
+                    extra = mapOf(
+                        "requestReason" to reason,
+                        "previousDeadlineElapsed" to previousDeadline,
+                        "deadlineElapsed" to deadlineElapsed,
+                        "remainingMs" to (deadlineElapsed - now).coerceAtLeast(0L),
+                        "hardDeadlineElapsed" to hardDeadline
+                    )
                 )
             )
         }
 
-        private fun runPulse(runGeneration: Long) {
+        private fun runLabPulse(runGeneration: Long) {
             if (!isCurrent(runGeneration)) return
             val pulseStartedElapsed = SystemClock.elapsedRealtime()
             if (pulseStartedElapsed >= deadlineElapsed) {
@@ -315,41 +363,8 @@ object GmsBinderPulseCoordinator {
                                 (SystemClock.elapsedRealtime() - pulseStartedElapsed)
                         )
                     )
-
-                    runCatching {
-                        val request = LocationSettingsRequest.Builder().build()
-                        LocationServices.SettingsApi
-                            .checkLocationSettings(builtClient, request)
-                            .setResultCallback { result ->
-                                if (!isCurrent(runGeneration)) {
-                                    return@setResultCallback
-                                }
-                                queryResultCount++
-                                LogManager.event(
-                                    context,
-                                    "gms_binder_pulse_query_result",
-                                    mapOf(
-                                        "mode" to spec.mode.name,
-                                        "requestReason" to spec.reason,
-                                        "pulse" to pulseNumber,
-                                        "statusCode" to result.status.statusCode
-                                    )
-                                )
-                            }
-                    }.onFailure {
-                        LogManager.event(
-                            context,
-                            "gms_binder_pulse_query_failed",
-                            mapOf(
-                                "mode" to spec.mode.name,
-                                "requestReason" to spec.reason,
-                                "pulse" to pulseNumber,
-                                "error" to it.javaClass.simpleName
-                            )
-                        )
-                    }
-
-                    scheduleCycleEnd(
+                    performReadOnlyQuery(runGeneration, builtClient, pulseNumber, labMode = true)
+                    scheduleLabCycleEnd(
                         runGeneration,
                         builtClient,
                         pulseStartedElapsed,
@@ -371,7 +386,7 @@ object GmsBinderPulseCoordinator {
                             "cause" to cause
                         )
                     )
-                    scheduleCycleEnd(
+                    scheduleLabCycleEnd(
                         runGeneration,
                         builtClient,
                         pulseStartedElapsed,
@@ -393,7 +408,7 @@ object GmsBinderPulseCoordinator {
                             "failureCode" to result.errorCode
                         )
                     )
-                    scheduleCycleEnd(
+                    scheduleLabCycleEnd(
                         runGeneration,
                         builtClient,
                         pulseStartedElapsed,
@@ -432,7 +447,7 @@ object GmsBinderPulseCoordinator {
                         "error" to it.javaClass.simpleName
                     )
                 )
-                scheduleCycleEnd(
+                scheduleLabCycleEnd(
                     runGeneration,
                     builtClient,
                     pulseStartedElapsed,
@@ -443,18 +458,274 @@ object GmsBinderPulseCoordinator {
             }
 
             if (isActiveClient(runGeneration, builtClient)) {
-                scheduleCycleEnd(
+                scheduleLabCycleEnd(
                     runGeneration,
                     builtClient,
                     pulseStartedElapsed,
                     pulseNumber,
-                    CONNECT_TIMEOUT_MS,
+                    LAB_CONNECT_TIMEOUT_MS,
                     "connect_timeout"
                 )
             }
         }
 
-        private fun scheduleCycleEnd(
+        private fun connectStabilizationClient(runGeneration: Long, reason: String) {
+            if (!isCurrent(runGeneration)) return
+            val now = SystemClock.elapsedRealtime()
+            if (now >= deadlineElapsed) {
+                finish("duration_complete", completed = true)
+                return
+            }
+
+            clearReconnectRunnable()
+            clearConnectTimeoutRunnable()
+            clearQueryRunnable()
+            disconnectActiveClient("stabilization_reconnect_$reason")
+            pulseCount++
+            val attempt = pulseCount
+            val attemptStartedElapsed = now
+
+            lateinit var builtClient: GoogleApiClient
+            val callbacks = object : GoogleApiClient.ConnectionCallbacks,
+                GoogleApiClient.OnConnectionFailedListener {
+                override fun onConnected(bundle: android.os.Bundle?) {
+                    if (!isActiveClient(runGeneration, builtClient)) return
+                    clearConnectTimeoutRunnable()
+                    connectedCount++
+                    connectedSinceElapsed = SystemClock.elapsedRealtime()
+                    lastHealthLogElapsed = 0L
+                    LogManager.event(
+                        context,
+                        "gms_binder_stabilization_anchor_connected",
+                        stabilizationMetrics(
+                            extra = mapOf(
+                                "attempt" to attempt,
+                                "connectLatencyMs" to
+                                    (connectedSinceElapsed - attemptStartedElapsed).coerceAtLeast(0L),
+                                "trigger" to reason
+                            )
+                        )
+                    )
+                    runStabilizationQuery(runGeneration, builtClient)
+                }
+
+                override fun onConnectionSuspended(cause: Int) {
+                    if (!isActiveClient(runGeneration, builtClient)) return
+                    recordConnectedSegment()
+                    LogManager.event(
+                        context,
+                        "gms_binder_stabilization_anchor_suspended",
+                        stabilizationMetrics(
+                            extra = mapOf(
+                                "cause" to cause,
+                                "attempt" to attempt
+                            )
+                        )
+                    )
+                    scheduleStabilizationReconnect(
+                        runGeneration,
+                        "connection_suspended_$cause",
+                        STABILIZATION_RECONNECT_DELAY_MS
+                    )
+                }
+
+                override fun onConnectionFailed(result: ConnectionResult) {
+                    if (!isActiveClient(runGeneration, builtClient)) return
+                    recordConnectedSegment()
+                    LogManager.event(
+                        context,
+                        "gms_binder_stabilization_anchor_failed",
+                        stabilizationMetrics(
+                            extra = mapOf(
+                                "failureCode" to result.errorCode,
+                                "attempt" to attempt
+                            )
+                        )
+                    )
+                    scheduleStabilizationReconnect(
+                        runGeneration,
+                        "connection_failed_${result.errorCode}",
+                        STABILIZATION_RECONNECT_DELAY_MS
+                    )
+                }
+            }
+
+            builtClient = GoogleApiClient.Builder(context)
+                .addApi(LocationServices.API)
+                .addConnectionCallbacks(callbacks)
+                .addOnConnectionFailedListener(callbacks)
+                .build()
+            activeClient = builtClient
+
+            LogManager.event(
+                context,
+                "gms_binder_stabilization_anchor_connecting",
+                stabilizationMetrics(
+                    extra = mapOf(
+                        "attempt" to attempt,
+                        "trigger" to reason
+                    )
+                )
+            )
+
+            runCatching { builtClient.connect() }.onFailure { error ->
+                if (!isActiveClient(runGeneration, builtClient)) return@onFailure
+                LogManager.event(
+                    context,
+                    "gms_binder_stabilization_anchor_connect_threw",
+                    stabilizationMetrics(
+                        extra = mapOf(
+                            "attempt" to attempt,
+                            "error" to error.javaClass.simpleName
+                        )
+                    )
+                )
+                scheduleStabilizationReconnect(
+                    runGeneration,
+                    "connect_threw",
+                    STABILIZATION_RECONNECT_DELAY_MS
+                )
+            }
+
+            if (isActiveClient(runGeneration, builtClient)) {
+                connectTimeoutRunnable = Runnable {
+                    connectTimeoutRunnable = null
+                    if (!isActiveClient(runGeneration, builtClient)) return@Runnable
+                    if (builtClient.isConnected) return@Runnable
+                    LogManager.event(
+                        context,
+                        "gms_binder_stabilization_anchor_connect_timeout",
+                        stabilizationMetrics(extra = mapOf("attempt" to attempt))
+                    )
+                    scheduleStabilizationReconnect(
+                        runGeneration,
+                        "connect_timeout",
+                        STABILIZATION_RECONNECT_DELAY_MS
+                    )
+                }.also {
+                    handler.postDelayed(it, STABILIZATION_CONNECT_TIMEOUT_MS)
+                }
+            }
+        }
+
+        private fun runStabilizationQuery(
+            runGeneration: Long,
+            expectedClient: GoogleApiClient
+        ) {
+            if (!isActiveClient(runGeneration, expectedClient)) return
+            val now = SystemClock.elapsedRealtime()
+            if (now >= deadlineElapsed) {
+                finish("duration_complete", completed = true)
+                return
+            }
+            if (!expectedClient.isConnected) {
+                scheduleStabilizationReconnect(
+                    runGeneration,
+                    "query_client_not_connected",
+                    STABILIZATION_RECONNECT_DELAY_MS
+                )
+                return
+            }
+
+            queryAttemptCount++
+            performReadOnlyQuery(
+                runGeneration,
+                expectedClient,
+                queryAttemptCount,
+                labMode = false
+            )
+            maybeLogStabilizationHealth(now)
+            clearQueryRunnable()
+            queryRunnable = Runnable {
+                queryRunnable = null
+                runStabilizationQuery(runGeneration, expectedClient)
+            }.also { handler.postDelayed(it, spec.intervalMs) }
+        }
+
+        private fun performReadOnlyQuery(
+            runGeneration: Long,
+            expectedClient: GoogleApiClient,
+            sequence: Int,
+            labMode: Boolean
+        ) {
+            runCatching {
+                val request = LocationSettingsRequest.Builder().build()
+                LocationServices.SettingsApi
+                    .checkLocationSettings(expectedClient, request)
+                    .setResultCallback { result ->
+                        if (!isActiveClient(runGeneration, expectedClient)) {
+                            return@setResultCallback
+                        }
+                        queryResultCount++
+                        if (labMode) {
+                            LogManager.event(
+                                context,
+                                "gms_binder_pulse_query_result",
+                                mapOf(
+                                    "mode" to spec.mode.name,
+                                    "requestReason" to spec.reason,
+                                    "pulse" to sequence,
+                                    "statusCode" to result.status.statusCode
+                                )
+                            )
+                        }
+                    }
+            }.onFailure { error ->
+                LogManager.event(
+                    context,
+                    if (labMode) {
+                        "gms_binder_pulse_query_failed"
+                    } else {
+                        "gms_binder_stabilization_anchor_query_failed"
+                    },
+                    if (labMode) {
+                        mapOf(
+                            "mode" to spec.mode.name,
+                            "requestReason" to spec.reason,
+                            "pulse" to sequence,
+                            "error" to error.javaClass.simpleName
+                        )
+                    } else {
+                        stabilizationMetrics(
+                            extra = mapOf(
+                                "sequence" to sequence,
+                                "error" to error.javaClass.simpleName
+                            )
+                        )
+                    }
+                )
+            }
+        }
+
+        private fun scheduleStabilizationReconnect(
+            runGeneration: Long,
+            reason: String,
+            delayMs: Long
+        ) {
+            if (!isCurrent(runGeneration)) return
+            clearConnectTimeoutRunnable()
+            clearQueryRunnable()
+            recordConnectedSegment()
+            disconnectActiveClient("stabilization_$reason")
+            if (reconnectRunnable != null) return
+            reconnectCount++
+            LogManager.event(
+                context,
+                "gms_binder_stabilization_anchor_reconnecting",
+                stabilizationMetrics(
+                    extra = mapOf(
+                        "reason" to reason,
+                        "delayMs" to delayMs
+                    )
+                )
+            )
+            reconnectRunnable = Runnable {
+                reconnectRunnable = null
+                connectStabilizationClient(runGeneration, reason)
+            }.also { handler.postDelayed(it, delayMs) }
+        }
+
+        private fun scheduleLabCycleEnd(
             runGeneration: Long,
             expectedClient: GoogleApiClient,
             pulseStartedElapsed: Long,
@@ -466,9 +737,7 @@ object GmsBinderPulseCoordinator {
             clearCycleRunnable()
             cycleRunnable = Runnable {
                 cycleRunnable = null
-                if (!isActiveClient(runGeneration, expectedClient)) {
-                    return@Runnable
-                }
+                if (!isActiveClient(runGeneration, expectedClient)) return@Runnable
                 disconnectActiveClient(reason)
                 LogManager.event(
                     context,
@@ -480,11 +749,11 @@ object GmsBinderPulseCoordinator {
                         "reason" to reason
                     )
                 )
-                scheduleNextPulse(runGeneration, pulseStartedElapsed)
+                scheduleNextLabPulse(runGeneration, pulseStartedElapsed)
             }.also { handler.postDelayed(it, delayMs) }
         }
 
-        private fun scheduleNextPulse(
+        private fun scheduleNextLabPulse(
             runGeneration: Long,
             pulseStartedElapsed: Long
         ) {
@@ -498,34 +767,152 @@ object GmsBinderPulseCoordinator {
             val delay = max(0L, targetElapsed - now)
             nextPulseRunnable = Runnable {
                 nextPulseRunnable = null
-                runPulse(runGeneration)
+                runLabPulse(runGeneration)
             }.also { handler.postDelayed(it, delay) }
+        }
+
+        private fun scheduleDeadline(runGeneration: Long) {
+            deadlineRunnable?.let(handler::removeCallbacks)
+            deadlineRunnable = null
+            if (!isCurrent(runGeneration)) return
+            val delay = (deadlineElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+            deadlineRunnable = Runnable {
+                deadlineRunnable = null
+                if (isCurrent(runGeneration)) {
+                    finish("duration_complete", completed = true)
+                }
+            }.also { handler.postDelayed(it, delay) }
+        }
+
+        private fun maybeLogStabilizationHealth(now: Long) {
+            if (
+                lastHealthLogElapsed > 0L &&
+                now - lastHealthLogElapsed < STABILIZATION_HEALTH_LOG_INTERVAL_MS
+            ) {
+                return
+            }
+            lastHealthLogElapsed = now
+            LogManager.event(
+                context,
+                "gms_binder_stabilization_anchor_health",
+                stabilizationMetrics()
+            )
+        }
+
+        private fun recordConnectedSegment() {
+            val since = connectedSinceElapsed
+            if (since <= 0L) return
+            val duration = (SystemClock.elapsedRealtime() - since).coerceAtLeast(0L)
+            totalConnectedMs += duration
+            longestConnectedMs = maxOf(longestConnectedMs, duration)
+            connectedSinceElapsed = 0L
+        }
+
+        private fun currentConnectedDurationMs(): Long =
+            if (connectedSinceElapsed > 0L) {
+                (SystemClock.elapsedRealtime() - connectedSinceElapsed).coerceAtLeast(0L)
+            } else {
+                0L
+            }
+
+        private fun stabilizationMetrics(
+            extra: Map<String, Any> = emptyMap()
+        ): Map<String, Any> = linkedMapOf<String, Any>(
+            "mode" to spec.mode.name,
+            "hostPid" to Process.myPid(),
+            "binderAnchorConnected" to (activeClient?.isConnected == true),
+            "binderAnchorConnectedDurationMs" to currentConnectedDurationMs(),
+            "binderAnchorTotalConnectedMs" to
+                (totalConnectedMs + currentConnectedDurationMs()),
+            "binderAnchorLongestConnectedMs" to
+                maxOf(longestConnectedMs, currentConnectedDurationMs()),
+            "binderAnchorReconnectCount" to reconnectCount,
+            "connectionAttemptCount" to pulseCount,
+            "queryAttemptCount" to queryAttemptCount,
+            "queryResultCount" to queryResultCount,
+            "wakeLockHeld" to (wakeLock?.isHeld == true),
+            "deadlineElapsed" to deadlineElapsed,
+            "remainingMs" to
+                (deadlineElapsed - SystemClock.elapsedRealtime()).coerceAtLeast(0L)
+        ).apply { putAll(extra) }
+
+        private fun acquireWakeLock() {
+            if (spec.mode != PulseMode.STABILIZATION_LEASE || wakeLock?.isHeld == true) return
+            val power = context.getSystemService(Context.POWER_SERVICE) as? PowerManager
+            val created = power?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKE_LOCK_TAG)
+                ?: return
+            created.setReferenceCounted(false)
+            runCatching { created.acquire() }
+            wakeLock = created
+        }
+
+        private fun releaseWakeLock() {
+            val old = wakeLock
+            wakeLock = null
+            if (old?.isHeld == true) {
+                runCatching { old.release() }
+            }
         }
 
         private fun finish(reason: String, completed: Boolean) {
             if (!running) return
+            val metricsBeforeStop = if (spec.mode == PulseMode.STABILIZATION_LEASE) {
+                stabilizationMetrics(
+                    extra = mapOf(
+                        "requestReason" to spec.reason,
+                        "reason" to reason,
+                        "completed" to completed,
+                        "elapsedMs" to
+                            (SystemClock.elapsedRealtime() - startedElapsed).coerceAtLeast(0L)
+                    )
+                )
+            } else {
+                emptyMap()
+            }
             running = false
             generation++
             nextPulseRunnable?.let(handler::removeCallbacks)
             nextPulseRunnable = null
             clearCycleRunnable()
+            clearQueryRunnable()
+            clearReconnectRunnable()
+            clearConnectTimeoutRunnable()
+            deadlineRunnable?.let(handler::removeCallbacks)
+            deadlineRunnable = null
+            recordConnectedSegment()
             disconnectActiveClient("run_finished")
+            releaseWakeLock()
             val elapsed = SystemClock.elapsedRealtime() - startedElapsed
-            LogManager.event(
-                context,
-                "gms_binder_pulse_finished",
-                mapOf(
-                    "mode" to spec.mode.name,
-                    "requestReason" to spec.reason,
-                    "reason" to reason,
-                    "completed" to completed,
-                    "elapsedMs" to elapsed,
-                    "pulseCount" to pulseCount,
-                    "connectedCount" to connectedCount,
-                    "queryResultCount" to queryResultCount,
-                    "hostPid" to Process.myPid()
+
+            if (spec.mode == PulseMode.STABILIZATION_LEASE) {
+                LogManager.event(
+                    context,
+                    "gms_binder_stabilization_anchor_finished",
+                    metricsBeforeStop + mapOf(
+                        "binderAnchorConnected" to false,
+                        "binderAnchorConnectedDurationMs" to 0L,
+                        "binderAnchorTotalConnectedMs" to totalConnectedMs,
+                        "binderAnchorLongestConnectedMs" to longestConnectedMs,
+                        "wakeLockHeld" to false
+                    )
                 )
-            )
+            } else {
+                LogManager.event(
+                    context,
+                    "gms_binder_pulse_finished",
+                    mapOf(
+                        "mode" to spec.mode.name,
+                        "requestReason" to spec.reason,
+                        "reason" to reason,
+                        "completed" to completed,
+                        "elapsedMs" to elapsed,
+                        "pulseCount" to pulseCount,
+                        "connectedCount" to connectedCount,
+                        "queryResultCount" to queryResultCount,
+                        "hostPid" to Process.myPid()
+                    )
+                )
+            }
             onFinished()
         }
 
@@ -549,6 +936,21 @@ object GmsBinderPulseCoordinator {
         private fun clearCycleRunnable() {
             cycleRunnable?.let(handler::removeCallbacks)
             cycleRunnable = null
+        }
+
+        private fun clearQueryRunnable() {
+            queryRunnable?.let(handler::removeCallbacks)
+            queryRunnable = null
+        }
+
+        private fun clearReconnectRunnable() {
+            reconnectRunnable?.let(handler::removeCallbacks)
+            reconnectRunnable = null
+        }
+
+        private fun clearConnectTimeoutRunnable() {
+            connectTimeoutRunnable?.let(handler::removeCallbacks)
+            connectTimeoutRunnable = null
         }
 
         private fun isCurrent(runGeneration: Long): Boolean =

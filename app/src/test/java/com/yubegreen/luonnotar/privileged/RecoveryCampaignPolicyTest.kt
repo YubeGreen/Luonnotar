@@ -688,4 +688,41 @@ class RecoveryCampaignPolicyTest {
             )
         )
     }
+
+    @Test
+    fun vivoHoldsContinuousAnchorWhenForceStopGateIsClosed() {
+        assertTrue(
+            RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nextResetCount = 2,
+                forceStopWanted = true,
+                forceStopAllowed = false
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nextResetCount = 2,
+                forceStopWanted = true,
+                forceStopAllowed = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                nextResetCount = 2,
+                forceStopWanted = true,
+                forceStopAllowed = false
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nextResetCount = 1,
+                forceStopWanted = false,
+                forceStopAllowed = false
+            )
+        )
+    }
+
 }

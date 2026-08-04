@@ -236,6 +236,17 @@ object RecoveryCampaignPolicy {
         }
     }
 
+    fun shouldHoldAnchorInsteadOfFallbackStopApp(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        nextResetCount: Int,
+        forceStopWanted: Boolean,
+        forceStopAllowed: Boolean
+    ): Boolean =
+        vendorFamily == BackgroundPolicyVendorFamily.VIVO &&
+            nextResetCount >= 2 &&
+            forceStopWanted &&
+            !forceStopAllowed
+
     fun packageSuccessorResetIntervalMs(resetCount: Int): Long = when {
         resetCount < PACKAGE_SUCCESSOR_FAST_RESETS -> PACKAGE_SUCCESSOR_FAST_RESET_INTERVAL_MS
         resetCount < 8 -> PACKAGE_SUCCESSOR_SHORT_BACKOFF_MS
