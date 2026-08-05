@@ -2011,8 +2011,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val transportLatencyMs =
             if (success) completedElapsed - startedElapsed else -1L
 
+        var startEmergencyCampaign = false
+        var escalationMode = "none"
+        var exhaustionCountForEscalation = 0
+
         synchronized(lock) {
             if (success) {
+                /*
+                 * A restored MCS socket breaks the failure streak. A future
+                 * escalation must be supported by two new full kick failures.
+                 */
+                consecutiveGmsMcsKickExhaustions = 0
+
                 val persistentRunning = listGmsProcessesLocked().any {
                     it.name == "$GMS_PACKAGE.persistent"
                 }
@@ -2023,6 +2033,61 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     persistentRunning = persistentRunning,
                     source = "mcs_kick"
                 )
+            } else {
+                consecutiveGmsMcsKickExhaustions += 1
+                exhaustionCountForEscalation =
+                    consecutiveGmsMcsKickExhaustions
+
+                val emergencyCooldownReady =
+                    lastGmsMcsEmergencyEscalationElapsed == 0L ||
+                        completedElapsed -
+                        lastGmsMcsEmergencyEscalationElapsed >=
+                        GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS
+
+                if (
+                    consecutiveGmsMcsKickExhaustions >=
+                    GMS_MCS_KICK_EXHAUSTION_THRESHOLD &&
+                    emergencyCooldownReady
+                ) {
+                    val campaign = gmsRecoveryCampaign
+                    when {
+                        gmsRecoveryInProgress && campaign != null -> {
+                            /*
+                             * Do not recursively start a second campaign. Ask
+                             * the active campaign to consume one bounded hard
+                             * reset as soon as force-stop policy allows it.
+                             */
+                            if (!campaign.hardResetRequested) {
+                                campaign.hardResetRequested = true
+                                campaign.hardResetReason =
+                                    "mcs_kick_exhausted"
+                                campaign.hardResetRequestedElapsed =
+                                    completedElapsed
+                                campaign.nextResetEligibleElapsed =
+                                    completedElapsed
+                                campaign.resetWaitReportedForCount = -1
+                                campaign.stabilizationGraceDeadlineElapsed = 0L
+                                campaign.anchorOnlyAfterForceStopGate = false
+                                escalationMode = "active_campaign_hard_reset"
+                            } else {
+                                escalationMode = "hard_reset_already_pending"
+                            }
+                        }
+                        !gmsRecoveryInProgress -> {
+                            startEmergencyCampaign = true
+                            escalationMode = "new_emergency_campaign"
+                        }
+                        else -> {
+                            escalationMode = "campaign_state_inconsistent"
+                        }
+                    }
+
+                    if (escalationMode != "campaign_state_inconsistent") {
+                        lastGmsMcsEmergencyEscalationElapsed =
+                            completedElapsed
+                        consecutiveGmsMcsKickExhaustions = 0
+                    }
+                }
             }
 
             val usedRounds =
@@ -2035,12 +2100,37 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     "gms_mcs_kick_exhausted"
                 },
                 "trigger=$trigger rounds=$usedRounds" +
-                        " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
-                        " transportLatencyMs=$transportLatencyMs" +
-                        " ports=${finalProbe.establishedPorts.sorted()}"
+                    " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
+                    " transportLatencyMs=$transportLatencyMs" +
+                    " ports=${finalProbe.establishedPorts.sorted()}" +
+                    " consecutiveExhaustions=$exhaustionCountForEscalation"
             )
 
+            if (escalationMode != "none") {
+                eventLocked(
+                    "gms_mcs_kick_emergency_escalation",
+                    "trigger=$trigger mode=$escalationMode" +
+                        " consecutiveExhaustions=" +
+                        exhaustionCountForEscalation +
+                        " cooldownMs=" +
+                        GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS +
+                        " generation=${gmsRecoveryCampaign?.generation ?: 0L}"
+                )
+            }
+
             persistStatusLocked(force = true)
+        }
+
+        if (startEmergencyCampaign) {
+            synchronized(lock) {
+                recoverGmsLocked(
+                    trigger = "mcs_kick_exhausted",
+                    manual = false,
+                    automaticEvidenceReason =
+                        "consecutive_exhaustions=$exhaustionCountForEscalation",
+                    emergency = true
+                )
+            }
         }
     }
     private fun shouldKickMcsAfterThaw(): Boolean {
@@ -2327,11 +2417,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "vendor_recovery_exhausted",
                 "$packageName generation=$generation stillFrozen=$stillFrozen critical=$deliveryCritical"
             )
-            if (deliveryCritical && DeliveryFailureEscalationPolicy.isRebuildTarget(packageName)) {
+            if (DeliveryFailureEscalationPolicy.isRebuildTarget(packageName)) {
+                /*
+                 * Xiaomi's Greezer denial is often logged as non-critical even
+                 * though the verified result is cgroup.freeze=1. After the full
+                 * thaw burst has failed, keeping that PID cannot deliver FCM.
+                 * Use the existing non-force-stop package rebuild tier.
+                 */
                 maybeSchedulePackageRebuildLocked(
                     packageName = packageName,
                     now = now,
-                    verifiedFrozenAfterBurst = true
+                    verifiedFrozenAfterBurst = true,
+                    forcedReason = if (deliveryCritical) {
+                        null
+                    } else {
+                        "verified_vendor_thaw_exhaustion"
+                    }
                 )
             }
             if (
@@ -3486,27 +3587,36 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     "collapseWindowCount=${campaign.collapseCountInWindow}"
             )
         }
+        val hardResetRequested = campaign.hardResetRequested
         val stabilizationGraceActive =
-            !flappingEscalation &&
+            !hardResetRequested &&
+                !flappingEscalation &&
                 campaign.stabilizationGraceDeadlineElapsed > now
 
         val vendorFamily = currentVendorFamilyLocked()
         val resetEligible =
-            !campaign.anchorOnlyAfterForceStopGate &&
-                (now >= campaign.nextResetEligibleElapsed || flappingEscalation)
+            if (hardResetRequested) {
+                now >= campaign.nextResetEligibleElapsed
+            } else {
+                !campaign.anchorOnlyAfterForceStopGate &&
+                    (now >= campaign.nextResetEligibleElapsed || flappingEscalation)
+            }
+        val resetPolicyAllows =
+            hardResetRequested ||
+                RecoveryCampaignPolicy.shouldResetGmsAgain(
+                    nowElapsed = now,
+                    lastResetElapsed = campaign.lastResetElapsed,
+                    resetCount = campaign.resetCount,
+                    anyGmsFrozen = anyFrozen,
+                    transportHealthy = probe.healthy,
+                    maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
+                        vendorFamily
+                    )
+                )
         if (
             !stabilizationGraceActive &&
             resetEligible &&
-            RecoveryCampaignPolicy.shouldResetGmsAgain(
-                nowElapsed = now,
-                lastResetElapsed = campaign.lastResetElapsed,
-                resetCount = campaign.resetCount,
-                anyGmsFrozen = anyFrozen,
-                transportHealthy = probe.healthy,
-                maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
-                    vendorFamily
-                )
-            )
+            resetPolicyAllows
         ) {
             resetGmsPackageLocked(campaign, processesAfter, frozenAfter, probe)
         } else if (stabilizationGraceActive) {
@@ -3563,17 +3673,48 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val now = SystemClock.elapsedRealtime()
         val vendorFamily = currentVendorFamilyLocked()
         val nextResetCount = campaign.resetCount + 1
-        val campaignForceStopAllowed = RecoveryCampaignPolicy.shouldUseForceStopForGms(
-            vendorFamily = vendorFamily,
-            resetCount = nextResetCount,
-            refreezeCount = campaign.refreezeCount,
-            forceStopCount = campaign.forceStopCount
-        )
+        val hardResetRequested = campaign.hardResetRequested
+        val hardResetBudgetAvailable =
+            campaign.forceStopCount <
+                RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)
+        val normalForceStopRequested =
+            RecoveryCampaignPolicy.shouldUseForceStopForGms(
+                vendorFamily = vendorFamily,
+                resetCount = nextResetCount,
+                refreezeCount = campaign.refreezeCount,
+                forceStopCount = campaign.forceStopCount
+            )
+        val campaignForceStopAllowed =
+            normalForceStopRequested ||
+                (hardResetRequested && hardResetBudgetAvailable)
         val forceStopDecision = RecoveryCampaignPolicy.decideGmsForceStop(
             nowElapsed = now,
             forceStopHistory = gmsForceStopHistory.toList()
         )
+
+        if (hardResetRequested && !hardResetBudgetAvailable) {
+            campaign.hardResetRequested = false
+            eventLocked(
+                "gms_recovery_hard_reset_rejected",
+                "generation=${campaign.generation} reason=campaign_force_stop_budget " +
+                    "forceStops=${campaign.forceStopCount}/" +
+                    RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)
+            )
+            return
+        } else if (hardResetRequested && !forceStopDecision.allowed) {
+            campaign.nextResetEligibleElapsed =
+                now + GMS_MCS_HARD_RESET_RETRY_MS
+            campaign.resetWaitReportedForCount = -1
+            eventLocked(
+                "gms_recovery_hard_reset_deferred",
+                "generation=${campaign.generation} reason=${forceStopDecision.reason} " +
+                    "retryAt=${campaign.nextResetEligibleElapsed}"
+            )
+            return
+        }
+
         if (
+            !hardResetRequested &&
             RecoveryCampaignPolicy.shouldHoldAnchorInsteadOfFallbackStopApp(
                 vendorFamily = vendorFamily,
                 nextResetCount = nextResetCount,
@@ -3616,6 +3757,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val details = mutableListOf<String>()
         val forceStopAllowed = campaignForceStopAllowed && forceStopDecision.allowed
         val forceStopBlockReason = when {
+            hardResetRequested && forceStopAllowed -> campaign.hardResetReason
             !campaignForceStopAllowed -> "campaign_escalation_or_budget"
             !forceStopDecision.allowed -> forceStopDecision.reason
             else -> forceStopDecision.reason
@@ -3625,7 +3767,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "generation=${campaign.generation} reset=${campaign.resetCount} oldPids=${oldPids.sorted()} " +
                 "frozen=${frozenProcesses.map { "${it.name}:${it.pid}" }} " +
                 "transport=${transportProbe.healthy} vendor=$vendorFamily " +
-                "strategy=${if (forceStopAllowed) "force_stop_budget_available" else "non_destructive_or_stop_app"} " +
+                "strategy=${when {
+                    hardResetRequested && forceStopAllowed -> "hard_reset_force_stop"
+                    forceStopAllowed -> "force_stop_budget_available"
+                    else -> "non_destructive_or_stop_app"
+                }} " +
                 "forceStopReason=$forceStopBlockReason " +
                 "forceStops=${campaign.forceStopCount}/${RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)} " +
                 "dailyForceStops=${gmsForceStopHistory.size}/${RecoveryCampaignPolicy.GMS_FORCE_STOP_MAX_PER_24_HOURS}"
@@ -3647,11 +3793,25 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         if (forceStopAllowed) {
+            val destructiveReason = if (hardResetRequested) {
+                campaign.hardResetReason.ifBlank { "mcs_kick_exhausted" }
+            } else {
+                "bounded_vendor_or_refreeze_escalation"
+            }
+            if (hardResetRequested) {
+                campaign.hardResetRequested = false
+                eventLocked(
+                    "gms_recovery_hard_reset_consumed",
+                    "generation=${campaign.generation} reset=${campaign.resetCount} " +
+                        "reason=$destructiveReason requestedElapsed=" +
+                        campaign.hardResetRequestedElapsed
+                )
+            }
             remainingOldPids = forceStopAndUnstopGmsLocked(
                 campaign = campaign,
                 oldPids = oldPids,
                 details = details,
-                reason = "bounded_vendor_or_refreeze_escalation"
+                reason = destructiveReason
             )
         } else if (!stopAppSucceeded) {
             details += "am_force_stop:deferred_$forceStopBlockReason"
@@ -4815,6 +4975,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var collapseCountInWindow: Int = 0,
         var flappingEscalationReported: Boolean = false,
         var anchorOnlyAfterForceStopGate: Boolean = false,
+        var hardResetRequested: Boolean = false,
+        var hardResetReason: String = "",
+        var hardResetRequestedElapsed: Long = 0L,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -4847,6 +5010,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("collapseCountInWindow", collapseCountInWindow)
             .put("flappingEscalationReported", flappingEscalationReported)
             .put("anchorOnlyAfterForceStopGate", anchorOnlyAfterForceStopGate)
+            .put("hardResetRequested", hardResetRequested)
+            .put("hardResetReason", hardResetReason)
+            .put("hardResetRequestedElapsed", hardResetRequestedElapsed)
     }
 
     private data class GuardianProcessState(
@@ -5017,6 +5183,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val PACKAGE_QUERY_TIMEOUT_MS = 3_000L
         private const val GMS_MCS_KICK_EXHAUSTION_THRESHOLD = 2
         private const val GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS = 30_000L
+        private const val GMS_MCS_HARD_RESET_RETRY_MS = 15_000L
         private val DELIVERY_PACKAGE_TARGETS =
             setOf("com.whatsapp", "com.whatsapp.w4b")
         private val BACKGROUND_LAUNCH_WAKE_TARGETS =
