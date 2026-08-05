@@ -3694,7 +3694,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         campaign: GmsRecoveryCampaign,
         oldPids: Set<Int>,
         details: MutableList<String>,
-        reason: String
+        reason: String,
     ): Set<Int> {
         val canUnstop = verifyPackageUnstopBeforeForceStopLocked(GMS_PACKAGE, details)
         if (!canUnstop) {
