@@ -4322,7 +4322,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "dumpsys", "package", packageName,
             timeoutMs = PACKAGE_QUERY_TIMEOUT_MS
         )
-        return Regex("(?:^|\\s)userId=(\\d+)(?:\\s|$)")
+        return Regex("""(?:^|\s)userId=(\d+)(?:\s|$)""")
             .find(fallback.stdout)
             ?.groupValues?.getOrNull(1)
             ?.toIntOrNull()
