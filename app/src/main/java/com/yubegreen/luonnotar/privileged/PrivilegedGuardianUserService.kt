@@ -420,7 +420,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                             recordVendorSignalLocked(signal, now)
                             fastThawRequested =
                                 running &&
-                                    gmsRecoveryInProgress &&
+                                    //gmsRecoveryInProgress &&
                                     signal.packageName == GMS_PACKAGE &&
                                     signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
                             if (!running) {
