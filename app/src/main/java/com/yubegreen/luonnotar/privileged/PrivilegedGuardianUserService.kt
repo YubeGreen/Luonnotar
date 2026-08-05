@@ -1827,6 +1827,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     }
                     if (shouldRefreshAnchor) {
                         requestPostThawAnchorQuery()
+                        runGmsMcsKickWindow(trigger = "fast_thaw")
                     }
                 } catch (error: Throwable) {
                     synchronized(lock) {
@@ -1902,7 +1903,162 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         }
     }
+    private fun runGmsMcsKickWindow(trigger: String) {
+        val startedElapsed = SystemClock.elapsedRealtime()
+        val connectAttemptBefore = synchronized(lock) {
+            lastGmsMcsConnectAttemptElapsed
+        }
 
+        var success = false
+        var successfulRound = 0
+        var finalProbe = GmsTransportProbe(
+            observable = false,
+            establishedPorts = emptySet(),
+            detail = "not_started"
+        )
+
+        synchronized(lock) {
+            eventLocked(
+                "gms_mcs_kick_started",
+                "trigger=$trigger maxRounds=$GMS_MCS_KICK_MAX_ROUNDS"
+            )
+        }
+
+        for (round in 1..GMS_MCS_KICK_MAX_ROUNDS) {
+            val sticky = synchronized(lock) {
+                config.stickyUnfreeze && supportsStickyUnfreeze
+            }
+            val secondarySupported = synchronized(lock) {
+                supportsSecondaryProcessUnfreeze
+            }
+
+            // 广播发送前先确保 main 和 persistent 都处于解冻状态。
+            runGmsFastThawPass(
+                sticky = sticky,
+                secondarySupported = secondarySupported,
+                timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
+            )
+
+            val broadcast = runner.run(
+                "am", "broadcast",
+                "--user", "0",
+                "--receiver-foreground",
+                "-a", GMS_GCM_RECONNECT_ACTION,
+                "-p", GMS_PACKAGE,
+                timeoutMs = GMS_MCS_KICK_BROADCAST_TIMEOUT_MS
+            )
+
+            synchronized(lock) {
+                actionCount += 1
+                if (!broadcast.success) commandFailureCount += 1
+
+                eventLocked(
+                    "gms_mcs_kick_broadcast",
+                    "trigger=$trigger round=$round result=${broadcast.summary()}"
+                )
+            }
+
+            /*
+             * am broadcast 返回不代表动态 Receiver 已经真正收到。
+             * 接下来三秒持续检查冻结状态，确保 persistent 有机会处理广播。
+             */
+            val guardDeadline =
+                SystemClock.elapsedRealtime() + GMS_MCS_KICK_GUARD_MS
+
+            while (SystemClock.elapsedRealtime() < guardDeadline) {
+                if (fastReadFrozenGmsProcesses().isNotEmpty()) {
+                    runGmsFastThawPass(
+                        sticky = sticky,
+                        secondarySupported = secondarySupported,
+                        timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
+                    )
+                }
+
+                finalProbe = fastProbeGmsTransport()
+
+                if (finalProbe.healthy) {
+                    success = true
+                    successfulRound = round
+                    break
+                }
+
+                SystemClock.sleep(GMS_MCS_KICK_POLL_MS)
+            }
+
+            if (success) break
+        }
+
+        val completedElapsed = SystemClock.elapsedRealtime()
+        val connectAttemptAfter = synchronized(lock) {
+            lastGmsMcsConnectAttemptElapsed
+        }
+
+        val mcsConnectLatencyMs =
+            if (
+                connectAttemptAfter > connectAttemptBefore &&
+                connectAttemptAfter >= startedElapsed
+            ) {
+                connectAttemptAfter - startedElapsed
+            } else {
+                -1L
+            }
+
+        val transportLatencyMs =
+            if (success) completedElapsed - startedElapsed else -1L
+
+        synchronized(lock) {
+            if (success) {
+                val persistentRunning = listGmsProcessesLocked().any {
+                    it.name == "$GMS_PACKAGE.persistent"
+                }
+
+                applyGmsTransportProbeLocked(
+                    probe = finalProbe,
+                    now = completedElapsed,
+                    persistentRunning = persistentRunning,
+                    source = "mcs_kick"
+                )
+            }
+
+            eventLocked(
+                if (success) {
+                    "gms_mcs_kick_succeeded"
+                } else {
+                    "gms_mcs_kick_exhausted"
+                    val usedRounds =
+                        if (success) successfulRound else GMS_MCS_KICK_MAX_ROUNDS
+                                " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
+                                " transportLatencyMs=$transportLatencyMs" +
+                                " ports=${finalProbe.establishedPorts.sorted()}"
+            )
+
+            persistStatusLocked(force = true)
+        }
+    }
+
+    private fun fastProbeGmsTransport(): GmsTransportProbe {
+        val result = runner.run(
+            "ss", "-H", "-tn",
+            timeoutMs = GMS_MCS_KICK_SOCKET_TIMEOUT_MS
+        )
+
+        if (!result.success) {
+            return GmsTransportProbe(
+                observable = false,
+                establishedPorts = emptySet(),
+                detail = result.summary()
+            )
+        }
+
+        val ports =
+            GmsTransportSocketParser.establishedMcsPorts(result.stdout)
+
+        return GmsTransportProbe(
+            observable = true,
+            establishedPorts = ports,
+            detail = "source=mcs_kick lines=${result.stdout.lineSequence().count()}"
+        )
+    }
     private fun fastReadFrozenGmsProcesses(): List<Pair<String, Int>> {
         val preferred = runner.run(
             "ps", "-A", "-o", "PID,NAME,ARGS",
@@ -2333,8 +2489,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             adbTcp5555MissingSinceElapsed = now
             eventLocked(
-                "adb_tcp_5555_listener_missing",
-                "configured=$configured lastHealthy=$adbTcp5555LastHealthyElapsed"
+                if (success) {
+                    "gms_mcs_kick_succeeded"
+                } else {
+                    "gms_mcs_kick_exhausted"
+                },
+                "trigger=$trigger rounds=$usedRounds" +
+                        " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
+                        " transportLatencyMs=$transportLatencyMs" +
+                        " ports=${finalProbe.establishedPorts.sorted()}"
             )
         }
 
