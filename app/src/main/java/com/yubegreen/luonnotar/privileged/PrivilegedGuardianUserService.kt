@@ -2020,16 +2020,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 )
             }
 
+            val usedRounds =
+                if (success) successfulRound else GMS_MCS_KICK_MAX_ROUNDS
+
             eventLocked(
                 if (success) {
                     "gms_mcs_kick_succeeded"
                 } else {
                     "gms_mcs_kick_exhausted"
-                    val usedRounds =
-                        if (success) successfulRound else GMS_MCS_KICK_MAX_ROUNDS
-                                " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
-                                " transportLatencyMs=$transportLatencyMs" +
-                                " ports=${finalProbe.establishedPorts.sorted()}"
+                },
+                "trigger=$trigger rounds=$usedRounds" +
+                        " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
+                        " transportLatencyMs=$transportLatencyMs" +
+                        " ports=${finalProbe.establishedPorts.sorted()}"
             )
 
             persistStatusLocked(force = true)
@@ -2489,15 +2492,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             adbTcp5555MissingSinceElapsed = now
             eventLocked(
-                if (success) {
-                    "gms_mcs_kick_succeeded"
-                } else {
-                    "gms_mcs_kick_exhausted"
-                },
-                "trigger=$trigger rounds=$usedRounds" +
-                        " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
-                        " transportLatencyMs=$transportLatencyMs" +
-                        " ports=${finalProbe.establishedPorts.sorted()}"
+                "adb_tcp_5555_listener_missing",
+                "configured=$configured lastHealthy=$adbTcp5555LastHealthyElapsed"
             )
         }
 
@@ -3212,6 +3208,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             reason = "campaign_started",
             force = true
         )
+        scheduleGmsFastThaw(signalElapsed = now)
         probeGmsImportanceFenceLocked(now, force = true)
         persistStatusLocked(force = true)
 
@@ -3682,6 +3679,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             reason = "reset_${campaign.resetCount}_completed",
             force = true
         )
+        scheduleGmsFastThaw(signalElapsed = resetCompletedElapsed)
         campaign.commandDetails += details
         eventLocked(
             "gms_recovery_reset_completed",
@@ -4949,6 +4947,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_STOP_VERIFY_WAIT_MS = 5_000L
         private const val GMS_STOP_VERIFY_POLL_MS = 500L
         private const val GMS_BINDER_PULSE_TIMEOUT_MS = 10_000L
+        private const val GMS_GCM_RECONNECT_ACTION =
+            "com.google.android.intent.action.GCM_RECONNECT"
+
+        private const val GMS_MCS_KICK_MAX_ROUNDS = 3
+        private const val GMS_MCS_KICK_GUARD_MS = 3_000L
+        private const val GMS_MCS_KICK_POLL_MS = 250L
+        private const val GMS_MCS_KICK_BROADCAST_TIMEOUT_MS = 1_500L
+        private const val GMS_MCS_KICK_SOCKET_TIMEOUT_MS = 1_000L
+        private const val GMS_MCS_KICK_THAW_TIMEOUT_MS = 700L
         private const val GMS_BINDER_PULSE_ACTION =
             "com.yubegreen.luonnotar.action.ADB_GMS_BINDER_PULSE_TEST"
         private const val GMS_BINDER_STABILIZATION_ACTION =
