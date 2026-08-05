@@ -4146,9 +4146,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         while (gmsRecoveryHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
             gmsRecoveryHistory.removeFirst()
         }
-        while (gmsForceStopHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
+        while (gmsForceStopHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true)
             gmsForceStopHistory.removeFirst()
-        }
     }
 
     private fun listProcessesLocked(): List<GuardianProcess> {
