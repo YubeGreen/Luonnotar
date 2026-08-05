@@ -45,6 +45,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var scheduled: ScheduledFuture<*>? = null
     private var initialCycleFuture: ScheduledFuture<*>? = null
     private var eventWatcherProcess: java.lang.Process? = null
+    private var consecutiveGmsMcsKickExhaustions = 0
+    private var lastGmsMcsEmergencyEscalationElapsed = 0L
     private var eventWatcherThread: Thread? = null
     private var eventWatcherAlive = false
     private var eventTriggerCount = 0L
@@ -2009,8 +2011,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val transportLatencyMs =
             if (success) completedElapsed - startedElapsed else -1L
 
+        var escalateToEmergencyRecovery = false
+        var exhaustionCountForEscalation = 0
+
         synchronized(lock) {
             if (success) {
+                /*
+                 * 只要 5228 成功恢复，就清除连续失败计数。
+                 * 后续再次失败必须重新累计两次，避免偶发失败直接炸 GMS。
+                 */
+                consecutiveGmsMcsKickExhaustions = 0
+
                 val persistentRunning = listGmsProcessesLocked().any {
                     it.name == "$GMS_PACKAGE.persistent"
                 }
@@ -2021,6 +2032,37 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     persistentRunning = persistentRunning,
                     source = "mcs_kick"
                 )
+            } else {
+                consecutiveGmsMcsKickExhaustions += 1
+                exhaustionCountForEscalation =
+                    consecutiveGmsMcsKickExhaustions
+
+                val emergencyCooldownReady =
+                    lastGmsMcsEmergencyEscalationElapsed == 0L ||
+                            completedElapsed -
+                            lastGmsMcsEmergencyEscalationElapsed >=
+                            GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS
+
+                /*
+                 * 两个完整的三轮 Kick 都无法拉回 MCS/5228，
+                 * 说明广播式恢复已经失效。此时进入现有的 GMS
+                 * emergency recovery，重建 GMS PID。
+                 */
+                if (
+                    consecutiveGmsMcsKickExhaustions >=
+                    GMS_MCS_KICK_EXHAUSTION_THRESHOLD &&
+                    emergencyCooldownReady &&
+                    !gmsRecoveryInProgress
+                ) {
+                    escalateToEmergencyRecovery = true
+                    lastGmsMcsEmergencyEscalationElapsed = completedElapsed
+
+                    /*
+                     * 本次升级已经消费掉这两个失败。
+                     * 紧急恢复之后若仍失败，需要重新累计两次。
+                     */
+                    consecutiveGmsMcsKickExhaustions = 0
+                }
             }
 
             val usedRounds =
@@ -2035,10 +2077,39 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "trigger=$trigger rounds=$usedRounds" +
                         " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
                         " transportLatencyMs=$transportLatencyMs" +
-                        " ports=${finalProbe.establishedPorts.sorted()}"
+                        " ports=${finalProbe.establishedPorts.sorted()}" +
+                        " consecutiveExhaustions=" +
+                        exhaustionCountForEscalation
             )
 
+            if (escalateToEmergencyRecovery) {
+                eventLocked(
+                    "gms_mcs_kick_emergency_escalation",
+                    "trigger=$trigger" +
+                            " consecutiveExhaustions=" +
+                            exhaustionCountForEscalation +
+                            " cooldownMs=" +
+                            GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS
+                )
+            }
+
             persistStatusLocked(force = true)
+        }
+
+        /*
+         * 不要放在上面的状态写入逻辑中间。
+         * 先完整记录 Kick 结果，再调用现有紧急恢复流程。
+         */
+        if (escalateToEmergencyRecovery) {
+            synchronized(lock) {
+                recoverGmsLocked(
+                    trigger = "mcs_kick_exhausted",
+                    manual = false,
+                    automaticEvidenceReason =
+                        "consecutive_exhaustions=$exhaustionCountForEscalation",
+                    emergency = true
+                )
+            }
         }
     }
     private fun shouldKickMcsAfterThaw(): Boolean {
@@ -5013,11 +5084,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val MAX_EVENT_DETAIL = 500
         private const val TUNING_COMMAND_TIMEOUT_MS = 4_000L
         private const val PACKAGE_QUERY_TIMEOUT_MS = 3_000L
+        private const val GMS_MCS_KICK_EXHAUSTION_THRESHOLD = 2
+        private const val GMS_MCS_KICK_EMERGENCY_COOLDOWN_MS = 30_000L
         private val DELIVERY_PACKAGE_TARGETS =
             setOf("com.whatsapp", "com.whatsapp.w4b")
         private val BACKGROUND_LAUNCH_WAKE_TARGETS =
             setOf("com.whatsapp", "com.whatsapp.w4b", "com.termux")
         private val MANAGED_LIVENESS_PACKAGES = setOf("com.termux")
         private val SAFE_CGROUP_PATH = Regex("^/[A-Za-z0-9_./:@-]+$")
+
     }
 }
