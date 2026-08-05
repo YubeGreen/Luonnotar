@@ -1827,6 +1827,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     }
                     if (shouldRefreshAnchor) {
                         requestPostThawAnchorQuery()
+                    }
+
+                    if (shouldKickMcsAfterThaw()) {
                         runGmsMcsKickWindow(trigger = "fast_thaw")
                     }
                 } catch (error: Throwable) {
@@ -2038,7 +2041,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             persistStatusLocked(force = true)
         }
     }
+    private fun shouldKickMcsAfterThaw(): Boolean {
+        repeat(8) {
+            val probe = fastProbeGmsTransport()
 
+            if (!probe.healthy) {
+                return true
+            }
+
+            SystemClock.sleep(250L)
+        }
+
+        return false
+    }
     private fun fastProbeGmsTransport(): GmsTransportProbe {
         val result = runner.run(
             "ss", "-H", "-tn",
@@ -4146,7 +4161,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         while (gmsRecoveryHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
             gmsRecoveryHistory.removeFirst()
         }
-        while (gmsForceStopHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true)7o
+        while (gmsForceStopHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true)
+            gmsForceStopHistory.removeFirst()
     }
 
     private fun listProcessesLocked(): List<GuardianProcess> {
