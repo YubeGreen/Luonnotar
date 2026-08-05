@@ -1,5 +1,6 @@
 package com.yubegreen.luonnotar.privileged
 
+import java.io.IOException
 import java.io.BufferedReader
 import java.io.InputStreamReader
 import java.util.concurrent.TimeUnit
@@ -74,12 +75,22 @@ internal class GuardianCommandRunner(
 
     private fun drain(reader: BufferedReader, destination: StringBuilder) =
         thread(name = "luonnotar-command-drain", isDaemon = true) {
-            reader.useLines { lines ->
-                lines.forEach { line ->
-                    if (destination.length < MAX_CAPTURE_CHARS) {
-                        destination.append(line).append('\n')
+            try {
+                reader.useLines { lines ->
+                    lines.forEach { line ->
+                        if (destination.length < MAX_CAPTURE_CHARS) {
+                            destination.append(line).append('\n')
+                        }
                     }
                 }
+            } catch (_: IOException) {
+                /*
+                 * 命令超时、进程被销毁或流被其他线程关闭时，
+                 * readLine() 可能抛出 InterruptedIOException。
+                 *
+                 * drain 只是辅助输出线程，流关闭属于正常清理路径，
+                 * 不能让异常逃出线程并终止整个特权引擎。
+                 */
             }
         }
 
