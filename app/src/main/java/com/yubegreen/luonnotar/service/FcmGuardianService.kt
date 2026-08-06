@@ -59,6 +59,7 @@ import com.yubegreen.luonnotar.notification.GmsBinderAnchorCoordinator
 import com.yubegreen.luonnotar.notification.GmsBinderPulseCoordinator
 import com.yubegreen.luonnotar.notification.GmsImportanceFenceCoordinator
 import com.yubegreen.luonnotar.notification.NotificationListenerRecoveryCoordinator
+import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianSupervisorReceiver
 import com.yubegreen.luonnotar.receiver.GuardianCleanupReceiver
 import com.yubegreen.luonnotar.receiver.LabAlarmScheduler
 import com.yubegreen.luonnotar.util.LogManager
@@ -101,6 +102,7 @@ class FcmGuardianService : Service() {
         const val KEEPALIVE_URL = "https://connectivitycheck.gstatic.com/generate_204"
         private const val TICK_SECONDS = 5L
         private const val LOCK_CHECK_MS = 30_000L
+        private const val EMBEDDED_GUARDIAN_REFRESH_MS = 30_000L
         private const val RECOVERY_PROBE_COOLDOWN_MS = 15_000L
         private const val PROBE_TIMEOUT_MS =
             GuardianProfilePolicy.WHOLE_PROBE_DEADLINE_MS
@@ -182,6 +184,7 @@ class FcmGuardianService : Service() {
     private val startupProbeScheduled = AtomicBoolean(false)
     private var lastExpectedTickElapsed = 0L
     private var lastLockCheckElapsed = 0L
+    private var lastEmbeddedGuardianRefreshElapsed = 0L
     private val lastKeepaliveAttemptElapsed = AtomicLong(0L)
     private val lastVpnDnsAttemptElapsed = AtomicLong(0L)
     private val lastTailscaleDnsAttemptElapsed = AtomicLong(0L)
@@ -1279,6 +1282,20 @@ class FcmGuardianService : Service() {
             return
         }
         if (prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)) return
+        if (
+            lastEmbeddedGuardianRefreshElapsed <= 0L ||
+            nowElapsed < lastEmbeddedGuardianRefreshElapsed ||
+            nowElapsed - lastEmbeddedGuardianRefreshElapsed >= EMBEDDED_GUARDIAN_REFRESH_MS
+        ) {
+            lastEmbeddedGuardianRefreshElapsed = nowElapsed
+            // r257: :keeper is only the outside clock. EmbeddedGuardianStore
+            // is process-owned, so all reads and repairs are dispatched to an
+            // explicit receiver in the default app process.
+            sendBroadcast(
+                Intent(applicationContext, EmbeddedGuardianSupervisorReceiver::class.java)
+                    .setAction(EmbeddedGuardianSupervisorReceiver.ACTION_REFRESH)
+            )
+        }
         val previousElapsed = lastTickElapsedMemory.takeIf { it > 0L }
             ?: prefs.getLong(
                 LuonnotarPreferences.KEY_LAST_TICK_ELAPSED,

@@ -84,6 +84,12 @@
         </service>
 
         <receiver
+            android:name=".privileged.embedded.EmbeddedGuardianSupervisorReceiver"
+            android:directBootAware="true"
+            android:enabled="true"
+            android:exported="false" />
+
+        <receiver
             android:name=".privileged.embedded.EmbeddedGuardianBootReceiver"
             android:directBootAware="true"
             android:enabled="true"

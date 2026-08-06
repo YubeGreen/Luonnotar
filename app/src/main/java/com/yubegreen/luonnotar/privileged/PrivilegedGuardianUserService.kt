@@ -82,6 +82,40 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val eventFastLaneVerifiedSequences = linkedSetOf<Long>()
     private var eventFastLaneLastPostRecoveryElapsed = 0L
     private var eventFastLanePostRecoveryCount = 0L
+
+    // r257: an independent cgroup sentinel catches vendor freezes that never
+    // produce am_app_frozen and may not update AOSP freezer bookkeeping.
+    private var vendorBridgeRestartFuture: ScheduledFuture<*>? = null
+    private var vendorBridgeReadyTimeoutFuture: ScheduledFuture<*>? = null
+    private var vendorBridgeProcess: java.lang.Process? = null
+    private var vendorBridgeThread: Thread? = null
+    private var vendorBridgeDeviceFamily: BackgroundPolicyVendorFamily? = null
+    private var vendorBridgeAlive = false
+    private var vendorBridgeReady = false
+    private var vendorBridgeTimeoutSupported = false
+    private var vendorBridgeStickyConfigured = false
+    private var vendorBridgeStartCount = 0L
+    private var vendorBridgeFailureCount = 0L
+    private var vendorBridgeHeartbeatCount = 0L
+    private var vendorBridgeLastHeartbeatElapsed = 0L
+    private var vendorBridgeFrozenCount = 0L
+    private var vendorBridgeRecoveryAttemptCount = 0L
+    private var vendorBridgePlainRecoveryCount = 0L
+    private var vendorBridgeAdoptReleaseCount = 0L
+    private var vendorBridgeVerifiedRecoveryCount = 0L
+    private var vendorBridgeFailedRecoveryCount = 0L
+    private var vendorBridgeLockCount = 0L
+    private var vendorBridgeLastLockElapsed = 0L
+    private var vendorBridgeLastTarget = "never"
+    private var vendorBridgeLastMode = "never"
+    private var vendorBridgeLastState = "never"
+    private var vendorBridgeLastPid = 0
+    private var vendorBridgeMainPid = 0
+    private var vendorBridgeMainState = "unknown"
+    private var vendorBridgePersistentPid = 0
+    private var vendorBridgePersistentState = "unknown"
+    private var vendorBridgeLastRecoveryLatencyMs = 0L
+    private var vendorBridgeMaxRecoveryLatencyMs = 0L
     private var eventTriggerCount = 0L
     private var config = GuardianEngineConfig().normalized()
     private var running = false
@@ -241,6 +275,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (startedElapsed <= 0L) startedElapsed = SystemClock.elapsedRealtime()
         ensureCapabilitiesLocked()
         startEventWatcherLocked()
+        startVendorBridgeLocked()
         restartScheduleLocked()
         eventLocked("engine_started", "poll=${config.pollIntervalMs}ms uid=${Process.myUid()}")
         persistStatusLocked(force = true)
@@ -363,6 +398,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         cancelPackageSuccessorGuardsLocked("engine_stopped")
         cancelDeliveryProtectionLeasesLocked("engine_stopped")
         cancelGmsRecoveryCampaignLocked("engine_stopped")
+        stopVendorBridgeLocked()
         stopEventWatcherLocked()
         eventLocked("engine_stopped", "requested_by_client")
         persistStatusLocked(force = true)
@@ -380,6 +416,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             cancelPackageSuccessorGuardsLocked("engine_destroyed")
             cancelDeliveryProtectionLeasesLocked("engine_destroyed")
             cancelGmsRecoveryCampaignLocked("engine_destroyed")
+            stopVendorBridgeLocked()
             stopEventWatcherLocked()
             executor.shutdownNow()
             longOperationExecutor.shutdownNow()
@@ -397,8 +434,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun startEventWatcherLocked(forceLegacy: Boolean = false) {
         val targetEnabled = isGmsFastLaneTargetedLocked()
+        val vendorBridgeTargeted = isVendorBridgeTargetedLocked()
         val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
-        val wantsFastLane = !forceLegacy && targetEnabled
+        // On vivo/OriginOS the cgroup watcher is the sole immediate owner.
+        // Keeping the r256 logcat sidecar active would race its adopt-release
+        // transaction with a second unfreeze loop.
+        val wantsFastLane = !forceLegacy && targetEnabled && !vendorBridgeTargeted
         val currentProcessAlive = eventWatcherProcess?.isAlive == true
         val currentThreadAlive = eventWatcherThread?.isAlive == true
         val currentCompatible = currentProcessAlive && currentThreadAlive && when {
@@ -422,9 +463,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         stopEventWatcherLocked()
         eventFastLaneTargetEnabled = targetEnabled
         if (!wantsFastLane) {
-            startLegacyEventWatcherLocked(
-                if (forceLegacy) "fast_lane_runtime_fallback" else "gms_target_disabled"
-            )
+            val reason = when {
+                forceLegacy -> "fast_lane_runtime_fallback"
+                vendorBridgeTargeted -> "vendor_cgroup_bridge"
+                else -> "gms_target_disabled"
+            }
+            startLegacyEventWatcherLocked(reason)
             return
         }
 
@@ -841,17 +885,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         } ?: return
         var fastThawRequested = false
         var delegatedToFastLane = false
+        var delegatedToVendorBridge = false
         val accepted = synchronized(lock) {
             recordVendorSignalLocked(signal, now)
+            val gmsFreezeSignal = signal.packageName == GMS_PACKAGE
+            delegatedToVendorBridge =
+                running && vendorBridgeReady && gmsFreezeSignal
             delegatedToFastLane =
                 running &&
+                    !delegatedToVendorBridge &&
                     eventFastLaneReady &&
-                    signal.packageName == GMS_PACKAGE &&
+                    gmsFreezeSignal &&
                     signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
             fastThawRequested =
                 running &&
+                    !delegatedToVendorBridge &&
                     !eventFastLaneReady &&
-                    signal.packageName == GMS_PACKAGE &&
+                    gmsFreezeSignal &&
                     signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
             if (!running) {
                 false
@@ -872,10 +922,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (fastThawRequested) {
             scheduleGmsFastThaw(signalElapsed = now)
         }
-        if (accepted && delegatedToFastLane) {
+        if (accepted && (delegatedToVendorBridge || delegatedToFastLane)) {
             synchronized(lock) {
                 eventLocked(
-                    "vendor_recovery_delegated_to_fast_lane",
+                    if (delegatedToVendorBridge) {
+                        "vendor_recovery_delegated_to_cgroup_bridge"
+                    } else {
+                        "vendor_recovery_delegated_to_fast_lane"
+                    },
                     "${signal.packageName} kind=${signal.kind}"
                 )
             }
@@ -896,6 +950,325 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 }
             }
         }
+    }
+
+    private fun startVendorBridgeLocked() {
+        val targetEnabled = isVendorBridgeTargetedLocked()
+        if (!targetEnabled) {
+            stopVendorBridgeLocked()
+            vendorBridgeLastState = if (isGmsFastLaneTargetedLocked()) {
+                "not_vivo"
+            } else {
+                "disabled"
+            }
+            return
+        }
+        val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
+        val processAlive = vendorBridgeProcess?.isAlive == true
+        val threadAlive = vendorBridgeThread?.isAlive == true
+        if (processAlive && threadAlive && vendorBridgeStickyConfigured == sticky) {
+            vendorBridgeAlive = true
+            return
+        }
+
+        if (processAlive || threadAlive) {
+            eventLocked(
+                "gms_vendor_bridge_reconfigured",
+                "sticky=$sticky processAlive=$processAlive threadAlive=$threadAlive"
+            )
+        }
+        stopVendorBridgeLocked()
+        vendorBridgeStickyConfigured = sticky
+        vendorBridgeLastState = "starting"
+
+        val startResult = runCatching {
+            ProcessBuilder("/system/bin/sh")
+                .redirectErrorStream(true)
+                .start()
+                .also { process ->
+                    process.outputStream.bufferedWriter().use { writer ->
+                        writer.write(
+                            GmsVendorFreezeBridgeScript.build(
+                                parentPid = Process.myPid(),
+                                stickyUnfreeze = sticky
+                            )
+                        )
+                        writer.flush()
+                    }
+                }
+        }
+        val process = startResult.getOrNull()
+        if (process == null) {
+            val error = startResult.exceptionOrNull()
+            vendorBridgeFailureCount += 1
+            errorCount += 1
+            vendorBridgeAlive = false
+            vendorBridgeLastState = "start_failed"
+            eventLocked(
+                "gms_vendor_bridge_start_failed",
+                "${error?.javaClass?.simpleName}:${error?.message.orEmpty()}"
+            )
+            scheduleVendorBridgeRestartLocked()
+            return
+        }
+
+        vendorBridgeProcess = process
+        vendorBridgeAlive = true
+        vendorBridgeReady = false
+        vendorBridgeStartCount += 1
+        vendorBridgeThread = thread(
+            name = "luonnotar-gms-vendor-freeze-bridge",
+            isDaemon = true
+        ) {
+            var failure: Throwable? = null
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line -> handleVendorBridgeOutput(process, line) }
+                }
+            } catch (error: Throwable) {
+                failure = error
+            }
+            handleVendorBridgeEnded(process, failure)
+        }
+        vendorBridgeReadyTimeoutFuture = runCatching {
+            executor.schedule(
+                {
+                    synchronized(lock) {
+                        vendorBridgeReadyTimeoutFuture = null
+                        if (!running || vendorBridgeProcess !== process || vendorBridgeReady) {
+                            return@synchronized
+                        }
+                        vendorBridgeFailureCount += 1
+                        errorCount += 1
+                        vendorBridgeLastState = "ready_timeout"
+                        eventLocked(
+                            "gms_vendor_bridge_ready_timeout",
+                            "processAlive=${process.isAlive} sticky=$sticky"
+                        )
+                        stopVendorBridgeLocked()
+                        if (running) scheduleVendorBridgeRestartLocked()
+                    }
+                },
+                VENDOR_BRIDGE_READY_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS
+            )
+        }.getOrElse { error ->
+            errorCount += 1
+            eventLocked(
+                "gms_vendor_bridge_ready_timeout_schedule_failed",
+                "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+            null
+        }
+        eventLocked(
+            "gms_vendor_bridge_started",
+            "strategy=cgroup_adopt_release sticky=$sticky parentPid=${Process.myPid()}"
+        )
+    }
+
+    private fun handleVendorBridgeOutput(process: java.lang.Process, line: String) {
+        if (!synchronized(lock) { vendorBridgeProcess === process }) return
+        when (val record = GmsVendorFreezeBridgeProtocol.parse(line)) {
+            is GmsVendorFreezeBridgeRecord.Ready -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                vendorBridgeReadyTimeoutFuture?.cancel(false)
+                vendorBridgeReadyTimeoutFuture = null
+                vendorBridgeReady = true
+                vendorBridgeAlive = true
+                vendorBridgeTimeoutSupported = record.timeout
+                vendorBridgeStickyConfigured = record.sticky
+                vendorBridgeLastState = "ready"
+                vendorBridgeLastHeartbeatElapsed = SystemClock.elapsedRealtime()
+                eventLocked(
+                    "gms_vendor_bridge_ready",
+                    "strategy=adopt_release sticky=${record.sticky} timeout=${record.timeout}"
+                )
+                persistStatusLocked(force = true)
+            }
+            is GmsVendorFreezeBridgeRecord.Heartbeat -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                vendorBridgeHeartbeatCount += 1
+                vendorBridgeLastHeartbeatElapsed = SystemClock.elapsedRealtime()
+                vendorBridgeMainPid = record.mainPid
+                vendorBridgeMainState = record.mainState
+                vendorBridgePersistentPid = record.persistentPid
+                vendorBridgePersistentState = record.persistentState
+                vendorBridgeLastState = when {
+                    record.mainState == "frozen" || record.persistentState == "frozen" -> "frozen"
+                    record.mainState == "thawed" || record.persistentState == "thawed" -> "thawed"
+                    else -> "${record.mainState}/${record.persistentState}"
+                }
+                // Keep the socket snapshot fresh every heartbeat, while the
+                // on-disk diagnostic file remains under its 30-second throttle.
+                persistStatusLocked(force = false)
+            }
+            is GmsVendorFreezeBridgeRecord.Frozen -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                vendorBridgeFrozenCount += 1
+                vendorBridgeLastTarget = record.target
+                vendorBridgeLastPid = record.pid
+                vendorBridgeLastState = "frozen"
+                eventLocked(
+                    "gms_vendor_cgroup_frozen",
+                    "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
+                        "path=${record.cgroupPath} consecutive=${record.consecutive}"
+                )
+            }
+            is GmsVendorFreezeBridgeRecord.Recovery -> {
+                var schedulePostRecovery = false
+                synchronized(lock) {
+                    if (vendorBridgeProcess !== process) return@synchronized
+                    val durationMs = (record.durationCentiseconds * 10L).coerceAtLeast(0L)
+                    vendorBridgeRecoveryAttemptCount += 1
+                    vendorBridgeLastTarget = record.target
+                    vendorBridgeLastPid = record.pid
+                    vendorBridgeLastMode = record.mode
+                    vendorBridgeLastRecoveryLatencyMs = durationMs
+                    vendorBridgeMaxRecoveryLatencyMs =
+                        maxOf(vendorBridgeMaxRecoveryLatencyMs, durationMs)
+                    when (record.mode) {
+                        "plain" -> vendorBridgePlainRecoveryCount += 1
+                        "adopt_release" -> vendorBridgeAdoptReleaseCount += 1
+                    }
+                    val commandCount = when (record.mode) {
+                        "adopt_release" -> if (record.stickyExitCode == 125) 3L else 4L
+                        else -> if (record.stickyExitCode == 125) 1L else 2L
+                    }
+                    actionCount += commandCount
+                    if (record.verified) {
+                        vendorBridgeVerifiedRecoveryCount += 1
+                        effectiveThawCount += 1
+                        vendorBridgeLastState = "thawed"
+                        gmsFastThawSuccessCount += 1
+                        gmsFastThawFinalVerifiedCount += 1
+                        gmsFastThawLastCompletedElapsed = SystemClock.elapsedRealtime()
+                        if (!lastGmsTransportProbe.healthy &&
+                            gmsFastThawAwaitingReconnectSinceElapsed <= 0L
+                        ) {
+                            gmsFastThawAwaitingReconnectSinceElapsed =
+                                gmsFastThawLastCompletedElapsed
+                        }
+                        schedulePostRecovery = true
+                    } else {
+                        vendorBridgeFailedRecoveryCount += 1
+                        verificationFailureCount += 1
+                        vendorBridgeLastState = "frozen"
+                    }
+                    eventLocked(
+                        if (record.verified) {
+                            "gms_vendor_bridge_recovery_verified"
+                        } else {
+                            "gms_vendor_bridge_recovery_failed"
+                        },
+                        "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
+                            "mode=${record.mode} plainRc=${record.plainExitCode} " +
+                            "freezeRc=${record.freezeExitCode} releaseRc=${record.releaseExitCode} " +
+                            "stickyRc=${record.stickyExitCode} durationMs=$durationMs " +
+                            "consecutive=${record.consecutive}"
+                    )
+                    persistStatusLocked(force = true)
+                }
+                if (schedulePostRecovery) {
+                    schedulePostFastLaneRecovery(
+                        sequence = record.sequence,
+                        state = "vendor_bridge:${record.mode}"
+                    )
+                }
+            }
+            is GmsVendorFreezeBridgeRecord.VendorLock -> {
+                val signalElapsed = SystemClock.elapsedRealtime()
+                synchronized(lock) {
+                    if (vendorBridgeProcess !== process) return@synchronized
+                    vendorBridgeLockCount += 1
+                    vendorBridgeLastLockElapsed = signalElapsed
+                    vendorBridgeLastTarget = record.target
+                    vendorBridgeLastPid = record.pid
+                    vendorBridgeLastState = "vendor_lock"
+                    eventLocked(
+                        "gms_vendor_refreeze_lock",
+                        "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
+                            "failures=${record.failures} cooldownMs=${record.cooldownCentiseconds * 10L}"
+                    )
+                    persistStatusLocked(force = true)
+                }
+                // The sidecar has already proven that normal and adopt-release
+                // thaw paths cannot hold. Escalate immediately instead of
+                // waiting for the old 45-96 second shield exhaustion path.
+                scheduleGmsFastThaw(signalElapsed)
+            }
+            is GmsVendorFreezeBridgeRecord.Diagnostic -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                eventLocked(
+                    "gms_vendor_bridge_diagnostic",
+                    "type=${record.type} detail=${record.detail}"
+                )
+            }
+            null -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                eventLocked("gms_vendor_bridge_unparsed_output", line.take(MAX_EVENT_DETAIL))
+            }
+        }
+    }
+
+    private fun handleVendorBridgeEnded(process: java.lang.Process, failure: Throwable?) {
+        synchronized(lock) {
+            if (vendorBridgeProcess !== process) return
+            vendorBridgeAlive = false
+            vendorBridgeReady = false
+            vendorBridgeProcess = null
+            vendorBridgeThread = null
+            vendorBridgeReadyTimeoutFuture?.cancel(false)
+            vendorBridgeReadyTimeoutFuture = null
+            vendorBridgeFailureCount += 1
+            vendorBridgeLastState = "ended"
+            if (!running) return
+            errorCount += 1
+            eventLocked(
+                "gms_vendor_bridge_failed",
+                "${failure?.javaClass?.simpleName ?: "eof"}:${failure?.message.orEmpty()}"
+            )
+            scheduleVendorBridgeRestartLocked()
+        }
+    }
+
+    private fun scheduleVendorBridgeRestartLocked() {
+        vendorBridgeRestartFuture?.cancel(false)
+        vendorBridgeRestartFuture = runCatching {
+            executor.schedule(
+                {
+                    synchronized(lock) {
+                        vendorBridgeRestartFuture = null
+                        if (running && vendorBridgeProcess?.isAlive != true) {
+                            startVendorBridgeLocked()
+                        }
+                    }
+                },
+                VENDOR_BRIDGE_RESTART_DELAY_MS,
+                TimeUnit.MILLISECONDS
+            )
+        }.getOrElse { error ->
+            errorCount += 1
+            eventLocked(
+                "gms_vendor_bridge_restart_schedule_failed",
+                "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+            null
+        }
+    }
+
+    private fun stopVendorBridgeLocked() {
+        vendorBridgeRestartFuture?.cancel(false)
+        vendorBridgeRestartFuture = null
+        vendorBridgeReadyTimeoutFuture?.cancel(false)
+        vendorBridgeReadyTimeoutFuture = null
+        vendorBridgeAlive = false
+        vendorBridgeReady = false
+        vendorBridgeTimeoutSupported = false
+        val process = vendorBridgeProcess
+        vendorBridgeProcess = null
+        process?.destroy()
+        vendorBridgeThread?.interrupt()
+        vendorBridgeThread = null
     }
 
     private fun handleEventWatcherEnded(
@@ -3336,6 +3709,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun isVendorBridgeTargetedLocked(): Boolean =
+        isGmsFastLaneTargetedLocked() &&
+            vendorBridgeFamilyLocked() == BackgroundPolicyVendorFamily.VIVO
+
+    private fun vendorBridgeFamilyLocked(): BackgroundPolicyVendorFamily {
+        vendorBridgeDeviceFamily?.let { return it }
+        return currentVendorFamilyLocked().also { vendorBridgeDeviceFamily = it }
+    }
+
     private fun isGmsFastLaneTargetedLocked(): Boolean =
         GMS_PACKAGE in config.packageTargets ||
             config.processTargets.any { processName ->
@@ -3437,6 +3819,24 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         vendorRecoveryExhaustedUntilByPackage.entries.removeAll { (_, until) -> until <= now }
         ensureCapabilitiesLocked()
         if (!eventWatcherAlive) startEventWatcherLocked()
+        if (isVendorBridgeTargetedLocked()) {
+            val vendorBridgeHeartbeatStale = vendorBridgeReady &&
+                vendorBridgeLastHeartbeatElapsed > 0L &&
+                now >= vendorBridgeLastHeartbeatElapsed &&
+                now - vendorBridgeLastHeartbeatElapsed > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
+            if (!vendorBridgeAlive || vendorBridgeHeartbeatStale) {
+                if (vendorBridgeHeartbeatStale) {
+                    eventLocked(
+                        "gms_vendor_bridge_heartbeat_stale",
+                        "ageMs=${now - vendorBridgeLastHeartbeatElapsed}"
+                    )
+                    stopVendorBridgeLocked()
+                }
+                startVendorBridgeLocked()
+            }
+        } else if (vendorBridgeAlive || vendorBridgeProcess != null) {
+            stopVendorBridgeLocked()
+        }
         val processResult = listProcessesLocked()
         val matched = GuardianProcessParser.matching(processResult, config.processTargets)
         val currentNames = matched.mapTo(linkedSetOf()) { it.name }
@@ -3454,10 +3854,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 reassertIntervalMs = config.reassertIntervalMs
             )
             val guardedPackage = packageForProcess(process.name)
-            // Vendor signals own the rapid five-pass retry burst. The normal
-            // poller reasserts at the configured interval instead of issuing a
-            // command every 15 seconds while a ROM keeps a process frozen.
-            val shouldAct = force || policyDue
+            // On vivo/OriginOS, the direct cgroup bridge is the sole owner of
+            // GMS freeze/unfreeze commands. Letting the normal poller issue a
+            // concurrent framework unfreeze can split the bridge's bounded
+            // adopt -> release transaction and recreate the stale-state race
+            // that this release is specifically designed to repair.
+            val vendorBridgeOwnsGms = isVendorBridgeTargetedLocked() && guardedPackage == GMS_PACKAGE
+            val shouldAct = (force || policyDue) && !vendorBridgeOwnsGms
             var action = "observed"
             var commandDetail = ""
             var amAttempted = false
@@ -5156,6 +5559,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun persistStatusLocked(force: Boolean = false) {
         val now = SystemClock.elapsedRealtime()
+        val snapshot = statusJsonLocked()
+        // Socket clients use this immutable snapshot. Updating it is cheap and
+        // must not be coupled to the much slower diagnostic-file write cadence.
+        cachedStatusJson = snapshot
         if (
             !force &&
             lastDiagnosticStatusWriteElapsed > 0L &&
@@ -5164,8 +5571,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             return
         }
-        val snapshot = statusJsonLocked()
-        cachedStatusJson = snapshot
         if (!diagnosticStore.writeStatus(snapshot)) {
             diagnosticWriteErrorCount += 1
         } else {
@@ -5176,6 +5581,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun statusJsonLocked(): String = JSONObject()
         .put("schema", STATUS_SCHEMA)
         .put("engine", "PrivilegedGuardianEngine")
+        .put("snapshotElapsed", SystemClock.elapsedRealtime())
         .put("running", running)
         .put("uid", Process.myUid())
         .put("identity", identity)
@@ -5229,6 +5635,42 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("maxImmediateLatencyMs", eventFastLaneMaxImmediateLatencyMs)
             .put("postRecoveryCount", eventFastLanePostRecoveryCount)
             .put("lastPostRecoveryElapsed", eventFastLaneLastPostRecoveryElapsed)
+        )
+        .put("gmsVendorFreezeBridge", JSONObject()
+            .put("targetEnabled", isVendorBridgeTargetedLocked())
+            .put("vendorFamily", vendorBridgeFamilyLocked().name)
+            .put("alive", vendorBridgeAlive)
+            .put("ready", vendorBridgeReady)
+            .put("strategy", "cgroup_adopt_release")
+            .put("timeoutSupported", vendorBridgeTimeoutSupported)
+            .put("stickyConfigured", vendorBridgeStickyConfigured)
+            .put("startCount", vendorBridgeStartCount)
+            .put("failureCount", vendorBridgeFailureCount)
+            .put("heartbeatCount", vendorBridgeHeartbeatCount)
+            .put("lastHeartbeatElapsed", vendorBridgeLastHeartbeatElapsed)
+            .put("heartbeatAgeMs", if (vendorBridgeLastHeartbeatElapsed > 0L) {
+                (SystemClock.elapsedRealtime() - vendorBridgeLastHeartbeatElapsed).coerceAtLeast(0L)
+            } else {
+                -1L
+            })
+            .put("frozenCount", vendorBridgeFrozenCount)
+            .put("recoveryAttemptCount", vendorBridgeRecoveryAttemptCount)
+            .put("plainRecoveryCount", vendorBridgePlainRecoveryCount)
+            .put("adoptReleaseCount", vendorBridgeAdoptReleaseCount)
+            .put("verifiedRecoveryCount", vendorBridgeVerifiedRecoveryCount)
+            .put("failedRecoveryCount", vendorBridgeFailedRecoveryCount)
+            .put("vendorLockCount", vendorBridgeLockCount)
+            .put("lastLockElapsed", vendorBridgeLastLockElapsed)
+            .put("lastTarget", vendorBridgeLastTarget)
+            .put("lastMode", vendorBridgeLastMode)
+            .put("lastState", vendorBridgeLastState)
+            .put("lastPid", vendorBridgeLastPid)
+            .put("mainPid", vendorBridgeMainPid)
+            .put("mainState", vendorBridgeMainState)
+            .put("persistentPid", vendorBridgePersistentPid)
+            .put("persistentState", vendorBridgePersistentState)
+            .put("lastRecoveryLatencyMs", vendorBridgeLastRecoveryLatencyMs)
+            .put("maxRecoveryLatencyMs", vendorBridgeMaxRecoveryLatencyMs)
         )
         .put("eventTriggerCount", eventTriggerCount)
         .put("vendorSignalCount", vendorSignalCount)
@@ -5701,10 +6143,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 17
+        private const val STATUS_SCHEMA = 18
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val EVENT_WATCHER_RESTART_DELAY_MS = 1_000L
         private const val FAST_LANE_READY_TIMEOUT_MS = 3_000L
+        private const val VENDOR_BRIDGE_RESTART_DELAY_MS = 1_000L
+        private const val VENDOR_BRIDGE_READY_TIMEOUT_MS = 3_000L
+        private const val VENDOR_BRIDGE_STALE_HEARTBEAT_MS = 15_000L
         private const val FAST_LANE_POST_RECOVERY_COOLDOWN_MS = 3_000L
         private const val MAX_FAST_LANE_SEQUENCE_HISTORY = 128
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L

@@ -91,7 +91,7 @@ internal class EmbeddedEngineInstanceGuard private constructor(
         private const val LOCK_PATH = "/data/local/tmp/luonnotar-guardian-engine.lock"
         const val LIFECYCLE_PATH = "/data/local/tmp/luonnotar-guardian-lifecycle.log"
         const val STATE_PATH = "/data/local/tmp/luonnotar-guardian-engine-state.json"
-        private const val HEARTBEAT_INTERVAL_MS = 60_000L
+        private const val HEARTBEAT_INTERVAL_MS = 10_000L
         private const val MAX_LIFECYCLE_BYTES = 1_000_000L
 
         fun acquire(startReason: String): EmbeddedEngineInstanceGuard? {

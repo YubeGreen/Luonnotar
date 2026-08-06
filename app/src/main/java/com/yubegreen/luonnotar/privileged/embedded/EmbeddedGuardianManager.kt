@@ -144,11 +144,20 @@ object EmbeddedGuardianManager {
     ) {
         val app = context.applicationContext
         val snapshot = EmbeddedGuardianStore.snapshot(app)
-        if (!snapshot.featureEnabled) return
-        if (EmbeddedLiveRefreshPolicy.shouldDefer(snapshot.setupState)) return
+        if (!snapshot.featureEnabled) {
+            callback(Result.success(snapshot.lastStatus))
+            return
+        }
+        if (EmbeddedLiveRefreshPolicy.shouldDefer(snapshot.setupState)) {
+            callback(Result.success(snapshot.lastStatus))
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val last = lastRefreshAttemptElapsed.get()
-        if (now - last < minAgeMs || !refreshInFlight.compareAndSet(false, true)) return
+        if (now - last < minAgeMs || !refreshInFlight.compareAndSet(false, true)) {
+            callback(Result.success(snapshot.lastStatus))
+            return
+        }
         lastRefreshAttemptElapsed.set(now)
         refresh(app) { result ->
             refreshInFlight.set(false)
@@ -206,7 +215,17 @@ object EmbeddedGuardianManager {
             }.onFailure { error ->
                 if (generation >= 0L) {
                     val identity = if (identityAvailable) EmbeddedGuardianStore.identity(app) else null
-                    val engineDead = if (identity != null) {
+                    val engineDead = if (
+                        identity != null && error is EmbeddedEngineStatusStaleException
+                    ) {
+                        terminateStaleEngine(
+                            app = app,
+                            generation = generation,
+                            identity = identity,
+                            error = error,
+                            source = "live_refresh_stale_status"
+                        )
+                    } else if (identity != null) {
                         preserveConnectionOrMarkDead(
                             app = app,
                             generation = generation,
@@ -488,6 +507,22 @@ object EmbeddedGuardianManager {
         val status = JSONObject(rawStatus)
         val statusUid = status.optInt("uid", -1)
         val running = status.optBoolean("running", false)
+        val snapshotElapsed = status.optLong("snapshotElapsed", 0L)
+        val nowElapsed = SystemClock.elapsedRealtime()
+        val snapshotAgeMs = EmbeddedEngineStatusFreshnessPolicy.ageMs(
+            nowElapsed = nowElapsed,
+            snapshotElapsed = snapshotElapsed
+        )
+        if (!EmbeddedEngineStatusFreshnessPolicy.isFresh(
+                nowElapsed = nowElapsed,
+                snapshotElapsed = snapshotElapsed
+            )
+        ) {
+            throw EmbeddedEngineStatusStaleException(
+                "embedded engine status stale ageMs=$snapshotAgeMs " +
+                    "snapshotElapsed=$snapshotElapsed"
+            )
+        }
         check(EmbeddedGuardianStatePolicy.acceptsLiveHandshake(ping.uid, statusUid, running)) {
             "embedded live status rejected pingUid=${ping.uid} statusUid=$statusUid running=$running"
         }
@@ -514,6 +549,50 @@ object EmbeddedGuardianManager {
             if (attempt + 1 < FAST_PING_ATTEMPTS) Thread.sleep(FAST_PING_RETRY_DELAY_MS)
         }
         return Result.failure(lastFailure)
+    }
+
+    /**
+     * A live socket with a stale status means the server survived while its
+     * privileged guardian stopped publishing progress. A ping cannot detect
+     * that split-brain state, so explicitly destroy the stale app_process and
+     * let the normal auto-repair path start a clean generation.
+     */
+    private fun terminateStaleEngine(
+        app: Context,
+        generation: Long,
+        identity: EmbeddedGuardianStore.EndpointIdentity,
+        error: Throwable,
+        source: String
+    ): Boolean {
+        val destroyResult = runCatching {
+            EmbeddedGuardianClient(
+                identity.port,
+                identity.token,
+                connectTimeoutMs = 1_500,
+                readTimeoutMs = 5_000
+            ).destroy()
+        }
+        val stopped = destroyResult.isSuccess && runCatching {
+            awaitRemoteStop(identity)
+        }.getOrDefault(false)
+        EmbeddedGuardianStore.markConnectionUnavailable(
+            app,
+            generation,
+            EmbeddedConnectionState.DEAD,
+            error.toString(),
+            source
+        )
+        LogManager.event(
+            app,
+            "embedded_stale_engine_terminated",
+            EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                mapOf(
+                    "destroyAccepted" to destroyResult.isSuccess,
+                    "remoteStopped" to stopped,
+                    "destroyError" to destroyResult.exceptionOrNull().toString()
+                )
+        )
+        return stopped
     }
 
     /** Returns true only when a separate short ping proves the engine is unavailable/incompatible. */
@@ -554,8 +633,8 @@ object EmbeddedGuardianManager {
     }
 
     private fun awaitRemoteStop(identity: EmbeddedGuardianStore.EndpointIdentity): Boolean {
-        repeat(5) {
-            Thread.sleep(100L)
+        repeat(10) {
+            Thread.sleep(200L)
             val stillAlive = runCatching {
                 EmbeddedGuardianClient(
                     identity.port,
@@ -568,6 +647,9 @@ object EmbeddedGuardianManager {
         }
         return false
     }
+
+    private class EmbeddedEngineStatusStaleException(message: String) :
+        IllegalStateException(message)
 
     private data class PingHandshake(val uid: Int, val engineRevision: Int)
     private data class LiveHandshake(val uid: Int, val status: String)
