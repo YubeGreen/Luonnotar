@@ -19,7 +19,7 @@ data class GuardianEngineConfig(
     val tuneDeviceIdle: Boolean = true,
     val tuneNetworkPolicy: Boolean = true,
     val tuneHibernation: Boolean = true,
-    val rootCgroupThaw: Boolean = true,
+    val rootCgroupThaw: Boolean = false,
     val gmsRecoveryEnabled: Boolean = false,
     val vendorEmergencyRecoveryEnabled: Boolean = true,
     val gmsFreezeThreshold: Int = 3,
@@ -95,7 +95,7 @@ data class GuardianEngineConfig(
         .toString()
 
     companion object {
-        const val SCHEMA = 6
+        const val SCHEMA = 7
 
         val DEFAULT_PROCESS_TARGETS = listOf(
             "com.google.android.gms",
@@ -163,7 +163,7 @@ data class GuardianEngineConfig(
                     tuneDeviceIdle = json.optBoolean("tuneDeviceIdle", true),
                     tuneNetworkPolicy = json.optBoolean("tuneNetworkPolicy", true),
                     tuneHibernation = json.optBoolean("tuneHibernation", true),
-                    rootCgroupThaw = json.optBoolean("rootCgroupThaw", true),
+                    rootCgroupThaw = if (schema < 7) false else json.optBoolean("rootCgroupThaw", false),
                     gmsRecoveryEnabled = json.optBoolean("gmsRecoveryEnabled", false),
                     vendorEmergencyRecoveryEnabled =
                         json.optBoolean("vendorEmergencyRecoveryEnabled", true),

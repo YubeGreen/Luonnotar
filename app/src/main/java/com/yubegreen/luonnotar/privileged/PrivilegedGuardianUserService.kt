@@ -11,6 +11,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.concurrent.thread
 import kotlin.system.exitProcess
 
@@ -41,14 +42,46 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         Thread(runnable, "luonnotar-gms-fast-thaw").apply { isDaemon = true }
     }
     private val gmsFastThawWorkerActive = AtomicBoolean(false)
+    private val gmsFastThawPendingSignalElapsed = AtomicLong(0L)
     private val recentEvents = ArrayDeque<GuardianEvent>()
     private var scheduled: ScheduledFuture<*>? = null
     private var initialCycleFuture: ScheduledFuture<*>? = null
+    private var eventWatcherRestartFuture: ScheduledFuture<*>? = null
+    private var eventFastLaneReadyTimeoutFuture: ScheduledFuture<*>? = null
     private var eventWatcherProcess: java.lang.Process? = null
     private var consecutiveGmsMcsKickExhaustions = 0
     private var lastGmsMcsEmergencyEscalationElapsed = 0L
     private var eventWatcherThread: Thread? = null
     private var eventWatcherAlive = false
+    private var eventWatcherMode = "none"
+    private var eventFastLaneReady = false
+    private var eventFastLaneBackend = "none"
+    private var eventFastLaneTimeoutSupported = false
+    private var eventFastLaneStickyConfigured = false
+    private var eventFastLaneTargetEnabled = false
+    private var eventFastLaneStartCount = 0L
+    private var eventFastLaneFailureCount = 0L
+    private var eventFastLaneSignalCount = 0L
+    private var eventFastLaneImmediateAttemptCount = 0L
+    private var eventFastLaneImmediateAcceptedCount = 0L
+    private var eventFastLaneImmediateSkippedCount = 0L
+    private var eventFastLaneShieldCompletionCount = 0L
+    private var eventFastLaneShieldCommandCount = 0L
+    private var eventFastLaneShieldAcceptedCount = 0L
+    private var eventFastLaneFrozenPollCount = 0L
+    private var eventFastLaneVerifiedThawCount = 0L
+    private var eventFastLaneBlindReassertCount = 0L
+    private var eventFastLaneExhaustedCount = 0L
+    private var eventFastLaneLastEpisode = 0L
+    private var eventFastLaneLastState = "never"
+    private var eventFastLaneLastSignalElapsed = 0L
+    private var eventFastLaneLastImmediateLatencyMs = 0L
+    private var eventFastLaneMaxImmediateLatencyMs = 0L
+    private val eventFastLaneSignalElapsedBySequence = linkedMapOf<Long, Long>()
+    private val eventFastLaneProbeHandledSequences = linkedSetOf<Long>()
+    private val eventFastLaneVerifiedSequences = linkedSetOf<Long>()
+    private var eventFastLaneLastPostRecoveryElapsed = 0L
+    private var eventFastLanePostRecoveryCount = 0L
     private var eventTriggerCount = 0L
     private var config = GuardianEngineConfig().normalized()
     private var running = false
@@ -67,6 +100,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var directCgroupSuccessCount = 0L
     private var capabilityChecked = false
     private var supportsStickyUnfreeze = false
+    private var supportsDirectActivityUnfreeze = false
     private var supportsSecondaryProcessUnfreeze = false
     private var supportsStopApp = false
     private var supportsPackageUnstop = false
@@ -361,13 +395,134 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
-    private fun startEventWatcherLocked() {
-        if (eventWatcherProcess?.isAlive == true && eventWatcherThread?.isAlive == true) {
+    private fun startEventWatcherLocked(forceLegacy: Boolean = false) {
+        val targetEnabled = isGmsFastLaneTargetedLocked()
+        val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
+        val wantsFastLane = !forceLegacy && targetEnabled
+        val currentProcessAlive = eventWatcherProcess?.isAlive == true
+        val currentThreadAlive = eventWatcherThread?.isAlive == true
+        val currentCompatible = currentProcessAlive && currentThreadAlive && when {
+            wantsFastLane -> eventWatcherMode == "shell_fast_lane" &&
+                eventFastLaneStickyConfigured == sticky &&
+                eventFastLaneTargetEnabled
+            else -> eventWatcherMode == "legacy_logcat"
+        }
+        if (currentCompatible) {
             eventWatcherAlive = true
             return
         }
+
+        if (currentProcessAlive || currentThreadAlive) {
+            eventLocked(
+                "event_watcher_reconfigured",
+                "oldMode=$eventWatcherMode wantsFastLane=$wantsFastLane " +
+                    "sticky=$sticky targetEnabled=$targetEnabled"
+            )
+        }
         stopEventWatcherLocked()
-        val process = runCatching {
+        eventFastLaneTargetEnabled = targetEnabled
+        if (!wantsFastLane) {
+            startLegacyEventWatcherLocked(
+                if (forceLegacy) "fast_lane_runtime_fallback" else "gms_target_disabled"
+            )
+            return
+        }
+
+        eventFastLaneReady = false
+        eventFastLaneBackend = "starting"
+        eventFastLaneTimeoutSupported = false
+        eventFastLaneStickyConfigured = sticky
+        val startResult = runCatching {
+            ProcessBuilder("/system/bin/sh")
+                .redirectErrorStream(true)
+                .start()
+                .also { process ->
+                    process.outputStream.bufferedWriter().use { writer ->
+                        writer.write(
+                            GmsFreezerFastLaneScript.build(
+                                parentPid = Process.myPid(),
+                                stickyUnfreeze = sticky
+                            )
+                        )
+                        writer.flush()
+                    }
+                }
+        }
+        val process = startResult.getOrNull()
+        if (process == null) {
+            val error = startResult.exceptionOrNull()
+            eventFastLaneFailureCount += 1
+            errorCount += 1
+            eventLocked(
+                "gms_fast_lane_start_failed",
+                "${error?.javaClass?.simpleName}:${error?.message.orEmpty()}"
+            )
+            startLegacyEventWatcherLocked("fast_lane_start_failed")
+            return
+        }
+
+        eventWatcherProcess = process
+        eventWatcherAlive = true
+        eventWatcherMode = "shell_fast_lane"
+        eventFastLaneStartCount += 1
+        eventWatcherThread = thread(
+            name = "luonnotar-gms-freezer-fast-lane",
+            isDaemon = true
+        ) {
+            var failure: Throwable? = null
+            try {
+                process.inputStream.bufferedReader().useLines { lines ->
+                    lines.forEach { line -> handleFastLaneOutput(process, line) }
+                }
+            } catch (error: Throwable) {
+                failure = error
+            }
+            handleEventWatcherEnded(process, "shell_fast_lane", failure)
+        }
+        eventFastLaneReadyTimeoutFuture = runCatching {
+            executor.schedule(
+                {
+                    synchronized(lock) {
+                        eventFastLaneReadyTimeoutFuture = null
+                        if (!running || eventWatcherProcess !== process || eventFastLaneReady) {
+                            return@synchronized
+                        }
+                        eventFastLaneFailureCount += 1
+                        errorCount += 1
+                        eventLocked(
+                            "gms_fast_lane_ready_timeout",
+                            "processAlive=${process.isAlive} sticky=$sticky"
+                        )
+                        stopEventWatcherLocked()
+                        if (running) startLegacyEventWatcherLocked("fast_lane_ready_timeout")
+                    }
+                },
+                FAST_LANE_READY_TIMEOUT_MS,
+                TimeUnit.MILLISECONDS
+            )
+        }.getOrElse { error ->
+            errorCount += 1
+            eventLocked(
+                "gms_fast_lane_ready_timeout_schedule_failed",
+                "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+            null
+        }
+        eventLocked(
+            "gms_fast_lane_started",
+            "shell owns logcat; sticky=$sticky parentPid=${Process.myPid()}"
+        )
+    }
+
+    private fun startLegacyEventWatcherLocked(reason: String) {
+        eventFastLaneReadyTimeoutFuture?.cancel(false)
+        eventFastLaneReadyTimeoutFuture = null
+        eventFastLaneReady = false
+        eventFastLaneBackend = "legacy"
+        eventFastLaneTimeoutSupported = false
+        eventFastLaneStickyConfigured = false
+        eventFastLaneTargetEnabled = isGmsFastLaneTargetedLocked()
+        val startResult = runCatching {
             ProcessBuilder(
                 "logcat",
                 "-b", "events",
@@ -388,98 +543,411 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
                 .redirectErrorStream(true)
                 .start()
-        }.getOrElse { error ->
+        }
+        val process = startResult.getOrNull()
+        if (process == null) {
+            val error = startResult.exceptionOrNull()
             eventWatcherAlive = false
+            eventWatcherMode = "failed"
             errorCount += 1
-            eventLocked("event_watcher_start_failed", "${error.javaClass.simpleName}:${error.message}")
+            eventLocked(
+                "event_watcher_start_failed",
+                "reason=$reason ${error?.javaClass?.simpleName}:${error?.message.orEmpty()}"
+            )
+            scheduleEventWatcherRestartLocked(forceLegacy = true)
             return
         }
+
         eventWatcherProcess = process
         eventWatcherAlive = true
+        eventWatcherMode = "legacy_logcat"
         eventWatcherThread = thread(
-            name = "luonnotar-freezer-event-watcher",
+            name = "luonnotar-freezer-event-watcher-legacy",
             isDaemon = true
         ) {
-            runCatching {
+            var failure: Throwable? = null
+            try {
                 process.inputStream.bufferedReader().useLines { lines ->
-                    lines.forEach { line ->
-                        val now = SystemClock.elapsedRealtime()
-                        GmsTransportLogSignalParser.parse(line)?.let { healthSignal ->
-                            synchronized(lock) {
-                                recordGmsTransportLogSignalLocked(healthSignal, now)
-                            }
-                        }
+                    lines.forEach { line -> handleEventWatcherRawLine(process, line) }
+                }
+            } catch (error: Throwable) {
+                failure = error
+            }
+            handleEventWatcherEnded(process, "legacy_logcat", failure)
+        }
+        eventLocked(
+            "event_watcher_started",
+            "mode=legacy_logcat reason=$reason events+system+main"
+        )
+    }
 
-                        val signal = synchronized(lock) {
-                            VendorFreezeSignalParser.parse(
-                                line = line,
-                                processTargets = config.processTargets,
-                                packageTargets = config.packageTargets
-                            )
-                        } ?: return@forEach
-                        var fastThawRequested = false
-                        val accepted = synchronized(lock) {
-                            recordVendorSignalLocked(signal, now)
-                            fastThawRequested =
-                                running &&
-                                    //gmsRecoveryInProgress &&
-                                    signal.packageName == GMS_PACKAGE &&
-                                    signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
-                            if (!running) {
-                                false
-                            } else {
-                                val lastTrigger = lastSignalTriggerByPackage[signal.packageName] ?: 0L
-                                if (
-                                    now >= lastTrigger &&
-                                    now - lastTrigger < VendorFreezeRecoveryPolicy.SIGNAL_DEBOUNCE_MS
-                                ) {
-                                    false
-                                } else {
-                                    lastSignalTriggerByPackage[signal.packageName] = now
-                                    eventTriggerCount += 1
-                                    true
-                                }
-                            }
+    private fun handleFastLaneOutput(process: java.lang.Process, line: String) {
+        if (!synchronized(lock) { eventWatcherProcess === process }) return
+        when (val record = GmsFreezerFastLaneProtocol.parse(line)) {
+            is GmsFreezerFastLaneRecord.Ready -> synchronized(lock) {
+                if (eventWatcherProcess !== process) return@synchronized
+                eventFastLaneReadyTimeoutFuture?.cancel(false)
+                eventFastLaneReadyTimeoutFuture = null
+                eventFastLaneReady = true
+                eventFastLaneBackend = record.backend
+                eventFastLaneTimeoutSupported = record.timeout
+                eventFastLaneStickyConfigured = record.sticky
+                eventLocked(
+                    "gms_fast_lane_ready",
+                    "backend=${record.backend} sticky=${record.sticky} timeout=${record.timeout}"
+                )
+                persistStatusLocked(force = true)
+            }
+            is GmsFreezerFastLaneRecord.Signal -> {
+                val receivedElapsed = SystemClock.elapsedRealtime()
+                synchronized(lock) {
+                    if (eventWatcherProcess !== process) return@synchronized
+                    eventFastLaneSignalCount += 1
+                    eventFastLaneLastSignalElapsed = receivedElapsed
+                    eventFastLaneSignalElapsedBySequence[record.sequence] = receivedElapsed
+                    trimFastLaneSequenceHistoryLocked()
+                    eventLocked(
+                        "gms_fast_lane_signal",
+                        "seq=${record.sequence} target=${record.target}"
+                    )
+                }
+            }
+            is GmsFreezerFastLaneRecord.FirstThaw -> {
+                val completedElapsed = SystemClock.elapsedRealtime()
+                synchronized(lock) {
+                    if (eventWatcherProcess !== process) return@synchronized
+                    eventFastLaneBackend = record.backend
+                    val receivedElapsed =
+                        eventFastLaneSignalElapsedBySequence[record.sequence] ?: completedElapsed
+                    val kotlinObservedLatency =
+                        (completedElapsed - receivedElapsed).coerceAtLeast(0L)
+                    val shellCommandDuration =
+                        (record.durationCentiseconds * 10L).coerceAtLeast(0L)
+                    if (record.skipped) {
+                        eventFastLaneImmediateSkippedCount += 1
+                    } else {
+                        eventFastLaneLastImmediateLatencyMs = shellCommandDuration
+                        eventFastLaneMaxImmediateLatencyMs =
+                            maxOf(eventFastLaneMaxImmediateLatencyMs, shellCommandDuration)
+                        eventFastLaneImmediateAttemptCount += 1
+                        gmsFastThawAttemptCount += 1
+                        actionCount += 1
+                        if (record.exitCode == 0) {
+                            eventFastLaneImmediateAcceptedCount += 1
+                        } else {
+                            commandFailureCount += 1
                         }
-                        if (fastThawRequested) {
-                            scheduleGmsFastThaw(signalElapsed = now)
-                        }
-                        if (accepted) {
-                            runCatching {
-                                executor.execute {
-                                    synchronized(lock) {
-                                        if (running) startVendorRecoveryBurstLocked(signal)
-                                    }
-                                }
-                            }.onFailure { error ->
-                                synchronized(lock) {
-                                    errorCount += 1
-                                    eventLocked(
-                                        "vendor_recovery_schedule_failed",
-                                        "${signal.packageName} ${error.javaClass.simpleName}:${error.message}"
-                                    )
-                                }
-                            }
-                        }
+                        gmsFastThawLastLatencyMs = shellCommandDuration
+                        gmsFastThawMaxLatencyMs =
+                            maxOf(gmsFastThawMaxLatencyMs, shellCommandDuration)
+                    }
+                    eventLocked(
+                        "gms_fast_lane_first_thaw",
+                        "seq=${record.sequence} target=${record.target} backend=${record.backend} " +
+                            "rc=${record.exitCode} skipped=${record.skipped} " +
+                            "shellDurationMs=$shellCommandDuration " +
+                            "kotlinObservedLatencyMs=$kotlinObservedLatency"
+                    )
+                }
+            }
+            is GmsFreezerFastLaneRecord.ProbeResult -> {
+                var schedulePostRecovery = false
+                synchronized(lock) {
+                    if (eventWatcherProcess !== process) return@synchronized
+                    eventFastLaneLastState = record.state
+                    val recoveryReady = GmsFreezerFastLanePolicy.isRecoveryReady(
+                        state = record.state,
+                        acceptedCount = record.acceptedCount
+                    )
+                    if (recoveryReady) {
+                        schedulePostRecovery = markFastLaneRecoveryLocked(
+                            sequence = record.sequence,
+                            state = record.state
+                        )
+                    }
+                    eventLocked(
+                        "gms_fast_lane_probe",
+                        "seq=${record.sequence} state=${record.state} commands=${record.commandCount} " +
+                            "accepted=${record.acceptedCount} frozenPolls=${record.frozenPollCount} " +
+                            "verified=${record.verifiedThawCount} blind=${record.blindReassertCount}"
+                    )
+                    persistStatusLocked(force = true)
+                }
+                if (schedulePostRecovery) {
+                    schedulePostFastLaneRecovery(record.sequence, record.state)
+                }
+            }
+            is GmsFreezerFastLaneRecord.ShieldResult -> {
+                var fallbackSignalElapsed = 0L
+                var schedulePostRecovery = false
+                synchronized(lock) {
+                    if (eventWatcherProcess !== process) return@synchronized
+                    eventFastLaneShieldCompletionCount += 1
+                    eventFastLaneShieldCommandCount += record.commandCount.toLong()
+                    eventFastLaneShieldAcceptedCount += record.acceptedCount.toLong()
+                    eventFastLaneFrozenPollCount += record.frozenPollCount.toLong()
+                    eventFastLaneVerifiedThawCount += record.verifiedThawCount.toLong()
+                    eventFastLaneBlindReassertCount += record.blindReassertCount.toLong()
+                    if (record.exhausted) eventFastLaneExhaustedCount += 1
+                    eventFastLaneLastEpisode = record.episode
+                    eventFastLaneLastState = record.state
+                    val sequenceSignalElapsed =
+                        eventFastLaneSignalElapsedBySequence.remove(record.sequence)
+                            ?: eventFastLaneLastSignalElapsed.takeIf { it > 0L }
+                            ?: SystemClock.elapsedRealtime()
+                    actionCount += record.commandCount.toLong()
+                    commandFailureCount +=
+                        (record.commandCount - record.acceptedCount).coerceAtLeast(0).toLong()
+                    val recoveryReady = GmsFreezerFastLanePolicy.isRecoveryReady(
+                        state = record.state,
+                        acceptedCount = record.acceptedCount
+                    )
+                    if (recoveryReady) {
+                        schedulePostRecovery = markFastLaneRecoveryLocked(
+                            sequence = record.sequence,
+                            state = record.state
+                        )
+                    }
+                    val requiresFallback =
+                        GmsFreezerFastLanePolicy.requiresKotlinFallback(
+                            state = record.state,
+                            acceptedCount = record.acceptedCount,
+                            exhausted = record.exhausted
+                        )
+                    if (requiresFallback) fallbackSignalElapsed = sequenceSignalElapsed
+                    eventLocked(
+                        "gms_fast_lane_shield_finished",
+                        "seq=${record.sequence} episode=${record.episode} state=${record.state} " +
+                            "commands=${record.commandCount} accepted=${record.acceptedCount} " +
+                            "frozenPolls=${record.frozenPollCount} verified=${record.verifiedThawCount} " +
+                            "blind=${record.blindReassertCount} durationMs=${record.durationCentiseconds * 10L} " +
+                            "exhausted=${record.exhausted} fallback=$requiresFallback"
+                    )
+                    persistStatusLocked(force = true)
+                }
+                if (schedulePostRecovery) {
+                    schedulePostFastLaneRecovery(record.sequence, record.state)
+                }
+                if (fallbackSignalElapsed > 0L) {
+                    scheduleGmsFastThaw(fallbackSignalElapsed)
+                }
+            }
+            is GmsFreezerFastLaneRecord.RawLog -> handleEventWatcherRawLine(process, record.line)
+            is GmsFreezerFastLaneRecord.Diagnostic -> synchronized(lock) {
+                if (eventWatcherProcess !== process) return@synchronized
+                eventLocked(
+                    "gms_fast_lane_diagnostic",
+                    "type=${record.type} detail=${record.detail}"
+                )
+            }
+            null -> synchronized(lock) {
+                if (eventWatcherProcess !== process) return@synchronized
+                eventLocked("gms_fast_lane_unparsed_output", line.take(MAX_EVENT_DETAIL))
+            }
+        }
+    }
+
+    private fun markFastLaneRecoveryLocked(sequence: Long, state: String): Boolean {
+        val firstPostRecovery = eventFastLaneProbeHandledSequences.add(sequence)
+        if (state == "thawed" && eventFastLaneVerifiedSequences.add(sequence)) {
+            gmsFastThawSuccessCount += 1
+            gmsFastThawFinalVerifiedCount += 1
+            effectiveThawCount += 1
+            gmsFastThawLastCompletedElapsed = SystemClock.elapsedRealtime()
+            if (!lastGmsTransportProbe.healthy &&
+                gmsFastThawAwaitingReconnectSinceElapsed <= 0L
+            ) {
+                gmsFastThawAwaitingReconnectSinceElapsed =
+                    gmsFastThawLastCompletedElapsed
+            }
+        }
+        trimFastLaneSequenceHistoryLocked()
+        return firstPostRecovery
+    }
+
+    private fun trimFastLaneSequenceHistoryLocked() {
+        while (eventFastLaneSignalElapsedBySequence.size > MAX_FAST_LANE_SEQUENCE_HISTORY) {
+            eventFastLaneSignalElapsedBySequence.remove(
+                eventFastLaneSignalElapsedBySequence.keys.first()
+            )
+        }
+        while (eventFastLaneProbeHandledSequences.size > MAX_FAST_LANE_SEQUENCE_HISTORY) {
+            eventFastLaneProbeHandledSequences.remove(
+                eventFastLaneProbeHandledSequences.first()
+            )
+        }
+        while (eventFastLaneVerifiedSequences.size > MAX_FAST_LANE_SEQUENCE_HISTORY) {
+            eventFastLaneVerifiedSequences.remove(eventFastLaneVerifiedSequences.first())
+        }
+    }
+
+    private fun schedulePostFastLaneRecovery(sequence: Long, state: String) {
+        var reservedAt = 0L
+        val accepted = synchronized(lock) {
+            val now = SystemClock.elapsedRealtime()
+            if (!running ||
+                (eventFastLaneLastPostRecoveryElapsed > 0L &&
+                    now >= eventFastLaneLastPostRecoveryElapsed &&
+                    now - eventFastLaneLastPostRecoveryElapsed < FAST_LANE_POST_RECOVERY_COOLDOWN_MS)
+            ) {
+                false
+            } else {
+                reservedAt = now
+                eventFastLaneLastPostRecoveryElapsed = now
+                eventFastLanePostRecoveryCount += 1
+                true
+            }
+        }
+        if (!accepted) return
+        runCatching {
+            gmsFastThawExecutor.execute {
+                if (!synchronized(lock) { running }) return@execute
+                requestPostThawAnchorQuery()
+                if (shouldKickMcsAfterThaw()) {
+                    runGmsMcsKickWindow(trigger = "shell_fast_lane:$state:seq=$sequence")
+                }
+            }
+        }.onFailure { error ->
+            synchronized(lock) {
+                if (eventFastLaneLastPostRecoveryElapsed == reservedAt) {
+                    eventFastLaneLastPostRecoveryElapsed = 0L
+                    eventFastLanePostRecoveryCount =
+                        (eventFastLanePostRecoveryCount - 1L).coerceAtLeast(0L)
+                }
+                errorCount += 1
+                eventLocked(
+                    "gms_fast_lane_post_recovery_schedule_failed",
+                    "seq=$sequence ${error.javaClass.simpleName}:${error.message.orEmpty()}"
+                )
+            }
+        }
+    }
+
+    private fun handleEventWatcherRawLine(process: java.lang.Process, line: String) {
+        if (!synchronized(lock) { eventWatcherProcess === process }) return
+        val now = SystemClock.elapsedRealtime()
+        GmsTransportLogSignalParser.parse(line)?.let { healthSignal ->
+            synchronized(lock) {
+                recordGmsTransportLogSignalLocked(healthSignal, now)
+            }
+        }
+
+        val signal = synchronized(lock) {
+            VendorFreezeSignalParser.parse(
+                line = line,
+                processTargets = config.processTargets,
+                packageTargets = config.packageTargets
+            )
+        } ?: return
+        var fastThawRequested = false
+        var delegatedToFastLane = false
+        val accepted = synchronized(lock) {
+            recordVendorSignalLocked(signal, now)
+            delegatedToFastLane =
+                running &&
+                    eventFastLaneReady &&
+                    signal.packageName == GMS_PACKAGE &&
+                    signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
+            fastThawRequested =
+                running &&
+                    !eventFastLaneReady &&
+                    signal.packageName == GMS_PACKAGE &&
+                    signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
+            if (!running) {
+                false
+            } else {
+                val lastTrigger = lastSignalTriggerByPackage[signal.packageName] ?: 0L
+                if (
+                    now >= lastTrigger &&
+                    now - lastTrigger < VendorFreezeRecoveryPolicy.SIGNAL_DEBOUNCE_MS
+                ) {
+                    false
+                } else {
+                    lastSignalTriggerByPackage[signal.packageName] = now
+                    eventTriggerCount += 1
+                    true
+                }
+            }
+        }
+        if (fastThawRequested) {
+            scheduleGmsFastThaw(signalElapsed = now)
+        }
+        if (accepted && delegatedToFastLane) {
+            synchronized(lock) {
+                eventLocked(
+                    "vendor_recovery_delegated_to_fast_lane",
+                    "${signal.packageName} kind=${signal.kind}"
+                )
+            }
+        } else if (accepted) {
+            runCatching {
+                executor.execute {
+                    synchronized(lock) {
+                        if (running) startVendorRecoveryBurstLocked(signal)
                     }
                 }
             }.onFailure { error ->
                 synchronized(lock) {
-                    if (running) {
-                        errorCount += 1
-                        eventLocked(
-                            "event_watcher_failed",
-                            "${error.javaClass.simpleName}:${error.message}"
-                        )
-                    }
+                    errorCount += 1
+                    eventLocked(
+                        "vendor_recovery_schedule_failed",
+                        "${signal.packageName} ${error.javaClass.simpleName}:${error.message}"
+                    )
                 }
             }
-            synchronized(lock) { eventWatcherAlive = false }
         }
-        eventLocked(
-            "event_watcher_started",
-            "logcat events+system+main / aosp+vendor freezer evidence"
-        )
+    }
+
+    private fun handleEventWatcherEnded(
+        process: java.lang.Process,
+        mode: String,
+        failure: Throwable?
+    ) {
+        synchronized(lock) {
+            if (eventWatcherProcess !== process) return
+            eventWatcherAlive = false
+            eventWatcherProcess = null
+            eventWatcherThread = null
+            eventFastLaneReadyTimeoutFuture?.cancel(false)
+            eventFastLaneReadyTimeoutFuture = null
+            eventFastLaneReady = false
+            eventFastLaneBackend = "ended"
+            eventFastLaneTimeoutSupported = false
+            if (!running) return
+            errorCount += 1
+            if (mode == "shell_fast_lane") eventFastLaneFailureCount += 1
+            eventLocked(
+                "event_watcher_failed",
+                "mode=$mode ${failure?.javaClass?.simpleName ?: "eof"}:" +
+                    failure?.message.orEmpty()
+            )
+            scheduleEventWatcherRestartLocked(forceLegacy = mode == "shell_fast_lane")
+        }
+    }
+
+    private fun scheduleEventWatcherRestartLocked(forceLegacy: Boolean) {
+        eventWatcherRestartFuture?.cancel(false)
+        eventWatcherRestartFuture = runCatching {
+            executor.schedule(
+                {
+                    synchronized(lock) {
+                        eventWatcherRestartFuture = null
+                        if (running && eventWatcherProcess?.isAlive != true) {
+                            startEventWatcherLocked(forceLegacy = forceLegacy)
+                        }
+                    }
+                },
+                EVENT_WATCHER_RESTART_DELAY_MS,
+                TimeUnit.MILLISECONDS
+            )
+        }.getOrElse { error ->
+            errorCount += 1
+            eventLocked(
+                "event_watcher_restart_schedule_failed",
+                "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+            null
+        }
     }
 
     private fun recordVendorSignalLocked(signal: VendorFreezeSignal, now: Long) {
@@ -1025,7 +1493,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             val afterActivityManager = readFreezeState(process.pid)
             if (
                 afterActivityManager.frozen == true &&
-                config.rootCgroupThaw &&
+                canDirectCgroupThawLocked() &&
                 before.controlFile != null
             ) {
                 directCgroupAttemptCount += 1
@@ -1713,6 +2181,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun scheduleGmsFastThaw(signalElapsed: Long) {
         if (!gmsFastThawWorkerActive.compareAndSet(false, true)) {
+            gmsFastThawPendingSignalElapsed.set(signalElapsed)
             synchronized(lock) {
                 gmsFastThawCoalescedCount += 1
                 eventLocked(
@@ -1732,10 +2201,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     val secondarySupported = synchronized(lock) {
                         supportsSecondaryProcessUnfreeze
                     }
+                    val backend = synchronized(lock) {
+                        if (supportsDirectActivityUnfreeze) {
+                            ActivityManagerUnfreezeCommand.Backend.CMD_ACTIVITY
+                        } else {
+                            ActivityManagerUnfreezeCommand.Backend.AM
+                        }
+                    }
                     val burstStarted = SystemClock.elapsedRealtime()
                     val deadline = burstStarted + GMS_FAST_THAW_BURST_DURATION_MS
                     var passCount = 0
-                    var frozenAfter = fastReadFrozenGmsProcesses()
+                    // The event itself is sufficient evidence to issue the first
+                    // command. Scanning cgroups before acting was r255's largest
+                    // avoidable latency and could consume the whole burst budget.
+                    var frozenAfter = listOf(GMS_PACKAGE to -1)
                     val passDetails = mutableListOf<String>()
 
                     while (
@@ -1758,6 +2237,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         val passResult = runGmsFastThawPass(
                             sticky = sticky,
                             secondarySupported = secondarySupported,
+                            backend = backend,
                             timeoutMs = minOf(
                                 GMS_FAST_THAW_COMMAND_TIMEOUT_MS,
                                 remainingForCommand
@@ -1844,6 +2324,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     }
                 } finally {
                     gmsFastThawWorkerActive.set(false)
+                    val pendingSignal = gmsFastThawPendingSignalElapsed.getAndSet(0L)
+                    if (pendingSignal > 0L) scheduleGmsFastThaw(pendingSignal)
                 }
             }
         }.onFailure { error ->
@@ -1861,15 +2343,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun runGmsFastThawPass(
         sticky: Boolean,
         secondarySupported: Boolean,
+        backend: ActivityManagerUnfreezeCommand.Backend,
         timeoutMs: Long
     ): FastThawPassResult {
-        val stickyArg = if (sticky) "--sticky " else ""
         val commands = mutableListOf(
-            "am unfreeze ${stickyArg}${GMS_PACKAGE} --user 0"
+            ActivityManagerUnfreezeCommand.shellWithAmFallback(GMS_PACKAGE, sticky, backend)
         )
         if (secondarySupported) {
-            commands +=
-                "am unfreeze ${stickyArg}${GMS_PACKAGE}.persistent --user 0"
+            commands += ActivityManagerUnfreezeCommand.shellWithAmFallback(
+                "$GMS_PACKAGE.persistent",
+                sticky,
+                backend
+            )
         }
         val shellCommand = commands.joinToString(
             separator = " & ",
@@ -1936,11 +2421,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             val secondarySupported = synchronized(lock) {
                 supportsSecondaryProcessUnfreeze
             }
+            val backend = synchronized(lock) {
+                if (supportsDirectActivityUnfreeze) {
+                    ActivityManagerUnfreezeCommand.Backend.CMD_ACTIVITY
+                } else {
+                    ActivityManagerUnfreezeCommand.Backend.AM
+                }
+            }
 
             // 广播发送前先确保 main 和 persistent 都处于解冻状态。
             runGmsFastThawPass(
                 sticky = sticky,
                 secondarySupported = secondarySupported,
+                backend = backend,
                 timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
             )
 
@@ -1975,6 +2468,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     runGmsFastThawPass(
                         sticky = sticky,
                         secondarySupported = secondarySupported,
+                        backend = backend,
                         timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
                     )
                 }
@@ -2317,7 +2811,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             var directAttempted = false
             var directAccepted = false
             val shouldTryDirect = FreezeRecoveryClassifier.shouldTryDirectCgroup(
-                enabled = config.rootCgroupThaw,
+                enabled = canDirectCgroupThawLocked(),
                 hasControlFile = before.controlFile != null,
                 beforeFrozen = before.frozen,
                 afterActivityManagerFrozen = afterActivityManager.frozen,
@@ -2842,6 +3336,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun isGmsFastLaneTargetedLocked(): Boolean =
+        GMS_PACKAGE in config.packageTargets ||
+            config.processTargets.any { processName ->
+                processName == GMS_PACKAGE ||
+                    processName == "$GMS_PACKAGE.persistent" ||
+                    processName.startsWith("$GMS_PACKAGE:")
+            }
+
     private fun processTargetsForPackage(packageName: String): List<String> {
         val configured = config.processTargets.filter { processName ->
             packageForProcess(processName) == packageName
@@ -2862,11 +3364,25 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     private fun stopEventWatcherLocked() {
+        eventWatcherRestartFuture?.cancel(false)
+        eventWatcherRestartFuture = null
+        eventFastLaneReadyTimeoutFuture?.cancel(false)
+        eventFastLaneReadyTimeoutFuture = null
         eventWatcherAlive = false
-        eventWatcherProcess?.destroy()
+        eventFastLaneReady = false
+        eventFastLaneBackend = "none"
+        eventFastLaneTimeoutSupported = false
+        eventFastLaneStickyConfigured = false
+        eventFastLaneTargetEnabled = false
+        eventWatcherMode = "none"
+        val process = eventWatcherProcess
         eventWatcherProcess = null
+        process?.destroy()
         eventWatcherThread?.interrupt()
         eventWatcherThread = null
+        eventFastLaneSignalElapsedBySequence.clear()
+        eventFastLaneProbeHandledSequences.clear()
+        eventFastLaneVerifiedSequences.clear()
     }
 
     private fun scheduleInitialCycleLocked() {
@@ -2957,10 +3473,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     amAccepted = result.success
                     actionCount += 1
                     commandDetail = result.summary()
-                    action = if (config.stickyUnfreeze && supportsStickyUnfreeze) {
-                        "am_unfreeze_sticky"
+                    val unfreezeBackend = if (supportsDirectActivityUnfreeze) {
+                        "cmd_activity"
                     } else {
-                        "am_unfreeze"
+                        "am"
+                    }
+                    action = if (config.stickyUnfreeze && supportsStickyUnfreeze) {
+                        "${unfreezeBackend}_unfreeze_sticky"
+                    } else {
+                        "${unfreezeBackend}_unfreeze"
                     }
                     if (!result.success) {
                         commandFailureCount += 1
@@ -2977,7 +3498,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
                 val afterActivityManager = if (amAttempted) readFreezeState(process.pid) else before
                 val shouldTryDirect = FreezeRecoveryClassifier.shouldTryDirectCgroup(
-                    enabled = config.rootCgroupThaw,
+                    enabled = canDirectCgroupThawLocked(),
                     hasControlFile = before.controlFile != null,
                     beforeFrozen = before.frozen,
                     afterActivityManagerFrozen = afterActivityManager.frozen,
@@ -4384,18 +4905,40 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         unfreezeProcessNameLocked(packageName)
 
     private fun unfreezeProcessNameLocked(processName: String): GuardianCommandResult {
-        val command = mutableListOf("am", "unfreeze")
-        if (config.stickyUnfreeze && supportsStickyUnfreeze) command += "--sticky"
-        command += processName
-        command += listOf("--user", "0")
-        return runner.run(command, timeoutMs = 8_000L)
+        val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
+        if (supportsDirectActivityUnfreeze) {
+            val direct = runner.run(
+                ActivityManagerUnfreezeCommand.build(
+                    processName = processName,
+                    sticky = sticky,
+                    backend = ActivityManagerUnfreezeCommand.Backend.CMD_ACTIVITY
+                ),
+                timeoutMs = 8_000L
+            )
+            if (direct.success) return direct
+            commandFailureCount += 1
+            eventLocked(
+                "direct_activity_unfreeze_fallback",
+                "process=$processName result=${direct.summary()}"
+            )
+        }
+        return runner.run(
+            ActivityManagerUnfreezeCommand.build(
+                processName = processName,
+                sticky = sticky,
+                backend = ActivityManagerUnfreezeCommand.Backend.AM
+            ),
+            timeoutMs = 8_000L
+        )
     }
 
-    private fun isUnfreezeAccepted(result: GuardianCommandResult): Boolean =
-        result.success && (
+    private fun isUnfreezeAccepted(result: GuardianCommandResult): Boolean {
+        if (!result.success) return false
+        val directBackend = result.command.take(2) == listOf("cmd", "activity")
+        return directBackend ||
             result.stdout.contains("Unfreezing process", ignoreCase = true) ||
-                result.stdout.contains("already unfrozen", ignoreCase = true)
-            )
+            result.stdout.contains("already unfrozen", ignoreCase = true)
+    }
 
     private fun currentVendorFamilyLocked(): BackgroundPolicyVendorFamily {
         val cached = lastBackgroundPolicyReport.device.family
@@ -4509,8 +5052,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val id = runner.run("id")
         identity = id.stdout.ifBlank { "uid=${Process.myUid()} ${id.stderr}" }.take(300)
         val amHelp = runner.run("am", "help", timeoutMs = 10_000L)
+        val activityHelp = runner.run("cmd", "activity", "help", timeoutMs = 10_000L)
+        supportsDirectActivityUnfreeze = activityHelp.success &&
+            activityHelp.stdout.lineSequence().any { line ->
+                line.contains("unfreeze")
+            }
         supportsStickyUnfreeze = amHelp.stdout.contains("unfreeze [--sticky]") ||
-            amHelp.stdout.contains("unfreeze --sticky")
+            amHelp.stdout.contains("unfreeze --sticky") ||
+            activityHelp.stdout.contains("unfreeze [--sticky]") ||
+            activityHelp.stdout.contains("unfreeze --sticky")
         supportsStopApp = amHelp.stdout.lineSequence().any { line ->
             line.trimStart().startsWith("stop-app")
         }
@@ -4525,7 +5075,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         capabilityChecked = true
         eventLocked(
             "capabilities_checked",
-            "identity=$identity sticky=$supportsStickyUnfreeze stopApp=$supportsStopApp " +
+            "identity=$identity sticky=$supportsStickyUnfreeze " +
+                "directActivityUnfreeze=$supportsDirectActivityUnfreeze stopApp=$supportsStopApp " +
                 "packageUnstop=$supportsPackageUnstop hibernation=$supportsAppHibernation"
         )
     }
@@ -4556,7 +5107,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 val frozen = when (kind) {
                     "cgroup2.freeze" -> text.lineSequence().firstOrNull()?.trim() == "1"
                     "cgroup2.events" -> Regex("(?:^|\\n)frozen\\s+1(?:$|\\n)").containsMatchIn(text)
-                    "cgroup1.state" -> text.equals("FROZEN", ignoreCase = true)
+                    "cgroup1.state" ->
+                        text.equals("FROZEN", ignoreCase = true) ||
+                            text.equals("FREEZING", ignoreCase = true)
                     else -> false
                 }
                 return FreezeEvidence(frozen, "$kind:$text", file, kind)
@@ -4564,6 +5117,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         return FreezeEvidence(null, "freeze_control_not_visible", null, null)
     }
+
+    private fun canDirectCgroupThawLocked(): Boolean =
+        config.rootCgroupThaw && Process.myUid() == 0
 
     private fun directCgroupThaw(evidence: FreezeEvidence): Boolean? {
         val file = evidence.controlFile ?: return null
@@ -4640,11 +5196,40 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("diagnosticStatusPath", GuardianDiagnosticStore.STATUS_PATH)
         .put("diagnosticEventsPath", GuardianDiagnosticStore.EVENTS_PATH)
         .put("supportsStickyUnfreeze", supportsStickyUnfreeze)
+        .put("supportsDirectActivityUnfreeze", supportsDirectActivityUnfreeze)
         .put("supportsSecondaryProcessUnfreeze", supportsSecondaryProcessUnfreeze)
         .put("supportsStopApp", supportsStopApp)
         .put("supportsPackageUnstop", supportsPackageUnstop)
         .put("supportsAppHibernation", supportsAppHibernation)
         .put("eventWatcherAlive", eventWatcherAlive)
+        .put("eventWatcherMode", eventWatcherMode)
+        .put("gmsFreezerFastLane", JSONObject()
+            .put("ready", eventFastLaneReady)
+            .put("backend", eventFastLaneBackend)
+            .put("timeoutSupported", eventFastLaneTimeoutSupported)
+            .put("stickyConfigured", eventFastLaneStickyConfigured)
+            .put("targetEnabled", eventFastLaneTargetEnabled)
+            .put("startCount", eventFastLaneStartCount)
+            .put("failureCount", eventFastLaneFailureCount)
+            .put("signalCount", eventFastLaneSignalCount)
+            .put("immediateAttemptCount", eventFastLaneImmediateAttemptCount)
+            .put("immediateAcceptedCount", eventFastLaneImmediateAcceptedCount)
+            .put("immediateSkippedCount", eventFastLaneImmediateSkippedCount)
+            .put("shieldCompletionCount", eventFastLaneShieldCompletionCount)
+            .put("shieldCommandCount", eventFastLaneShieldCommandCount)
+            .put("shieldAcceptedCount", eventFastLaneShieldAcceptedCount)
+            .put("frozenPollCount", eventFastLaneFrozenPollCount)
+            .put("verifiedThawCount", eventFastLaneVerifiedThawCount)
+            .put("blindReassertCount", eventFastLaneBlindReassertCount)
+            .put("exhaustedCount", eventFastLaneExhaustedCount)
+            .put("lastEpisode", eventFastLaneLastEpisode)
+            .put("lastState", eventFastLaneLastState)
+            .put("lastSignalElapsed", eventFastLaneLastSignalElapsed)
+            .put("lastImmediateLatencyMs", eventFastLaneLastImmediateLatencyMs)
+            .put("maxImmediateLatencyMs", eventFastLaneMaxImmediateLatencyMs)
+            .put("postRecoveryCount", eventFastLanePostRecoveryCount)
+            .put("lastPostRecoveryElapsed", eventFastLaneLastPostRecoveryElapsed)
+        )
         .put("eventTriggerCount", eventTriggerCount)
         .put("vendorSignalCount", vendorSignalCount)
         .put("vendorDeliveryFailureCount", vendorDeliveryFailureCount)
@@ -4706,6 +5291,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         })
         .put("root", Process.myUid() == 0)
+        .put("rootCgroupThawConfigured", config.rootCgroupThaw)
+        .put("rootCgroupThawEffective", canDirectCgroupThawLocked())
         .put("gmsRecoveryEnabled", config.gmsRecoveryEnabled)
         .put("vendorEmergencyRecoveryEnabled", config.vendorEmergencyRecoveryEnabled)
         .put("gmsRecoveryInProgress", gmsRecoveryInProgress)
@@ -5114,8 +5701,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 16
+        private const val STATUS_SCHEMA = 17
         private const val GMS_PACKAGE = "com.google.android.gms"
+        private const val EVENT_WATCHER_RESTART_DELAY_MS = 1_000L
+        private const val FAST_LANE_READY_TIMEOUT_MS = 3_000L
+        private const val FAST_LANE_POST_RECOVERY_COOLDOWN_MS = 3_000L
+        private const val MAX_FAST_LANE_SEQUENCE_HISTORY = 128
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L
         private const val GMS_FORCE_STOP_TIMEOUT_MS = 10_000L
         private const val GMS_UNSTOP_TIMEOUT_MS = 8_000L

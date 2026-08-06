@@ -9,7 +9,8 @@ param(
     [string]$AdbPath = "adb",
     [string]$DeviceSerial = "",
     [string]$OutputRoot = "",
-    [switch]$RestoreGlobalFreezer
+    [switch]$RestoreGlobalFreezer,
+    [string]$RestoreStateFile = ""
 )
 
 Set-StrictMode -Version Latest
@@ -54,9 +55,33 @@ function Invoke-Adb([string[]]$Arguments) {
     Invoke-AdbHost (@("-s", $serial) + $Arguments)
 }
 
+function Get-AospFreezerOverride {
+    $result = Invoke-Adb @(
+        "shell", "device_config", "get",
+        "activity_manager_native_boot", "use_freezer"
+    )
+    $value = $result.Output.Trim()
+    if ($result.ExitCode -ne 0 -or -not $value -or $value -eq "null") {
+        return $null
+    }
+    return $value
+}
+
+function Get-DeviceBootId {
+    $result = Invoke-Adb @("shell", "cat", "/proc/sys/kernel/random/boot_id")
+    $value = $result.Output.Trim()
+    if ($result.ExitCode -ne 0 -or -not $value) {
+        throw "Unable to read device boot_id."
+    }
+    return $value
+}
+
 if (-not $OutputRoot) {
     $OutputRoot = Join-Path $PSScriptRoot "test-output"
 }
+New-Item -ItemType Directory -Path $OutputRoot -Force | Out-Null
+$safeSerial = $serial -replace '[^A-Za-z0-9_.-]', '_'
+$persistentFreezerStatePath = Join-Path $OutputRoot "global-freezer-state-$safeSerial.json"
 $stamp = Get-Date -Format "yyyyMMdd-HHmmss"
 $output = Join-Path $OutputRoot "iqoo-sticky-$($Mode.ToLowerInvariant())-$stamp"
 New-Item -ItemType Directory -Path $output -Force | Out-Null
@@ -68,13 +93,50 @@ $stickySupported =
     $help.Output -match "(?s)unfreeze.*--sticky|--sticky.*unfreeze"
 
 if ($RestoreGlobalFreezer) {
-    $restore = Invoke-Adb @(
-        "shell", "device_config", "delete",
-        "activity_manager_native_boot", "use_freezer"
-    )
-    $restore.Output |
-        Set-Content (Join-Path $output "global-freezer-restore.txt") -Encoding UTF8
-    Write-Host "Global AOSP freezer override removed; reboot before comparison."
+    $stateFile = $RestoreStateFile
+    if (-not $stateFile -and (Test-Path -LiteralPath $persistentFreezerStatePath -PathType Leaf)) {
+        $stateFile = $persistentFreezerStatePath
+    }
+    $priorValue = $null
+    if ($stateFile) {
+        if (-not (Test-Path -LiteralPath $stateFile -PathType Leaf)) {
+            throw "Restore state file not found: $stateFile"
+        }
+        $state = Get-Content -LiteralPath $stateFile -Raw | ConvertFrom-Json
+        if ($state.device -and $state.device -ne $serial) {
+            throw "Restore state belongs to $($state.device), not $serial."
+        }
+        if ($null -ne $state.priorOverride) {
+            $priorValue = [string]$state.priorOverride
+        }
+    } else {
+        throw "No freezer restore state found. Pass -RestoreStateFile explicitly."
+    }
+
+    if ($null -eq $priorValue -or -not $priorValue) {
+        $restore = Invoke-Adb @(
+            "shell", "device_config", "delete",
+            "activity_manager_native_boot", "use_freezer"
+        )
+        $restoreAction = "delete_override"
+    } else {
+        $restore = Invoke-Adb @(
+            "shell", "device_config", "put",
+            "activity_manager_native_boot", "use_freezer", $priorValue
+        )
+        $restoreAction = "restore_$priorValue"
+    }
+    $afterRestore = Get-AospFreezerOverride
+    [ordered]@{
+        device = $serial
+        action = $restoreAction
+        exitCode = $restore.ExitCode
+        output = $restore.Output
+        observedOverrideAfterRestoreCommand = $afterRestore
+        restoreStateFile = $stateFile
+    } | ConvertTo-Json -Depth 4 |
+        Set-Content (Join-Path $output "global-freezer-restore.json") -Encoding UTF8
+    Write-Host "AOSP freezer override restored ($restoreAction); reboot is required."
     exit $restore.ExitCode
 }
 
@@ -84,16 +146,78 @@ if ($Mode -eq "StickyUnfreeze" -and -not $stickySupported) {
 }
 
 if ($Mode -eq "GlobalFreezerOff") {
-    $global = Invoke-Adb @(
-        "shell", "device_config", "put",
-        "activity_manager_native_boot", "use_freezer", "false"
-    )
-    $global.Output |
-        Set-Content (Join-Path $output "global-freezer-off.txt") -Encoding UTF8
-    if ($global.ExitCode -ne 0) {
-        throw "Unable to set the AOSP freezer A/B flag."
+    $currentOverride = Get-AospFreezerOverride
+    $currentBootId = Get-DeviceBootId
+
+    if ($currentOverride -ne "false") {
+        $state = [ordered]@{
+            schema = 2
+            device = $serial
+            capturedAt = [DateTimeOffset]::UtcNow.ToString("o")
+            priorOverride = $currentOverride
+            bootIdBeforeDisable = $currentBootId
+            namespace = "activity_manager_native_boot"
+            key = "use_freezer"
+        }
+        $state | ConvertTo-Json -Depth 4 |
+            Set-Content $persistentFreezerStatePath -Encoding UTF8
+        $state | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $output "global-freezer-state-before.json") -Encoding UTF8
+
+        $global = Invoke-Adb @(
+            "shell", "device_config", "put",
+            "activity_manager_native_boot", "use_freezer", "false"
+        )
+        $global.Output |
+            Set-Content (Join-Path $output "global-freezer-off.txt") -Encoding UTF8
+        if ($global.ExitCode -ne 0) {
+            throw "Unable to set the AOSP freezer A/B flag."
+        }
+        $afterSet = Get-AospFreezerOverride
+        [ordered]@{
+            phase = "prepared"
+            requested = "false"
+            observedOverride = $afterSet
+            bootIdBeforeDisable = $currentBootId
+            restoreStateFile = $persistentFreezerStatePath
+            nextStep = "Reboot the device, then run the same GlobalFreezerOff command again."
+        } | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $output "global-freezer-off-verification.json") -Encoding UTF8
+        if ($afterSet -ne "false") {
+            throw "device_config did not retain use_freezer=false."
+        }
+        Write-Host "PREPARED: AOSP freezer flag is false. Reboot, then rerun the same command."
+        Write-Host "Restore later with: -RestoreGlobalFreezer -RestoreStateFile `"$persistentFreezerStatePath`""
+        exit 0
     }
-    Write-Host "AOSP freezer flag set to false; reboot is required before testing."
+
+    if (-not (Test-Path -LiteralPath $persistentFreezerStatePath -PathType Leaf)) {
+        throw "Global freezer is already false, but the saved pre-test state is missing: $persistentFreezerStatePath"
+    }
+    $savedState = Get-Content -LiteralPath $persistentFreezerStatePath -Raw | ConvertFrom-Json
+    if ($savedState.device -and $savedState.device -ne $serial) {
+        throw "Saved freezer state belongs to $($savedState.device), not $serial."
+    }
+    if ($savedState.bootIdBeforeDisable -eq $currentBootId) {
+        [ordered]@{
+            phase = "reboot_required"
+            currentOverride = $currentOverride
+            currentBootId = $currentBootId
+            bootIdBeforeDisable = $savedState.bootIdBeforeDisable
+        } | ConvertTo-Json -Depth 4 |
+            Set-Content (Join-Path $output "global-freezer-reboot-required.json") -Encoding UTF8
+        Write-Host "REBOOT_REQUIRED: the device has not rebooted since use_freezer=false was set."
+        exit 5
+    }
+    [ordered]@{
+        phase = "post_reboot_collection"
+        observedOverride = $currentOverride
+        currentBootId = $currentBootId
+        bootIdBeforeDisable = $savedState.bootIdBeforeDisable
+        restoreStateFile = $persistentFreezerStatePath
+    } | ConvertTo-Json -Depth 4 |
+        Set-Content (Join-Path $output "global-freezer-post-reboot.json") -Encoding UTF8
+    Write-Host "POST_REBOOT: collecting the GlobalFreezerOff comparison window."
 }
 
 $targetPattern =
@@ -134,7 +258,8 @@ do {
     Start-Sleep -Seconds $PollSeconds
 } while ((Get-Date) -lt $deadline)
 
-$actions | ConvertTo-Json -Depth 4 |
+$actionArray = @($actions)
+ConvertTo-Json -InputObject $actionArray -Depth 4 |
     Set-Content (Join-Path $output "sticky-actions.json") -Encoding UTF8
 (Invoke-Adb @("shell", "dumpsys", "activity")).Output |
     Set-Content (Join-Path $output "dumpsys-activity.txt") -Encoding UTF8
@@ -147,6 +272,9 @@ $actions | ConvertTo-Json -Depth 4 |
     stickySupported = $stickySupported
     durationSeconds = $DurationSeconds
     actionCount = $actions.Count
+    freezerOverride = Get-AospFreezerOverride
+    bootId = Get-DeviceBootId
+    restoreStateFile = if ($Mode -eq "GlobalFreezerOff") { $persistentFreezerStatePath } else { $null }
     warning = "Sticky unfreeze may not override vivo QuickFrozen, PEM, fast_freezer, or single-cleaner."
     comparison = @(
         "Baseline: original ADB configuration",

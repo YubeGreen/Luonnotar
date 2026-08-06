@@ -68,4 +68,24 @@ class GuardianEngineConfigTest {
             )
         )
     }
+    @Test
+    fun schemaSixDisablesLegacyRootCgroupWrite() {
+        val raw = JSONObject()
+            .put("schema", 6)
+            .put("rootCgroupThaw", true)
+            .toString()
+
+        assertFalse(GuardianEngineConfig.fromJson(raw).rootCgroupThaw)
+    }
+
+    @Test
+    fun schemaSevenCanExplicitlyEnableRootCgroupWrite() {
+        val raw = JSONObject()
+            .put("schema", 7)
+            .put("rootCgroupThaw", true)
+            .toString()
+
+        assertTrue(GuardianEngineConfig.fromJson(raw).rootCgroupThaw)
+    }
+
 }

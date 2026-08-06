@@ -198,3 +198,31 @@ Device Idle、CPU/Wi-Fi Lock、VPN handle 与 validated 状态。
 输出包括 `summary.md`、`whatsapp-outages.csv`、`push-deliveries.csv`、
 `backlog-releases.csv`、`missing-arrival-evidence.csv`、
 `cross-device-sequences.csv` 和 `experiment-events.csv`。
+
+## r256：AOSP freezer 与厂商 freezer 的隔离测试
+
+不要在写入 `activity_manager_native_boot/use_freezer=false` 后直接开始测试；该项需要重启后才进入有效比较窗口。
+
+```powershell
+# 1. 保存原始值并准备关闭 AOSP cached-app freezer
+.\test-iqoo-sticky-unfreeze.ps1 `
+  -Mode GlobalFreezerOff `
+  -DeviceSerial "100.111.89.64:5555"
+
+# 2. 重启手机
+adb -s "100.111.89.64:5555" reboot
+
+# 3. 手机重新连上 ADB 后，再执行同一命令开始采集
+.\test-iqoo-sticky-unfreeze.ps1 `
+  -Mode GlobalFreezerOff `
+  -DeviceSerial "100.111.89.64:5555"
+
+# 4. 结束后恢复原来的 override，并再次重启
+.\test-iqoo-sticky-unfreeze.ps1 `
+  -RestoreGlobalFreezer `
+  -DeviceSerial "100.111.89.64:5555"
+adb -s "100.111.89.64:5555" reboot
+```
+
+脚本用设备 `boot_id` 阻止“未重启就采集”，并把测试前的 override 按设备保存到
+`test-output/global-freezer-state-<serial>.json`。不要手工删除该文件，直到恢复完成。

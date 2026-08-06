@@ -30,6 +30,6 @@ class EmbeddedGuardianProtocolTest {
     }
 
     @Test fun engineRevisionMatches250Release() {
-        assertEquals(255, EmbeddedGuardianProtocol.ENGINE_REVISION)
+        assertEquals(256, EmbeddedGuardianProtocol.ENGINE_REVISION)
     }
 }
