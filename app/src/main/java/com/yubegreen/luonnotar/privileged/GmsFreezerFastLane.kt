@@ -165,7 +165,7 @@ internal object GmsFreezerFastLaneScript {
             shell_pid=${'$'}${'$'}
             base_root=${shellQuote(baseRootForParent)}
             base="${'$'}base_root-${'$'}shell_pid"
-            fifo="${'$'}base/logcat.fifo"
+            logcat_pid_file="${'$'}base/logcat.pid"
             lock_dir="${'$'}base/shield.lock"
             worker_pid_file="${'$'}base/worker.pid"
             lock_owner_file="${'$'}lock_dir/owner"
@@ -184,12 +184,12 @@ internal object GmsFreezerFastLaneScript {
             last_main_immediate_cs=0
             last_persistent_immediate_cs=0
             stopping=0
-            logcat_pid=""
             monitor_pid=""
+            pipeline_pid=""
 
             rm -rf "${'$'}base"
             mkdir -p "${'$'}base" || exit 70
-            rm -f "${'$'}fifo" "${'$'}worker_pid_file"
+            rm -f "${'$'}logcat_pid_file" "${'$'}worker_pid_file"
             rmdir "${'$'}lock_dir" >/dev/null 2>&1 || true
 
             read_uptime_cs() {
@@ -501,7 +501,14 @@ internal object GmsFreezerFastLaneScript {
 
             cleanup() {
                 stopping=1
-                [ -n "${'$'}logcat_pid" ] && kill "${'$'}logcat_pid" >/dev/null 2>&1 || true
+                if [ -r "${'$'}logcat_pid_file" ]; then
+                    IFS= read -r _logcat_pid < "${'$'}logcat_pid_file"
+                    case "${'$'}_logcat_pid" in
+                        ''|*[!0-9]*) ;;
+                        *) kill "${'$'}_logcat_pid" >/dev/null 2>&1 || true ;;
+                    esac
+                fi
+                [ -n "${'$'}pipeline_pid" ] && kill "${'$'}pipeline_pid" >/dev/null 2>&1 || true
                 if [ -r "${'$'}worker_pid_file" ]; then
                     IFS=' ' read -r _worker_token _worker_pid < "${'$'}worker_pid_file"
                     case "${'$'}_worker_pid" in ''|*[!0-9]*) ;; *) kill "${'$'}_worker_pid" >/dev/null 2>&1 || true ;; esac
@@ -517,28 +524,13 @@ internal object GmsFreezerFastLaneScript {
             monitor_pid=${'$'}!
             trap cleanup EXIT HUP INT TERM
 
-            if ! mkfifo "${'$'}fifo"; then
-                printf '__LUONNOTAR_FAST_LANE_DIAG__\ttype=mkfifo_failed\tdetail=base_unavailable\n'
+            if ! command -v logcat >/dev/null 2>&1; then
+                printf '__LUONNOTAR_FAST_LANE_DIAG__\ttype=logcat_missing\tdetail=command_unavailable\n'
                 exit 71
             fi
 
-            logcat -b events -b system -b main -v brief -T 1 \
-                'am_app_frozen:I' \
-                'BroadcastQueue:W' \
-                'BroadcastQueueModernImpl:W' \
-                'BroadcastQueueInjector:W' \
-                'PowerManagerServiceImpl:I' \
-                'PowerManagerService:I' \
-                'GCM:W' \
-                'AuthPII:E' \
-                'Linux:D' \
-                '*:S' > "${'$'}fifo" 2>&1 &
-            logcat_pid=${'$'}!
-
-            printf '__LUONNOTAR_FAST_LANE_READY__\tbackend=%s\tsticky=%s\ttimeout=%s\n' \
-                "${'$'}backend" "${'$'}sticky_enabled" 1
-
-            while IFS= read -r line; do
+            consume_logcat() {
+                while IFS= read -r line; do
                 case "${'$'}line" in
                     *am_app_frozen*com.google.android.gms.persistent*)
                         _signal_target="com.google.android.gms.persistent"
@@ -592,10 +584,37 @@ internal object GmsFreezerFastLaneScript {
                         "${'$'}_done" "${'$'}_duration"
                     ensure_worker
                 fi
-                printf '__LUONNOTAR_FAST_LANE_LOG__\t%s\n' "${'$'}line"
-            done < "${'$'}fifo"
+                    printf '__LUONNOTAR_FAST_LANE_LOG__\t%s\n' "${'$'}line"
+                done
+            }
 
-            printf '__LUONNOTAR_FAST_LANE_DIAG__\ttype=logcat_eof\tdetail=watcher_ended\n'
+            printf '__LUONNOTAR_FAST_LANE_READY__\tbackend=%s\tsticky=%s\ttimeout=%s\ttransport=pipe\n' \
+                "${'$'}backend" "${'$'}sticky_enabled" 1
+
+            /system/bin/sh -c '
+                _pid_file="${'$'}1"
+                shift
+                printf "%s\n" "${'$'}${'$'}" > "${'$'}_pid_file" || exit 73
+                exec "${'$'}@"
+            ' luonnotar-logcat "${'$'}logcat_pid_file" \
+                logcat -b events -b system -b main -v brief -T 1 \
+                'am_app_frozen:I' \
+                'BroadcastQueue:W' \
+                'BroadcastQueueModernImpl:W' \
+                'BroadcastQueueInjector:W' \
+                'PowerManagerServiceImpl:I' \
+                'PowerManagerService:I' \
+                'GCM:W' \
+                'AuthPII:E' \
+                'Linux:D' \
+                '*:S' 2>&1 | consume_logcat &
+            pipeline_pid=${'$'}!
+            wait "${'$'}pipeline_pid"
+            _pipeline_rc=${'$'}?
+            pipeline_pid=""
+
+            printf '__LUONNOTAR_FAST_LANE_DIAG__\ttype=logcat_eof\tdetail=watcher_ended_rc_%s\n' \
+                "${'$'}_pipeline_rc"
             exit 72
         """.trimIndent() + "\n"
     }

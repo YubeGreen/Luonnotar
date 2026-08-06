@@ -39,6 +39,16 @@ class GmsFreezerFastLaneScriptTest {
         assertTrue(script.contains("[ \"${'$'}_previous_soft\" -lt \"${'$'}_now\" ]"))
         assertTrue(script.contains("FROZEN|FREEZING"))
         assertTrue(script.contains("return 124"))
+        assertTrue(!script.contains("mkfifo"))
+        assertTrue(!script.contains("logcat.fifo"))
+        assertTrue(script.contains("transport=pipe"))
+        assertTrue(script.contains("2>&1 | consume_logcat &"))
+        assertTrue(script.contains("wait \"${'$'}pipeline_pid\""))
+        assertTrue(script.contains("logcat_pid_file"))
+        assertTrue(
+            script.windowed("__LUONNOTAR_FAST_LANE_FIRST__".length)
+                .count { it == "__LUONNOTAR_FAST_LANE_FIRST__" } == 1
+        )
     }
 
     @Test(expected = IllegalArgumentException::class)
