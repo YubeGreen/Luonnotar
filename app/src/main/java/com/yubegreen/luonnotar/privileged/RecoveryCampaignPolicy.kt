@@ -72,6 +72,11 @@ object RecoveryCampaignPolicy {
     // bounded cooldown bypass after this deadline. The caller is responsible
     // for allowing it only once per continuous transport-missing episode.
     const val GMS_VIVO_VERIFIED_OUTAGE_DEADLINE_MS = 30_000L
+    // r265: once a VIVO campaign has already performed a reset, neither a
+    // refreshed preconnection lease nor the vendor-defense recovery owner may
+    // postpone reset #2 forever while the successor keeps refreezing and MCS
+    // stays continuously absent. This deadline is per post-reset outage phase.
+    const val GMS_VIVO_IN_CAMPAIGN_OUTAGE_DEADLINE_MS = 30_000L
     const val GMS_VIVO_POST_SUCCESS_PROTECTION_MS = 120_000L
     const val GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS = 15_000L
     const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
@@ -203,6 +208,37 @@ object RecoveryCampaignPolicy {
         if (lastBypassedMissingEpisodeElapsed == transportMissingSinceElapsed) return false
         return nowElapsed - transportMissingSinceElapsed >=
             gmsVerifiedOutageDeadlineMs(postSuccessProtectionActive)
+    }
+
+    fun shouldOverrideGmsInCampaignRecoveryGuards(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        nowElapsed: Long,
+        resetCount: Int,
+        maxResetCount: Int,
+        lastResetElapsed: Long,
+        transportMissingSinceElapsed: Long,
+        transportHealthy: Boolean,
+        lastPostResetRefreezeElapsed: Long
+    ): Boolean {
+        if (vendorFamily != BackgroundPolicyVendorFamily.VIVO) return false
+        if (nowElapsed < 0L || transportHealthy) return false
+        if (resetCount <= 0 || resetCount >= maxResetCount.coerceAtLeast(0)) return false
+        if (lastResetElapsed <= 0L || lastResetElapsed > nowElapsed) return false
+        if (
+            transportMissingSinceElapsed <= 0L ||
+            transportMissingSinceElapsed > nowElapsed
+        ) {
+            return false
+        }
+        if (
+            lastPostResetRefreezeElapsed < lastResetElapsed ||
+            lastPostResetRefreezeElapsed > nowElapsed
+        ) {
+            return false
+        }
+        val deadline = GMS_VIVO_IN_CAMPAIGN_OUTAGE_DEADLINE_MS
+        return nowElapsed - lastResetElapsed >= deadline &&
+            nowElapsed - transportMissingSinceElapsed >= deadline
     }
 
     fun decideGmsForceStop(

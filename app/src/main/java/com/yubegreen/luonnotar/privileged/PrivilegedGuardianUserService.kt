@@ -4861,15 +4861,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun maybeStartVerifiedGmsCampaignLocked() {
         if (gmsRecoveryInProgress || !config.vendorEmergencyRecoveryEnabled) return
-        if (vendorDefenseOwnsGmsRecoveryLocked()) {
-            vendorBridgeDefenseRecoverySuppressionCount += 1
-            eventLocked(
-                "gms_recovery_suppressed_vendor_defense_owner",
-                "source=verified_outage seq=$vendorBridgeDefenseOwnershipSequence " +
-                    "phase=$vendorBridgeDefenseOwnershipPhase"
-            )
-            return
-        }
         if (!lastGmsTransportProbe.observable || lastGmsTransportProbe.healthy) return
         if (gmsTransportConsecutiveMissing < 3) return
         val gmsProcesses = listGmsProcessesLocked()
@@ -4896,21 +4887,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     ): String {
         val now = SystemClock.elapsedRealtime()
         pruneGmsStateLocked(now)
-        if (!manual && vendorDefenseOwnsGmsRecoveryLocked(now)) {
-            vendorBridgeDefenseRecoverySuppressionCount += 1
-            eventLocked(
-                "gms_recovery_suppressed_vendor_defense_owner",
-                "source=$trigger seq=$vendorBridgeDefenseOwnershipSequence " +
-                    "phase=$vendorBridgeDefenseOwnershipPhase"
-            )
-            lastGmsRecoveryOutcome = GmsRecoveryOutcome(
-                trigger = trigger,
-                result = "suppressed:vendor_defense_owner",
-                startedElapsed = now,
-                completedElapsed = now
-            )
-            return statusJsonLocked()
-        }
         if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) {
             eventLocked("gms_recovery_rejected", "already_in_progress")
             return statusJsonLocked()
@@ -4948,6 +4924,34 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             vendorFamily = vendorFamily,
             strongEvidence = strongEvidence
         )
+        val vendorDefenseOwnsRecovery = vendorDefenseOwnsGmsRecoveryLocked(now)
+        val vendorDefenseOwnerDeadlineOverride =
+            !manual &&
+                vendorFamily == BackgroundPolicyVendorFamily.VIVO &&
+                strongEvidence &&
+                verifiedOutageDeadlineReached
+        if (vendorDefenseOwnsRecovery && !vendorDefenseOwnerDeadlineOverride) {
+            vendorBridgeDefenseRecoverySuppressionCount += 1
+            eventLocked(
+                "gms_recovery_suppressed_vendor_defense_owner",
+                "source=$trigger seq=$vendorBridgeDefenseOwnershipSequence " +
+                    "phase=$vendorBridgeDefenseOwnershipPhase"
+            )
+            lastGmsRecoveryOutcome = GmsRecoveryOutcome(
+                trigger = trigger,
+                result = "suppressed:vendor_defense_owner",
+                startedElapsed = now,
+                completedElapsed = now
+            )
+            return statusJsonLocked()
+        } else if (vendorDefenseOwnsRecovery && vendorDefenseOwnerDeadlineOverride) {
+            eventLocked(
+                "gms_recovery_vendor_defense_owner_overridden_verified_outage",
+                "source=$trigger seq=$vendorBridgeDefenseOwnershipSequence " +
+                    "phase=$vendorBridgeDefenseOwnershipPhase outageAgeMs=$outageAgeMs " +
+                    "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)}"
+            )
+        }
         val campaignDecision = RecoveryCampaignPolicy.decideGmsCampaign(
             nowElapsed = now,
             lastCampaignCompletedElapsed = lastGmsRecoveryCompletedElapsed,
@@ -5106,6 +5110,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (newlyFrozen.isNotEmpty()) {
             gmsRecoverySuccessorRefreezeCount += newlyFrozen.size
             campaign.refreezeCount += newlyFrozen.size
+            campaign.lastRefreezeElapsed = now
             eventLocked(
                 "gms_recovery_successor_refrozen",
                 "generation=$generation pids=${newlyFrozen.sorted()} resetCount=${campaign.resetCount}"
@@ -5134,6 +5139,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             persistentRunning = processesAfter.any { it.name == "$GMS_PACKAGE.persistent" },
             source = "campaign"
         )
+        if (campaign.resetCount > 0) {
+            if (probe.healthy) {
+                campaign.postResetTransportMissingSinceElapsed = 0L
+                campaign.inCampaignOutageDeadlineReportedForResetCount = -1
+            } else if (
+                campaign.postResetTransportMissingSinceElapsed <= 0L ||
+                campaign.postResetTransportMissingSinceElapsed > now
+            ) {
+                campaign.postResetTransportMissingSinceElapsed = now
+            }
+        } else {
+            campaign.postResetTransportMissingSinceElapsed = 0L
+        }
 
         if (!anyFrozen && probe.healthy) {
             if (campaign.stabilizationStartedElapsed <= 0L) {
@@ -5285,18 +5303,36 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         }
         val hardResetRequested = campaign.hardResetRequested
+        val vendorFamily = currentVendorFamilyLocked()
+        val maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(vendorFamily)
+        val inCampaignOutageDeadlineReached =
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = vendorFamily,
+                nowElapsed = now,
+                resetCount = campaign.resetCount,
+                maxResetCount = maxResetCount,
+                lastResetElapsed = campaign.lastResetElapsed,
+                transportMissingSinceElapsed =
+                    campaign.postResetTransportMissingSinceElapsed,
+                transportHealthy = probe.healthy,
+                lastPostResetRefreezeElapsed = campaign.lastRefreezeElapsed
+            )
         val stabilizationGraceActive =
             !hardResetRequested &&
                 !flappingEscalation &&
+                !inCampaignOutageDeadlineReached &&
                 campaign.stabilizationGraceDeadlineElapsed > now
 
-        val vendorFamily = currentVendorFamilyLocked()
         val resetEligible =
             if (hardResetRequested) {
                 now >= campaign.nextResetEligibleElapsed
             } else {
                 !campaign.anchorOnlyAfterForceStopGate &&
-                    (now >= campaign.nextResetEligibleElapsed || flappingEscalation)
+                    (
+                        now >= campaign.nextResetEligibleElapsed ||
+                            flappingEscalation ||
+                            inCampaignOutageDeadlineReached
+                    )
             }
         val resetPolicyAllows =
             hardResetRequested ||
@@ -5306,12 +5342,32 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     resetCount = campaign.resetCount,
                     anyGmsFrozen = anyFrozen,
                     transportHealthy = probe.healthy,
-                    maxResetCount = RecoveryCampaignPolicy.gmsMaxResetsPerCampaign(
-                        vendorFamily
-                    )
+                    maxResetCount = maxResetCount
                 )
         val vendorDefenseOwnsRecovery = vendorDefenseOwnsGmsRecoveryLocked(now)
-        if (vendorDefenseOwnsRecovery && !probe.healthy) {
+        if (
+            inCampaignOutageDeadlineReached &&
+            campaign.inCampaignOutageDeadlineReportedForResetCount != campaign.resetCount
+        ) {
+            campaign.inCampaignOutageDeadlineReportedForResetCount = campaign.resetCount
+            val outageAgeMs =
+                (now - campaign.postResetTransportMissingSinceElapsed).coerceAtLeast(0L)
+            val resetAgeMs = (now - campaign.lastResetElapsed).coerceAtLeast(0L)
+            val refreezeAgeMs = (now - campaign.lastRefreezeElapsed).coerceAtLeast(0L)
+            eventLocked(
+                "gms_recovery_in_campaign_outage_deadline_reached",
+                "generation=$generation reset=${campaign.resetCount} " +
+                    "outageAgeMs=$outageAgeMs resetAgeMs=$resetAgeMs " +
+                    "refreezeAgeMs=$refreezeAgeMs owner=$vendorDefenseOwnsRecovery " +
+                    "phase=$vendorBridgeDefenseOwnershipPhase " +
+                    "nextResetEligibleElapsed=${campaign.nextResetEligibleElapsed}"
+            )
+        }
+        if (
+            vendorDefenseOwnsRecovery &&
+            !probe.healthy &&
+            !inCampaignOutageDeadlineReached
+        ) {
             if (campaign.resetWaitReportedForCount != Int.MIN_VALUE) {
                 campaign.resetWaitReportedForCount = Int.MIN_VALUE
                 vendorBridgeDefenseRecoverySuppressionCount += 1
@@ -5327,6 +5383,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             resetEligible &&
             resetPolicyAllows
         ) {
+            if (vendorDefenseOwnsRecovery && inCampaignOutageDeadlineReached) {
+                eventLocked(
+                    "gms_recovery_reset_vendor_defense_owner_overridden_outage_deadline",
+                    "generation=$generation reset=${campaign.resetCount} " +
+                        "seq=$vendorBridgeDefenseOwnershipSequence " +
+                        "phase=$vendorBridgeDefenseOwnershipPhase"
+                )
+            }
             resetGmsPackageLocked(campaign, processesAfter, frozenAfter, probe)
         } else if (stabilizationGraceActive) {
             eventLocked(
@@ -5463,6 +5527,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         campaign.stabilizationGraceDeadlineElapsed = 0L
         campaign.flappingEscalationReported = false
         campaign.anchorOnlyAfterForceStopGate = false
+        campaign.postResetTransportMissingSinceElapsed = 0L
+        campaign.inCampaignOutageDeadlineReportedForResetCount = -1
         gmsFastThawAwaitingReconnectSinceElapsed = 0L
         gmsRecoveryResetCount += 1
         val oldPids = currentProcesses.mapTo(linkedSetOf()) { it.pid }
@@ -6868,6 +6934,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var hardResetRequested: Boolean = false,
         var hardResetReason: String = "",
         var hardResetRequestedElapsed: Long = 0L,
+        var postResetTransportMissingSinceElapsed: Long = 0L,
+        var lastRefreezeElapsed: Long = 0L,
+        var inCampaignOutageDeadlineReportedForResetCount: Int = -1,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -6903,6 +6972,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("hardResetRequested", hardResetRequested)
             .put("hardResetReason", hardResetReason)
             .put("hardResetRequestedElapsed", hardResetRequestedElapsed)
+            .put("postResetTransportMissingSinceElapsed", postResetTransportMissingSinceElapsed)
+            .put("lastRefreezeElapsed", lastRefreezeElapsed)
+            .put(
+                "inCampaignOutageDeadlineReportedForResetCount",
+                inCampaignOutageDeadlineReportedForResetCount
+            )
     }
 
     private data class GuardianProcessState(
@@ -7004,7 +7079,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 23
+        private const val STATUS_SCHEMA = 24
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

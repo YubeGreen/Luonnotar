@@ -448,6 +448,83 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
+    fun vivoInCampaignOutageDeadlineOverridesOnlyAfterResetAndPostResetRefreeze() {
+        val base = 100_000L
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = base + 29_999L,
+                resetCount = 1,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base + 5_000L
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = base + 30_000L,
+                resetCount = 1,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base + 5_000L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = base + 60_000L,
+                resetCount = 1,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base + 40_000L,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base + 45_000L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = base + 60_000L,
+                resetCount = 1,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base - 1L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = base + 60_000L,
+                resetCount = 2,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base + 5_000L
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldOverrideGmsInCampaignRecoveryGuards(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                nowElapsed = base + 60_000L,
+                resetCount = 1,
+                maxResetCount = 2,
+                lastResetElapsed = base,
+                transportMissingSinceElapsed = base,
+                transportHealthy = false,
+                lastPostResetRefreezeElapsed = base + 5_000L
+            )
+        )
+    }
+
+    @Test
     fun vivoGmsForceStopIsDelayedAndBudgeted() {
         assertEquals(
             2,
