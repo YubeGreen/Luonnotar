@@ -83,6 +83,18 @@ object RecoveryCampaignPolicy {
     // evidence from the same continuously missing-MCS episode.
     const val GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS = 20_000L
     const val GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_MIN_EVENTS = 2
+    // r267: the outer verified-outage deadline is an actual wake-up point, not
+    // merely a predicate that waits for the next ordinary 15-30s engine cycle.
+    // After the exact deadline, bounded 5s rechecks may actively sample MCS
+    // transport while waiting for the second recent fast_freezer edge.
+    const val GMS_VIVO_VERIFIED_OUTAGE_RECHECK_INTERVAL_MS = 5_000L
+    const val GMS_VIVO_VERIFIED_OUTAGE_RECHECK_MAX_ATTEMPTS = 6
+    // r267: when reset #2 is specifically blocked by the global force-stop
+    // minimum interval, preserve that safety boundary and continue the same
+    // destructive action at the exact eligibility time. The continuation does
+    // not create extra reset or force-stop budget; it is reset #2 delayed.
+    const val GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_INTERVAL_MS = 5_000L
+    const val GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_MAX_ATTEMPTS = 12
     const val GMS_VIVO_POST_SUCCESS_PROTECTION_MS = 120_000L
     const val GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS = 15_000L
     const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
@@ -296,6 +308,49 @@ object RecoveryCampaignPolicy {
         }
         return GmsForceStopDecision(true, "force_stop_budget_available")
     }
+
+    /**
+     * Returns the exact elapsed-realtime instant at which the next global GMS
+     * force-stop may be attempted, or null when the 24h destructive budget is
+     * already exhausted / the clock is invalid.
+     */
+    fun gmsNextForceStopEligibleElapsed(
+        nowElapsed: Long,
+        forceStopHistory: List<Long>
+    ): Long? {
+        if (nowElapsed < 0L) return null
+        val cutoff = (nowElapsed - DAY_MS).coerceAtLeast(0L)
+        val recent = forceStopHistory.filter { it in cutoff..nowElapsed }
+        if (recent.size >= GMS_FORCE_STOP_MAX_PER_24_HOURS) return null
+        val last = recent.maxOrNull() ?: 0L
+        if (last <= 0L) return nowElapsed
+        return maxOf(nowElapsed, last + GMS_FORCE_STOP_MIN_INTERVAL_MS)
+    }
+
+    /**
+     * Revalidates the evidence immediately before a deferred destructive reset.
+     * The continuation may cross several ordinary engine cycles, so its original
+     * freezer observation is never trusted indefinitely.
+     */
+    fun verifiedVivoDeferredForceStopEvidence(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        transportObservable: Boolean,
+        transportHealthy: Boolean,
+        consecutiveMissing: Int,
+        currentPidsPresent: Boolean,
+        frozenNow: Boolean,
+        recentFastFreezerEventCount: Int
+    ): Boolean =
+        vendorFamily == BackgroundPolicyVendorFamily.VIVO &&
+            transportObservable &&
+            !transportHealthy &&
+            consecutiveMissing >= 3 &&
+            currentPidsPresent &&
+            (
+                frozenNow ||
+                    recentFastFreezerEventCount >=
+                    GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_MIN_EVENTS
+            )
 
     fun gmsMaxResetsPerCampaign(
         vendorFamily: BackgroundPolicyVendorFamily

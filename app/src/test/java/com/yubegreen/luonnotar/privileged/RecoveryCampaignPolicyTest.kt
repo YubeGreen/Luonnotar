@@ -2,6 +2,7 @@ package com.yubegreen.luonnotar.privileged
 
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -1037,5 +1038,115 @@ class RecoveryCampaignPolicyTest {
             )
         )
     }
+
+    @Test
+    fun nextForceStopEligibilityPreservesGlobalIntervalAndDailyBudget() {
+        val now = 2_000_000L
+        assertEquals(
+            now,
+            RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+                nowElapsed = now,
+                forceStopHistory = emptyList()
+            )
+        )
+
+        val last = now - 120_000L
+        assertEquals(
+            last + RecoveryCampaignPolicy.GMS_FORCE_STOP_MIN_INTERVAL_MS,
+            RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+                nowElapsed = now,
+                forceStopHistory = listOf(last)
+            )
+        )
+
+        val oldEnough = now - RecoveryCampaignPolicy.GMS_FORCE_STOP_MIN_INTERVAL_MS - 1L
+        assertEquals(
+            now,
+            RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+                nowElapsed = now,
+                forceStopHistory = listOf(oldEnough)
+            )
+        )
+
+        val sixRecent = (0 until RecoveryCampaignPolicy.GMS_FORCE_STOP_MAX_PER_24_HOURS)
+            .map { index -> now - index * 60_000L }
+        assertNull(
+            RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+                nowElapsed = now,
+                forceStopHistory = sixRecent
+            )
+        )
+    }
+
+    @Test
+    fun r267DeadlineAndContinuationVerificationAreBounded() {
+        assertEquals(5_000L, RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_INTERVAL_MS)
+        assertEquals(6, RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_MAX_ATTEMPTS)
+        assertEquals(5_000L, RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_INTERVAL_MS)
+        assertEquals(12, RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_MAX_ATTEMPTS)
+        assertEquals(10 * 60_000L, RecoveryCampaignPolicy.GMS_FORCE_STOP_MIN_INTERVAL_MS)
+        assertEquals(6, RecoveryCampaignPolicy.GMS_FORCE_STOP_MAX_PER_24_HOURS)
+    }
+
+
+    @Test
+    fun deferredForceStopRequiresFreshVivoOutageEvidence() {
+        assertTrue(
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 3,
+                currentPidsPresent = true,
+                frozenNow = true,
+                recentFastFreezerEventCount = 0
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 5,
+                currentPidsPresent = true,
+                frozenNow = false,
+                recentFastFreezerEventCount = 2
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                transportObservable = true,
+                transportHealthy = true,
+                consecutiveMissing = 5,
+                currentPidsPresent = true,
+                frozenNow = true,
+                recentFastFreezerEventCount = 2
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 2,
+                currentPidsPresent = true,
+                frozenNow = true,
+                recentFastFreezerEventCount = 2
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 5,
+                currentPidsPresent = true,
+                frozenNow = true,
+                recentFastFreezerEventCount = 2
+            )
+        )
+    }
+
 
 }

@@ -235,6 +235,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsTransportMissingEpisodePids: Set<Int> = emptySet()
     private var gmsRecentFreezerEvidenceLatchCount = 0L
     private var gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed = 0L
+    private var gmsVerifiedOutageDeadlineFuture: ScheduledFuture<*>? = null
+    private var gmsVerifiedOutageDeadlineEpisodeElapsed = 0L
+    private var gmsVerifiedOutageDeadlineRecheckAttempt = 0
+    private var gmsVerifiedOutageDeadlineRecheckCount = 0L
+    private var gmsVerifiedOutageDeadlineRecheckExhaustedCount = 0L
+    private var gmsDeferredForceStopContinuation: GmsDeferredForceStopContinuation? = null
+    private var gmsDeferredForceStopFuture: ScheduledFuture<*>? = null
+    private var gmsDeferredForceStopScheduledCount = 0L
+    private var gmsDeferredForceStopStartedCount = 0L
+    private var gmsDeferredForceStopCancelledCount = 0L
     private val gmsRecoveryHistory = ArrayDeque<Long>()
     private val gmsForceStopHistory = ArrayDeque<Long>()
     private var gmsRecoveryInProgress = false
@@ -452,6 +462,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         cancelPackageSuccessorGuardsLocked("engine_stopped")
         cancelDeliveryProtectionLeasesLocked("engine_stopped")
         cancelGmsRecoveryCampaignLocked("engine_stopped")
+        cancelGmsVerifiedOutageDeadlineRecheckLocked("engine_stopped")
+        cancelGmsDeferredForceStopContinuationLocked("engine_stopped")
         stopVendorBridgeLocked()
         stopEventWatcherLocked()
         eventLocked("engine_stopped", "requested_by_client")
@@ -470,6 +482,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             cancelPackageSuccessorGuardsLocked("engine_destroyed")
             cancelDeliveryProtectionLeasesLocked("engine_destroyed")
             cancelGmsRecoveryCampaignLocked("engine_destroyed")
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("engine_destroyed")
+            cancelGmsDeferredForceStopContinuationLocked("engine_destroyed")
             stopVendorBridgeLocked()
             stopEventWatcherLocked()
             executor.shutdownNow()
@@ -4681,6 +4695,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         maybeProbeGmsTransportLocked(now)
         maybeStartVerifiedGmsCampaignLocked()
+        ensureGmsVerifiedOutageDeadlineRecheckLocked(SystemClock.elapsedRealtime())
 
         cycleCount += 1
         lastCycleElapsed = SystemClock.elapsedRealtime()
@@ -4773,12 +4788,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         lastGmsTransportProbeElapsed = now
         gmsTransportProbeCount += 1
         if (!probe.observable) {
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("transport_unobservable")
+            cancelGmsDeferredForceStopContinuationLocked("transport_unobservable")
             gmsTransportUnobservableCount += 1
             gmsTransportConsecutiveMissing = 0
             gmsTransportMissingSinceElapsed = 0L
             gmsTransportMissingEpisodePids = emptySet()
             gmsVivoFastFreezerEvents.clear()
         } else if (probe.healthy) {
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("transport_healthy")
+            cancelGmsDeferredForceStopContinuationLocked("transport_healthy")
             gmsTransportHealthyCount += 1
             lastGmsTransportHealthyElapsed = now
             gmsTransportConsecutiveMissing = 0
@@ -4864,6 +4883,428 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
         )
 
+    private fun cancelGmsVerifiedOutageDeadlineRecheckLocked(reason: String) {
+        val hadFuture = gmsVerifiedOutageDeadlineFuture != null
+        val episode = gmsVerifiedOutageDeadlineEpisodeElapsed
+        gmsVerifiedOutageDeadlineFuture?.cancel(false)
+        gmsVerifiedOutageDeadlineFuture = null
+        gmsVerifiedOutageDeadlineEpisodeElapsed = 0L
+        gmsVerifiedOutageDeadlineRecheckAttempt = 0
+        if (hadFuture && episode > 0L) {
+            eventLocked(
+                "gms_verified_outage_deadline_recheck_cancelled",
+                "missingSince=$episode reason=$reason"
+            )
+        }
+    }
+
+    private fun ensureGmsVerifiedOutageDeadlineRecheckLocked(
+        nowElapsed: Long = SystemClock.elapsedRealtime()
+    ) {
+        if (
+            !running ||
+            gmsRecoveryInProgress ||
+            gmsRecoveryCampaign != null ||
+            gmsDeferredForceStopContinuation != null ||
+            currentVendorFamilyLocked() != BackgroundPolicyVendorFamily.VIVO ||
+            !lastGmsTransportProbe.observable ||
+            lastGmsTransportProbe.healthy ||
+            gmsTransportMissingSinceElapsed <= 0L ||
+            gmsCooldownBypassMissingEpisodeElapsed == gmsTransportMissingSinceElapsed
+        ) {
+            return
+        }
+        val episode = gmsTransportMissingSinceElapsed
+        if (
+            gmsVerifiedOutageDeadlineEpisodeElapsed == episode &&
+            gmsVerifiedOutageDeadlineRecheckAttempt >=
+                RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_MAX_ATTEMPTS
+        ) {
+            return
+        }
+        if (
+            gmsVerifiedOutageDeadlineFuture != null &&
+            gmsVerifiedOutageDeadlineEpisodeElapsed == episode
+        ) {
+            return
+        }
+        if (gmsVerifiedOutageDeadlineEpisodeElapsed != episode) {
+            gmsVerifiedOutageDeadlineRecheckAttempt = 0
+        }
+        val targetElapsed = episode + gmsVerifiedOutageDeadlineLocked(nowElapsed)
+        scheduleGmsVerifiedOutageDeadlineRecheckLocked(
+            episode = episode,
+            targetElapsed = targetElapsed,
+            attempt = gmsVerifiedOutageDeadlineRecheckAttempt
+        )
+    }
+
+    private fun scheduleGmsVerifiedOutageDeadlineRecheckLocked(
+        episode: Long,
+        targetElapsed: Long,
+        attempt: Int
+    ) {
+        gmsVerifiedOutageDeadlineFuture?.cancel(false)
+        gmsVerifiedOutageDeadlineEpisodeElapsed = episode
+        gmsVerifiedOutageDeadlineRecheckAttempt = attempt
+        val now = SystemClock.elapsedRealtime()
+        val delayMs = (targetElapsed - now).coerceAtLeast(0L)
+        gmsVerifiedOutageDeadlineFuture = executor.schedule(
+            {
+                synchronized(lock) {
+                    runGmsVerifiedOutageDeadlineRecheckLocked(episode, attempt)
+                }
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+        if (attempt == 0) {
+            eventLocked(
+                "gms_verified_outage_deadline_recheck_scheduled",
+                "missingSince=$episode targetElapsed=$targetElapsed delayMs=$delayMs " +
+                    "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)}"
+            )
+        }
+    }
+
+    private fun runGmsVerifiedOutageDeadlineRecheckLocked(
+        episode: Long,
+        attempt: Int
+    ) {
+        if (
+            gmsVerifiedOutageDeadlineEpisodeElapsed != episode ||
+            gmsTransportMissingSinceElapsed != episode ||
+            gmsRecoveryInProgress ||
+            gmsRecoveryCampaign != null ||
+            gmsDeferredForceStopContinuation != null ||
+            !running
+        ) {
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("stale_or_recovery_active")
+            return
+        }
+        gmsVerifiedOutageDeadlineFuture = null
+        val now = SystemClock.elapsedRealtime()
+        val probe = probeGmsTransportLocked()
+        val persistentRunning = listGmsProcessesLocked().any { process ->
+            process.name == "$GMS_PACKAGE.persistent"
+        }
+        applyGmsTransportProbeLocked(
+            probe = probe,
+            now = now,
+            persistentRunning = persistentRunning,
+            source = "outage_deadline"
+        )
+        gmsVerifiedOutageDeadlineRecheckCount += 1
+        if (
+            gmsTransportMissingSinceElapsed != episode ||
+            !probe.observable ||
+            probe.healthy
+        ) {
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("transport_recovered_or_unobservable")
+            return
+        }
+
+        maybeStartVerifiedGmsCampaignLocked()
+        if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) {
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("campaign_started")
+            return
+        }
+
+        val nextAttempt = attempt + 1
+        if (nextAttempt >= RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_MAX_ATTEMPTS) {
+            gmsVerifiedOutageDeadlineRecheckExhaustedCount += 1
+            gmsVerifiedOutageDeadlineRecheckAttempt = nextAttempt
+            gmsVerifiedOutageDeadlineFuture = null
+            eventLocked(
+                "gms_verified_outage_deadline_recheck_exhausted",
+                "missingSince=$episode attempts=$nextAttempt missing=$gmsTransportConsecutiveMissing " +
+                    "ports=${lastGmsTransportProbe.establishedPorts.sorted()}"
+            )
+            return
+        }
+        scheduleGmsVerifiedOutageDeadlineRecheckLocked(
+            episode = episode,
+            targetElapsed = SystemClock.elapsedRealtime() +
+                RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_INTERVAL_MS,
+            attempt = nextAttempt
+        )
+    }
+
+    private fun cancelGmsDeferredForceStopContinuationLocked(reason: String) {
+        val pending = gmsDeferredForceStopContinuation
+        gmsDeferredForceStopFuture?.cancel(false)
+        gmsDeferredForceStopFuture = null
+        gmsDeferredForceStopContinuation = null
+        if (pending != null) {
+            gmsDeferredForceStopCancelledCount += 1
+            eventLocked(
+                "gms_recovery_deferred_force_stop_cancelled",
+                "originGeneration=${pending.originGeneration} missingSince=${pending.missingEpisodeElapsed} " +
+                    "reason=$reason"
+            )
+        }
+    }
+
+    private fun scheduleGmsDeferredForceStopContinuationLocked(
+        campaign: GmsRecoveryCampaign,
+        nowElapsed: Long,
+        blockReason: String
+    ): Boolean {
+        if (
+            currentVendorFamilyLocked() != BackgroundPolicyVendorFamily.VIVO ||
+            blockReason != "force_stop_min_interval" ||
+            gmsTransportMissingSinceElapsed <= 0L
+        ) {
+            return false
+        }
+        val eligibleElapsed = RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+            nowElapsed = nowElapsed,
+            forceStopHistory = gmsForceStopHistory.toList()
+        ) ?: return false
+        if (eligibleElapsed <= nowElapsed) return false
+
+        val episode = gmsTransportMissingSinceElapsed
+        val existing = gmsDeferredForceStopContinuation
+        if (
+            existing != null &&
+            existing.missingEpisodeElapsed == episode &&
+            existing.eligibleElapsed <= eligibleElapsed
+        ) {
+            campaign.deferredForceStopContinuationPending = true
+            return true
+        }
+
+        gmsDeferredForceStopFuture?.cancel(false)
+        val pending = GmsDeferredForceStopContinuation(
+            originGeneration = campaign.generation,
+            missingEpisodeElapsed = episode,
+            requestedElapsed = nowElapsed,
+            eligibleElapsed = eligibleElapsed,
+            reason = blockReason
+        )
+        gmsDeferredForceStopContinuation = pending
+        campaign.deferredForceStopContinuationPending = true
+        gmsDeferredForceStopScheduledCount += 1
+        val delayMs = (eligibleElapsed - nowElapsed).coerceAtLeast(0L)
+        gmsDeferredForceStopFuture = executor.schedule(
+            {
+                synchronized(lock) {
+                    runGmsDeferredForceStopContinuationLocked(
+                        originGeneration = pending.originGeneration,
+                        missingEpisodeElapsed = pending.missingEpisodeElapsed
+                    )
+                }
+            },
+            delayMs,
+            TimeUnit.MILLISECONDS
+        )
+        eventLocked(
+            "gms_recovery_deferred_force_stop_scheduled",
+            "originGeneration=${campaign.generation} reset=2 missingSince=$episode " +
+                "requestedElapsed=$nowElapsed eligibleElapsed=$eligibleElapsed waitMs=$delayMs " +
+                "forceStopHistory=${gmsForceStopHistory.size}"
+        )
+        return true
+    }
+
+    private fun rescheduleGmsDeferredForceStopContinuationLocked(
+        pending: GmsDeferredForceStopContinuation,
+        targetElapsed: Long
+    ) {
+        pending.eligibleElapsed = targetElapsed
+        val now = SystemClock.elapsedRealtime()
+        gmsDeferredForceStopFuture?.cancel(false)
+        gmsDeferredForceStopFuture = executor.schedule(
+            {
+                synchronized(lock) {
+                    runGmsDeferredForceStopContinuationLocked(
+                        originGeneration = pending.originGeneration,
+                        missingEpisodeElapsed = pending.missingEpisodeElapsed
+                    )
+                }
+            },
+            (targetElapsed - now).coerceAtLeast(0L),
+            TimeUnit.MILLISECONDS
+        )
+    }
+
+    private fun runGmsDeferredForceStopContinuationLocked(
+        originGeneration: Long,
+        missingEpisodeElapsed: Long
+    ) {
+        val pending = gmsDeferredForceStopContinuation ?: return
+        if (
+            pending.originGeneration != originGeneration ||
+            pending.missingEpisodeElapsed != missingEpisodeElapsed
+        ) {
+            return
+        }
+        gmsDeferredForceStopFuture = null
+        if (!running) {
+            cancelGmsDeferredForceStopContinuationLocked("engine_stopped")
+            return
+        }
+        if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) {
+            rescheduleGmsDeferredForceStopContinuationLocked(
+                pending,
+                SystemClock.elapsedRealtime() +
+                    RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_INTERVAL_MS
+            )
+            return
+        }
+        if (
+            currentVendorFamilyLocked() != BackgroundPolicyVendorFamily.VIVO ||
+            gmsTransportMissingSinceElapsed != missingEpisodeElapsed
+        ) {
+            cancelGmsDeferredForceStopContinuationLocked("missing_episode_changed")
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val probe = probeGmsTransportLocked()
+        val processes = listGmsProcessesLocked()
+        applyGmsTransportProbeLocked(
+            probe = probe,
+            now = now,
+            persistentRunning = processes.any { it.name == "$GMS_PACKAGE.persistent" },
+            source = "deferred_force_stop_gate"
+        )
+        if (
+            gmsTransportMissingSinceElapsed != missingEpisodeElapsed ||
+            !probe.observable ||
+            probe.healthy
+        ) {
+            cancelGmsDeferredForceStopContinuationLocked("transport_recovered_or_unobservable")
+            return
+        }
+
+        val forceStopDecision = RecoveryCampaignPolicy.decideGmsForceStop(
+            nowElapsed = now,
+            forceStopHistory = gmsForceStopHistory.toList()
+        )
+        if (!forceStopDecision.allowed) {
+            if (forceStopDecision.reason == "force_stop_min_interval") {
+                val nextEligible = RecoveryCampaignPolicy.gmsNextForceStopEligibleElapsed(
+                    nowElapsed = now,
+                    forceStopHistory = gmsForceStopHistory.toList()
+                )
+                if (nextEligible != null && nextEligible > now) {
+                    eventLocked(
+                        "gms_recovery_deferred_force_stop_retimed",
+                        "originGeneration=$originGeneration previousEligible=${pending.eligibleElapsed} " +
+                            "nextEligible=$nextEligible"
+                    )
+                    rescheduleGmsDeferredForceStopContinuationLocked(pending, nextEligible)
+                    return
+                }
+            }
+            cancelGmsDeferredForceStopContinuationLocked(forceStopDecision.reason)
+            return
+        }
+
+        val currentPids = processes.mapTo(linkedSetOf()) { it.pid }
+        val frozenNow = processes.any { readFreezeState(it.pid).frozen == true }
+        val recentCutoff = maxOf(
+            missingEpisodeElapsed,
+            now - RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS
+        )
+        val recentFastFreezerCount = gmsVivoFastFreezerEvents.count { it in recentCutoff..now }
+        val strongEvidence =
+            RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                vendorFamily = currentVendorFamilyLocked(),
+                transportObservable = probe.observable,
+                transportHealthy = probe.healthy,
+                consecutiveMissing = gmsTransportConsecutiveMissing,
+                currentPidsPresent = currentPids.isNotEmpty(),
+                frozenNow = frozenNow,
+                recentFastFreezerEventCount = recentFastFreezerCount
+            )
+        if (!strongEvidence) {
+            pending.verifyAttempt += 1
+            if (
+                pending.verifyAttempt >=
+                RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_MAX_ATTEMPTS
+            ) {
+                cancelGmsDeferredForceStopContinuationLocked("strong_evidence_expired")
+                return
+            }
+            eventLocked(
+                "gms_recovery_deferred_force_stop_verification_wait",
+                "originGeneration=$originGeneration attempt=${pending.verifyAttempt} " +
+                    "frozenNow=$frozenNow recentFastFreezer=$recentFastFreezerCount " +
+                    "missing=$gmsTransportConsecutiveMissing ports=${probe.establishedPorts.sorted()}"
+            )
+            rescheduleGmsDeferredForceStopContinuationLocked(
+                pending,
+                now + RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_INTERVAL_MS
+            )
+            return
+        }
+
+        startGmsDeferredForceStopContinuationCampaignLocked(
+            pending = pending,
+            nowElapsed = now,
+            currentPids = currentPids,
+            frozenNow = frozenNow,
+            recentFastFreezerCount = recentFastFreezerCount
+        )
+    }
+
+    private fun startGmsDeferredForceStopContinuationCampaignLocked(
+        pending: GmsDeferredForceStopContinuation,
+        nowElapsed: Long,
+        currentPids: Set<Int>,
+        frozenNow: Boolean,
+        recentFastFreezerCount: Int
+    ) {
+        gmsDeferredForceStopFuture?.cancel(false)
+        gmsDeferredForceStopFuture = null
+        gmsDeferredForceStopContinuation = null
+        cancelGmsVerifiedOutageDeadlineRecheckLocked("deferred_force_stop_starting")
+
+        val generation = gmsRecoveryGeneration + 1L
+        gmsRecoveryGeneration = generation
+        val campaign = GmsRecoveryCampaign(
+            trigger = "deferred_force_stop_gate_continuation",
+            manual = false,
+            generation = generation,
+            startedElapsed = nowElapsed,
+            deadlineElapsed = nowElapsed + RecoveryCampaignPolicy.GMS_CAMPAIGN_DURATION_MS,
+            initialPids = currentPids,
+            lastObservedPids = currentPids,
+            resetCount = 1,
+            nextResetEligibleElapsed = nowElapsed,
+            hardResetRequested = true,
+            hardResetReason = "deferred_force_stop_gate_continuation",
+            hardResetRequestedElapsed = pending.requestedElapsed,
+            deferredForceStopContinuation = true,
+            continuationOriginGeneration = pending.originGeneration
+        )
+        gmsRecoveryCampaign = campaign
+        gmsRecoveryInProgress = true
+        gmsRecoveryAttemptCount += 1
+        lastGmsRecoveryElapsed = nowElapsed
+        gmsDeferredForceStopStartedCount += 1
+        eventLocked(
+            "gms_recovery_deferred_force_stop_started",
+            "originGeneration=${pending.originGeneration} generation=$generation " +
+                "waitedMs=${(nowElapsed - pending.requestedElapsed).coerceAtLeast(0L)} " +
+                "missingAgeMs=${(nowElapsed - pending.missingEpisodeElapsed).coerceAtLeast(0L)} " +
+                "pids=${currentPids.sorted()} frozenNow=$frozenNow " +
+                "recentFastFreezer=$recentFastFreezerCount"
+        )
+        ensureGmsPreconnectionLeaseLocked(
+            campaign = campaign,
+            nowElapsed = nowElapsed,
+            reason = "deferred_force_stop_continuation_started",
+            force = true
+        )
+        scheduleGmsFastThaw(signalElapsed = nowElapsed)
+        probeGmsImportanceFenceLocked(nowElapsed, force = true)
+        persistStatusLocked(force = true)
+        scheduleGmsRecoveryCampaignTicksLocked(generation)
+    }
+
     private fun recentVivoFastFreezerEvidenceLocked(
         nowElapsed: Long,
         vendorFamily: BackgroundPolicyVendorFamily,
@@ -4925,7 +5366,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     private fun maybeStartVerifiedGmsCampaignLocked() {
-        if (gmsRecoveryInProgress || !config.vendorEmergencyRecoveryEnabled) return
+        if (
+            gmsRecoveryInProgress ||
+            gmsDeferredForceStopContinuation != null ||
+            !config.vendorEmergencyRecoveryEnabled
+        ) return
         if (!lastGmsTransportProbe.observable || lastGmsTransportProbe.healthy) return
         if (gmsTransportConsecutiveMissing < 3) return
         val now = SystemClock.elapsedRealtime()
@@ -4972,6 +5417,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         pruneGmsStateLocked(now)
         if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) {
             eventLocked("gms_recovery_rejected", "already_in_progress")
+            return statusJsonLocked()
+        }
+        if (!manual && gmsDeferredForceStopContinuation != null) {
+            val pending = gmsDeferredForceStopContinuation!!
+            eventLocked(
+                "gms_recovery_suppressed_deferred_force_stop_pending",
+                "source=$trigger originGeneration=${pending.originGeneration} " +
+                    "eligibleElapsed=${pending.eligibleElapsed} " +
+                    "missingSince=${pending.missingEpisodeElapsed}"
+            )
+            lastGmsRecoveryOutcome = GmsRecoveryOutcome(
+                trigger = trigger,
+                result = "suppressed:deferred_force_stop_pending",
+                startedElapsed = now,
+                completedElapsed = now
+            )
             return statusJsonLocked()
         }
         if (!packageInstalled(GMS_PACKAGE)) {
@@ -5125,6 +5586,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         probeGmsImportanceFenceLocked(now, force = true)
         persistStatusLocked(force = true)
 
+        cancelGmsVerifiedOutageDeadlineRecheckLocked("campaign_started")
+        scheduleGmsRecoveryCampaignTicksLocked(generation)
+        return statusJsonLocked()
+    }
+
+    private fun scheduleGmsRecoveryCampaignTicksLocked(generation: Long) {
         gmsRecoveryCampaignFuture?.cancel(false)
         gmsRecoveryCampaignFuture = executor.scheduleWithFixedDelay(
             {
@@ -5147,7 +5614,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             RecoveryCampaignPolicy.GMS_CAMPAIGN_TICK_MS,
             TimeUnit.MILLISECONDS
         )
-        return statusJsonLocked()
     }
 
     private fun runGmsRecoveryCampaignTickLocked(generation: Long) {
@@ -5245,6 +5711,41 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         } else {
             campaign.postResetTransportMissingSinceElapsed = 0L
+        }
+
+        if (campaign.deferredForceStopContinuation) {
+            val deferredCurrentPids = processesAfter.mapTo(linkedSetOf()) { it.pid }
+            val recentCutoff = maxOf(
+                gmsTransportMissingSinceElapsed.takeIf { it > 0L } ?: now,
+                now - RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS
+            )
+            val recentFastFreezerCount =
+                gmsVivoFastFreezerEvents.count { it in recentCutoff..now }
+            val deferredEvidenceVerified =
+                RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+                    vendorFamily = currentVendorFamilyLocked(),
+                    transportObservable = probe.observable,
+                    transportHealthy = probe.healthy,
+                    consecutiveMissing = gmsTransportConsecutiveMissing,
+                    currentPidsPresent = deferredCurrentPids.isNotEmpty(),
+                    frozenNow = anyFrozen,
+                    recentFastFreezerEventCount = recentFastFreezerCount
+                )
+            if (!deferredEvidenceVerified) {
+                campaign.hardResetRequested = false
+                eventLocked(
+                    "gms_recovery_deferred_force_stop_revalidation_cancelled",
+                    "generation=$generation originGeneration=${campaign.continuationOriginGeneration} " +
+                        "observable=${probe.observable} healthy=${probe.healthy} " +
+                        "missing=$gmsTransportConsecutiveMissing frozenNow=$anyFrozen " +
+                        "recentFastFreezer=$recentFastFreezerCount pids=${deferredCurrentPids.sorted()}"
+                )
+                finishGmsRecoveryCampaignLocked(
+                    generation,
+                    "deferred_force_stop_revalidation_cancelled"
+                )
+                return
+            }
         }
 
         if (!anyFrozen && probe.healthy) {
@@ -5460,7 +5961,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (
             vendorDefenseOwnsRecovery &&
             !probe.healthy &&
-            !inCampaignOutageDeadlineReached
+            !inCampaignOutageDeadlineReached &&
+            !campaign.deferredForceStopContinuation
         ) {
             if (campaign.resetWaitReportedForCount != Int.MIN_VALUE) {
                 campaign.resetWaitReportedForCount = Int.MIN_VALUE
@@ -5477,7 +5979,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             resetEligible &&
             resetPolicyAllows
         ) {
-            if (vendorDefenseOwnsRecovery && inCampaignOutageDeadlineReached) {
+            if (vendorDefenseOwnsRecovery && campaign.deferredForceStopContinuation) {
+                eventLocked(
+                    "gms_recovery_reset_vendor_defense_owner_overridden_deferred_force_stop",
+                    "generation=$generation originGeneration=${campaign.continuationOriginGeneration} " +
+                        "seq=$vendorBridgeDefenseOwnershipSequence " +
+                        "phase=$vendorBridgeDefenseOwnershipPhase"
+                )
+            } else if (vendorDefenseOwnsRecovery && inCampaignOutageDeadlineReached) {
                 eventLocked(
                     "gms_recovery_reset_vendor_defense_owner_overridden_outage_deadline",
                     "generation=$generation reset=${campaign.resetCount} " +
@@ -5486,6 +5995,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 )
             }
             resetGmsPackageLocked(campaign, processesAfter, frozenAfter, probe)
+            if (campaign.deferredForceStopContinuationPending) {
+                finishGmsRecoveryCampaignLocked(generation, "deferred_force_stop_pending")
+                return
+            }
         } else if (stabilizationGraceActive) {
             eventLocked(
                 "gms_recovery_reset_deferred_stabilization_grace",
@@ -5592,6 +6105,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 forceStopAllowed = forceStopDecision.allowed
             )
         ) {
+            if (
+                forceStopDecision.reason == "force_stop_min_interval" &&
+                scheduleGmsDeferredForceStopContinuationLocked(
+                    campaign = campaign,
+                    nowElapsed = now,
+                    blockReason = forceStopDecision.reason
+                )
+            ) {
+                campaign.resetWaitReportedForCount = campaign.resetCount
+                eventLocked(
+                    "gms_recovery_reset_deferred_force_stop_gate_continuation_pending",
+                    "generation=${campaign.generation} nextReset=$nextResetCount " +
+                        "vendor=$vendorFamily reason=${forceStopDecision.reason} " +
+                        "ports=${transportProbe.establishedPorts.sorted()} " +
+                        "frozen=${frozenProcesses.map { "${it.name}:${it.pid}" }}"
+                )
+                return
+            }
+
+            // Daily destructive budget exhaustion (or an unexpected inability to
+            // schedule an exact min-interval continuation) keeps the old safe
+            // anchor-only behavior. Safety wins over delivery in this branch.
             campaign.nextResetEligibleElapsed = Long.MAX_VALUE
             campaign.resetWaitReportedForCount = campaign.resetCount
             campaign.anchorOnlyAfterForceStopGate = true
@@ -6096,6 +6631,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         gmsRecoveryCampaignFuture?.cancel(false)
         gmsRecoveryCampaignFuture = null
         val now = SystemClock.elapsedRealtime()
+        val deferredPendingResult = result == "deferred_force_stop_pending"
+        val deferredNeutralResult =
+            deferredPendingResult || result == "deferred_force_stop_revalidation_cancelled"
+        val deferredBeforeFinalProbe = gmsDeferredForceStopContinuation?.takeIf {
+            it.originGeneration == generation
+        }
         val finalProcesses = listGmsProcessesLocked()
         val finalPids = finalProcesses.map { it.pid }.sorted()
         val finalFrozen = finalProcesses.any { readFreezeState(it.pid).frozen == true }
@@ -6106,8 +6647,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             persistentRunning = finalProcesses.any { it.name == "$GMS_PACKAGE.persistent" },
             source = "campaign_final"
         )
-        val success = result == "stable_transport_verified" && !finalFrozen && finalProbe.healthy
-        lastGmsRecoveryCompletedElapsed = now
+        val deferredStillPending =
+            deferredPendingResult &&
+                gmsDeferredForceStopContinuation?.originGeneration == generation
+        val success =
+            result == "stable_transport_verified" && !finalFrozen && finalProbe.healthy
+
+        // A campaign that has reached reset #2 but is waiting for the global
+        // force-stop min-interval has not failed. Its destructive slot is
+        // preserved by the deferred continuation and must not create a new
+        // adaptive cooldown dead zone.
+        if (!deferredNeutralResult) {
+            lastGmsRecoveryCompletedElapsed = now
+        }
         if (success) {
             gmsRecoverySuccessCount += 1
             gmsTransportVerifiedRecoveryCount += 1
@@ -6121,19 +6673,30 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "generation=$generation untilElapsed=$gmsPostSuccessProtectionUntilElapsed " +
                     "durationMs=${RecoveryCampaignPolicy.GMS_VIVO_POST_SUCCESS_PROTECTION_MS}"
             )
-        } else {
+        } else if (!deferredNeutralResult) {
             errorCount += 1
             gmsConsecutiveCampaignFailures =
                 (gmsConsecutiveCampaignFailures + 1).coerceAtMost(1000)
         }
+
         gmsRecoveryInProgress = false
         gmsRecoveryCampaign = null
         if (campaign.manual) {
-            gmsManualRecoveryState = if (success) "completed_success" else "completed_failure:$result"
+            gmsManualRecoveryState =
+                if (success) "completed_success" else "completed_failure:$result"
+        }
+
+        val outcomeResult = when {
+            success -> "campaign_transport_verified"
+            deferredPendingResult && finalProbe.healthy ->
+                "deferred_force_stop_cancelled_transport_recovered"
+            deferredPendingResult && !finalProbe.observable ->
+                "deferred_force_stop_cancelled_transport_unobservable"
+            else -> result
         }
         lastGmsRecoveryOutcome = GmsRecoveryOutcome(
             trigger = campaign.trigger,
-            result = if (success) "campaign_transport_verified" else result,
+            result = outcomeResult,
             oldPids = campaign.initialPids.toList().sorted(),
             newPids = finalPids,
             commandDetail = campaign.commandDetails.flatten().joinToString(" | ").take(2_000),
@@ -6142,14 +6705,34 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             startedElapsed = campaign.startedElapsed,
             completedElapsed = now
         )
+        val deferredEligibleElapsed =
+            gmsDeferredForceStopContinuation?.eligibleElapsed
+                ?: deferredBeforeFinalProbe?.eligibleElapsed
+                ?: 0L
+        val nextRetryMs = if (deferredNeutralResult) {
+            0L
+        } else {
+            RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(
+                gmsConsecutiveCampaignFailures
+            )
+        }
         eventLocked(
             "gms_recovery_campaign_finished",
             "generation=$generation result=${lastGmsRecoveryOutcome.result} success=$success " +
                 "resets=${campaign.resetCount} refreezes=${campaign.refreezeCount} " +
                 "finalPids=$finalPids frozen=$finalFrozen ports=${finalProbe.establishedPorts.sorted()} " +
-                "consecutiveFailures=$gmsConsecutiveCampaignFailures nextRetryMs=" +
-                RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(gmsConsecutiveCampaignFailures)
+                "deferredForceStopPending=$deferredStillPending " +
+                "deferredEligibleElapsed=$deferredEligibleElapsed " +
+                "consecutiveFailures=$gmsConsecutiveCampaignFailures nextRetryMs=$nextRetryMs"
         )
+
+        // If a neutral deferred result lost its pending action because the final
+        // probe recovered/unobserved transport, there is nothing to schedule.
+        // Otherwise the pending continuation owns this outage until its exact
+        // force-stop eligibility time.
+        if (!deferredStillPending) {
+            ensureGmsVerifiedOutageDeadlineRecheckLocked(now)
+        }
         persistStatusLocked(force = true)
     }
 
@@ -6775,6 +7358,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsRecentFreezerEvidenceLatchCount", gmsRecentFreezerEvidenceLatchCount)
         .put("gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed",
             gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed)
+        .put("gmsVerifiedOutageDeadlineRecheckCount", gmsVerifiedOutageDeadlineRecheckCount)
+        .put("gmsVerifiedOutageDeadlineRecheckExhaustedCount",
+            gmsVerifiedOutageDeadlineRecheckExhaustedCount)
+        .put("gmsVerifiedOutageDeadlineEpisodeElapsed",
+            gmsVerifiedOutageDeadlineEpisodeElapsed)
+        .put("gmsVerifiedOutageDeadlineRecheckAttempt",
+            gmsVerifiedOutageDeadlineRecheckAttempt)
+        .put("gmsDeferredForceStopScheduledCount", gmsDeferredForceStopScheduledCount)
+        .put("gmsDeferredForceStopStartedCount", gmsDeferredForceStopStartedCount)
+        .put("gmsDeferredForceStopCancelledCount", gmsDeferredForceStopCancelledCount)
+        .put("gmsDeferredForceStopContinuation",
+            gmsDeferredForceStopContinuation?.toJson() ?: JSONObject.NULL)
         .put("gmsRecoveryAttemptCount", gmsRecoveryAttemptCount)
         .put("gmsRecoverySuccessCount", gmsRecoverySuccessCount)
         .put("gmsRecoveryGeneration", gmsRecoveryGeneration)
@@ -7010,6 +7605,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("resetBudgetReported", resetBudgetReported)
     }
 
+    private data class GmsDeferredForceStopContinuation(
+        val originGeneration: Long,
+        val missingEpisodeElapsed: Long,
+        val requestedElapsed: Long,
+        var eligibleElapsed: Long,
+        val reason: String,
+        var verifyAttempt: Int = 0
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("originGeneration", originGeneration)
+            .put("missingEpisodeElapsed", missingEpisodeElapsed)
+            .put("requestedElapsed", requestedElapsed)
+            .put("eligibleElapsed", eligibleElapsed)
+            .put("reason", reason)
+            .put("verifyAttempt", verifyAttempt)
+    }
+
     private data class GmsRecoveryCampaign(
         val trigger: String,
         val manual: Boolean,
@@ -7046,6 +7658,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var postResetTransportMissingSinceElapsed: Long = 0L,
         var lastRefreezeElapsed: Long = 0L,
         var inCampaignOutageDeadlineReportedForResetCount: Int = -1,
+        var deferredForceStopContinuationPending: Boolean = false,
+        var deferredForceStopContinuation: Boolean = false,
+        var continuationOriginGeneration: Long = 0L,
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -7087,6 +7702,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "inCampaignOutageDeadlineReportedForResetCount",
                 inCampaignOutageDeadlineReportedForResetCount
             )
+            .put("deferredForceStopContinuationPending", deferredForceStopContinuationPending)
+            .put("deferredForceStopContinuation", deferredForceStopContinuation)
+            .put("continuationOriginGeneration", continuationOriginGeneration)
     }
 
     private data class GuardianProcessState(
@@ -7188,7 +7806,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 25
+        private const val STATUS_SCHEMA = 26
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
