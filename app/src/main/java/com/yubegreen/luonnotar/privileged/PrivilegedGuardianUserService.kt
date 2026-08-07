@@ -1293,6 +1293,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 vendorBridgeLastTarget = record.target
                 vendorBridgeLastPid = record.pid
                 vendorBridgeLastState = "frozen"
+                if (
+                    record.target == GMS_PACKAGE ||
+                    record.target == "$GMS_PACKAGE.persistent"
+                ) {
+                    vendorBridgeDefenseOwnershipSequence = record.sequence
+                    vendorBridgeDefenseOwnershipPhase = "pending"
+                    vendorBridgeDefenseOwnershipUntilElapsed =
+                        SystemClock.elapsedRealtime() + VENDOR_DEFENSE_PENDING_OWNER_TTL_MS
+                }
                 eventLocked(
                     "vendor_cgroup_frozen",
                     "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
@@ -1339,9 +1348,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     when (record.phase) {
                         "stable", "expired" -> {
                             if (vendorBridgeDefenseOwnershipSequence == record.sequence) {
-                                vendorBridgeDefenseOwnershipUntilElapsed = 0L
-                                vendorBridgeDefenseOwnershipPhase = record.phase
+                                clearVendorDefenseRecoveryOwnershipLocked(record.phase)
                             }
+                        }
+                        "escalating" -> {
+                            // Keep only a sub-second handoff lease. The VendorLock
+                            // callback runs after this and is then allowed to start
+                            // exactly one bounded recovery campaign.
+                            vendorBridgeDefenseOwnershipSequence = record.sequence
+                            vendorBridgeDefenseOwnershipPhase = record.phase
+                            vendorBridgeDefenseOwnershipUntilElapsed =
+                                nowElapsed + VENDOR_DEFENSE_ESCALATION_HANDOFF_MS
                         }
                         "stable_hold" -> {
                             vendorBridgeDefenseOwnershipSequence = record.sequence
@@ -4250,6 +4267,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 {
                     synchronized(lock) {
                         if (!running || !vendorBridgeOwnsGmsCommandsLocked()) return@synchronized
+                        if (
+                            sequence != vendorBridgeDefenseLastSequence ||
+                            vendorBridgeDefenseLastPhase !in setOf("escalating", "expired")
+                        ) {
+                            eventLocked(
+                                "vendor_bridge_lock_escalation_stale",
+                                "seq=$sequence currentSeq=$vendorBridgeDefenseLastSequence " +
+                                    "phase=$vendorBridgeDefenseLastPhase"
+                            )
+                            return@synchronized
+                        }
                         val frozen = listGmsProcessesLocked().filter {
                             readFreezeState(it.pid).frozen == true
                         }
@@ -4784,20 +4812,27 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
     }
 
+    private fun clearVendorDefenseRecoveryOwnershipLocked(reason: String) {
+        if (vendorBridgeDefenseOwnershipSequence > 0L) {
+            eventLocked(
+                "vendor_defense_recovery_owner_released",
+                "seq=$vendorBridgeDefenseOwnershipSequence phase=$vendorBridgeDefenseOwnershipPhase reason=$reason"
+            )
+        }
+        vendorBridgeDefenseOwnershipSequence = 0L
+        vendorBridgeDefenseOwnershipUntilElapsed = 0L
+        vendorBridgeDefenseOwnershipPhase = reason
+    }
+
     private fun vendorDefenseOwnsGmsRecoveryLocked(
         nowElapsed: Long = SystemClock.elapsedRealtime()
     ): Boolean {
-        val explicitOwner =
-            vendorBridgeReady &&
-                vendorBridgeDefenseOwnershipSequence > 0L &&
-                vendorBridgeDefenseOwnershipUntilElapsed > nowElapsed
-        if (explicitOwner) return true
-        // Close the small race between the event watcher seeing VIVO's
-        // am_app_frozen line and the bridge emitting its `defense started` record.
-        val lastFreeze = gmsFreezeEvents.lastOrNull() ?: return false
-        return vendorBridgeOwnsGmsCommandsLocked() &&
-            nowElapsed >= lastFreeze &&
-            nowElapsed - lastFreeze <= VENDOR_DEFENSE_OWNER_SIGNAL_GRACE_MS
+        if (!vendorBridgeReady || vendorBridgeDefenseOwnershipSequence <= 0L) return false
+        if (vendorBridgeDefenseOwnershipUntilElapsed <= nowElapsed) {
+            clearVendorDefenseRecoveryOwnershipLocked("ttl_expired")
+            return false
+        }
+        return true
     }
 
     private fun maybeStartVerifiedGmsCampaignLocked() {
@@ -6903,7 +6938,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 21
+        private const val STATUS_SCHEMA = 22
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
@@ -6913,9 +6948,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val VENDOR_BRIDGE_READY_TIMEOUT_MS = 3_000L
         private const val VENDOR_BRIDGE_STALE_HEARTBEAT_MS = 30_000L
         private const val VENDOR_BRIDGE_LOCK_ESCALATION_DELAY_MS = 750L
-        private const val VENDOR_DEFENSE_OWNER_ACTIVE_TTL_MS = 30_000L
+        private const val VENDOR_DEFENSE_OWNER_ACTIVE_TTL_MS = 45_000L
         private const val VENDOR_DEFENSE_OWNER_GRACE_MS = 5_000L
-        private const val VENDOR_DEFENSE_OWNER_SIGNAL_GRACE_MS = 15_000L
+        private const val VENDOR_DEFENSE_PENDING_OWNER_TTL_MS = 2_000L
+        private const val VENDOR_DEFENSE_ESCALATION_HANDOFF_MS = 500L
         private const val DELEGATED_UNFREEZE_LOG_INTERVAL_MS = 5_000L
         private const val LEGACY_GUARDIAN_PID_PATH = "/data/local/tmp/luonnotar2/guardian.pid"
         private const val LEGACY_GUARDIAN_AUDIT_INTERVAL_MS = 60_000L

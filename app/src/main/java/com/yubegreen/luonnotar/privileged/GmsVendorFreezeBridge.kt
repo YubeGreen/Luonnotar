@@ -198,7 +198,7 @@ internal data class GmsVendorDefenseReconnectPlan(
 )
 
 internal object GmsVendorDefensePolicy {
-    const val STRATEGY = "atomic_group_defense_episode"
+    const val STRATEGY = "atomic_group_defense_edge_budget"
     const val PULSE_REQUIRED_CENTISECONDS = 1_200L
     const val STABLE_REQUIRED_CENTISECONDS = 1_200L
     const val NO_THAW_ESCALATION_CENTISECONDS = 3_000L
@@ -207,10 +207,11 @@ internal object GmsVendorDefensePolicy {
     const val HARD_LIMIT_CENTISECONDS = 60_000L
     const val POST_ESCALATION_GRACE_CENTISECONDS = 500L
     const val RETRY_HOLD_CENTISECONDS = 3_000L
-    // A 250 ms retry cadence amplified one real OriginOS refreeze episode into
-    // dozens of framework commands. 2.5 s is still comfortably below the
-    // observed 5-7 s OEM refreeze cadence while keeping the command owner quiet.
-    const val ACTION_INTERVAL_CENTISECONDS = 250L
+    // r263: defense commands are event-driven. One physical freeze edge may
+    // spend at most four framework commands (two GMS peers across at most two
+    // release phases), and the whole PID generation may never spend more than 12.
+    const val MAX_EPISODE_COMMANDS = 12
+    const val MAX_EDGE_COMMANDS = 4
 
     const val PULSE_REQUIRED_MILLISECONDS = PULSE_REQUIRED_CENTISECONDS * 10L
     const val STABLE_REQUIRED_MILLISECONDS = STABLE_REQUIRED_CENTISECONDS * 10L
@@ -301,7 +302,11 @@ gms_defense_started_cs=0
 gms_defense_hard_deadline_cs=0
 gms_defense_stable_since_cs=0
 gms_defense_last_thawed_cs=0
-gms_defense_last_action_cs=0
+gms_defense_action_armed=0
+gms_defense_budget_exhausted=0
+gms_defense_edge_budget_exhausted=0
+gms_defense_edge_commands=0
+defense_budget_enforced=0
 gms_defense_pulse_sent=0
 gms_defense_stable_hold_announced=0
 gms_defense_escalated=0
@@ -325,7 +330,8 @@ gms_defense_escalation_required_cs=${GmsVendorDefensePolicy.SUSTAINED_REFREEZE_E
 gms_defense_hard_limit_cs=${GmsVendorDefensePolicy.HARD_LIMIT_CENTISECONDS}
 gms_defense_post_escalation_grace_cs=${GmsVendorDefensePolicy.POST_ESCALATION_GRACE_CENTISECONDS}
 gms_defense_hold_until_cs=0
-gms_defense_action_interval_cs=${GmsVendorDefensePolicy.ACTION_INTERVAL_CENTISECONDS}
+gms_defense_command_budget=${GmsVendorDefensePolicy.MAX_EPISODE_COMMANDS}
+gms_defense_edge_command_budget=${GmsVendorDefensePolicy.MAX_EDGE_COMMANDS}
 framework_freezer_unsupported=0
 framework_freezer_unsupported_reported=0
 whatsapp_pid=0
@@ -654,6 +660,25 @@ aggregate_rc() {
 }
 
 
+reserve_defense_command() {
+    if [ "${'$'}defense_budget_enforced" -ne 1 ]; then
+        return 0
+    fi
+    if [ "${'$'}gms_defense_commands" -ge "${'$'}gms_defense_command_budget" ]; then
+        gms_defense_budget_exhausted=1
+        return 1
+    fi
+    if [ "${'$'}gms_defense_edge_commands" -ge "${'$'}gms_defense_edge_command_budget" ]; then
+        gms_defense_edge_budget_exhausted=1
+        return 1
+    fi
+    # Count at reservation time, not after a nested helper returns. This is the
+    # single source of truth for the episode-wide hard budget.
+    gms_defense_commands=${'$'}((gms_defense_commands + 1))
+    gms_defense_edge_commands=${'$'}((gms_defense_edge_commands + 1))
+    return 0
+}
+
 run_parallel_pair() {
     require_command_owner
     _pair_mode="${'$'}1"
@@ -669,8 +694,23 @@ run_parallel_pair() {
         return 70
     }
     _main_job=""; _persistent_job=""
-    [ -n "${'$'}_pair_main_arg" ] && recovery_command_count=${'$'}((recovery_command_count + 1))
-    [ -n "${'$'}_pair_persistent_arg" ] && recovery_command_count=${'$'}((recovery_command_count + 1))
+    _main_budget_denied=0; _persistent_budget_denied=0
+    if [ -n "${'$'}_pair_main_arg" ]; then
+        if reserve_defense_command; then
+            recovery_command_count=${'$'}((recovery_command_count + 1))
+        else
+            _pair_main_arg=""
+            _main_budget_denied=1
+        fi
+    fi
+    if [ -n "${'$'}_pair_persistent_arg" ]; then
+        if reserve_defense_command; then
+            recovery_command_count=${'$'}((recovery_command_count + 1))
+        else
+            _pair_persistent_arg=""
+            _persistent_budget_denied=1
+        fi
+    fi
     if [ -n "${'$'}_pair_main_arg" ]; then
         (
             case "${'$'}_pair_mode" in
@@ -684,7 +724,11 @@ run_parallel_pair() {
         _main_job=${'$'}!
     else
         printf '125\n' > "${'$'}_pair_dir/main.rc"
-        printf 'not_requested\n' > "${'$'}_pair_dir/main.out"
+        if [ "${'$'}_main_budget_denied" -eq 1 ]; then
+            printf 'defense_command_budget_exhausted\n' > "${'$'}_pair_dir/main.out"
+        else
+            printf 'not_requested\n' > "${'$'}_pair_dir/main.out"
+        fi
     fi
     if [ -n "${'$'}_pair_persistent_arg" ]; then
         (
@@ -699,7 +743,11 @@ run_parallel_pair() {
         _persistent_job=${'$'}!
     else
         printf '125\n' > "${'$'}_pair_dir/persistent.rc"
-        printf 'not_requested\n' > "${'$'}_pair_dir/persistent.out"
+        if [ "${'$'}_persistent_budget_denied" -eq 1 ]; then
+            printf 'defense_command_budget_exhausted\n' > "${'$'}_pair_dir/persistent.out"
+        else
+            printf 'not_requested\n' > "${'$'}_pair_dir/persistent.out"
+        fi
     fi
     [ -n "${'$'}_main_job" ] && wait "${'$'}_main_job" >/dev/null 2>&1 || true
     [ -n "${'$'}_persistent_job" ] && wait "${'$'}_persistent_job" >/dev/null 2>&1 || true
@@ -983,7 +1031,11 @@ start_gms_defense() {
     gms_defense_hard_deadline_cs=${'$'}((NOW_CS + gms_defense_hard_limit_cs))
     gms_defense_stable_since_cs=0
     gms_defense_last_thawed_cs=0
-    gms_defense_last_action_cs=0
+    gms_defense_action_armed=1
+    gms_defense_budget_exhausted=0
+    gms_defense_edge_budget_exhausted=0
+    gms_defense_edge_commands=0
+    defense_budget_enforced=0
     gms_defense_pulse_sent=0
     gms_defense_stable_hold_announced=0
     gms_defense_escalated=0
@@ -999,7 +1051,7 @@ start_gms_defense() {
     gms_defense_adopt_observed=0
     gms_defense_last_main_pid="${'$'}main_pid"
     gms_defense_last_persistent_pid="${'$'}persistent_pid"
-    emit_gms_defense started "stableRequiredCs=${'$'}gms_defense_stable_required_cs,stableHoldCs=${'$'}gms_defense_stable_hold_cs,hardLimitCs=${'$'}gms_defense_hard_limit_cs"
+    emit_gms_defense started "stableRequiredCs=${'$'}gms_defense_stable_required_cs,stableHoldCs=${'$'}gms_defense_stable_hold_cs,commandBudget=${'$'}gms_defense_command_budget,edgeBudget=${'$'}gms_defense_edge_command_budget,hardLimitCs=${'$'}gms_defense_hard_limit_cs"
 }
 
 reset_gms_defense_for_pid_change() {
@@ -1020,7 +1072,11 @@ reset_gms_defense_for_pid_change() {
     gms_defense_last_persistent_pid="${'$'}persistent_pid"
     gms_defense_stable_since_cs=0
     gms_defense_last_thawed_cs=0
-    gms_defense_last_action_cs=0
+    gms_defense_action_armed=1
+    gms_defense_budget_exhausted=0
+    gms_defense_edge_budget_exhausted=0
+    gms_defense_edge_commands=0
+    defense_budget_enforced=0
     gms_defense_pulse_sent=0
     gms_defense_stable_hold_announced=0
     gms_defense_escalated=0
@@ -1035,6 +1091,17 @@ reset_gms_defense_for_pid_change() {
 defense_release_gms_group() {
     _def_consecutive="${'$'}1"
     recovery_command_count=0
+    gms_defense_edge_commands=0
+    gms_defense_edge_budget_exhausted=0
+    defense_budget_enforced=1
+    if [ "${'$'}gms_defense_commands" -ge "${'$'}gms_defense_command_budget" ]; then
+        gms_defense_budget_exhausted=1
+        gms_defense_last_mode="defense_budget_exhausted"
+        gms_defense_last_detail="commandBudget=${'$'}gms_defense_command_budget"
+        defense_budget_enforced=0
+        return 75
+    fi
+
     gms_defense_attempts=${'$'}((gms_defense_attempts + 1))
     if [ "${'$'}sticky_enabled" -eq 1 ]; then
         run_parallel_pair sticky "${'$'}main_pid" "${'$'}persistent_pid" "defense_sticky"
@@ -1049,29 +1116,31 @@ defense_release_gms_group() {
         gms_defense_last_mode="defense_release_pair"
         gms_defense_last_detail="mainRelease:${'$'}PAIR_MAIN_RC:${'$'}PAIR_MAIN_DETAIL,persistentRelease:${'$'}PAIR_PERSISTENT_RC:${'$'}PAIR_PERSISTENT_DETAIL"
     fi
-    _def_fast_commands="${'$'}recovery_command_count"
-    gms_defense_commands=${'$'}((gms_defense_commands + _def_fast_commands))
     sleep 0.12
     refresh_slot main "${'$'}main_target"; refresh_slot persistent "${'$'}persistent_target"
     if [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}main_state" = "thawed" ] && \
        [ "${'$'}persistent_pid" -gt 0 ] && [ "${'$'}persistent_state" = "thawed" ]; then
+        defense_budget_enforced=0
         return 0
     fi
 
-    # r262: a VIVO fast_freezer episode is already known to be an external
-    # physical cgroup freeze. Do not try to "adopt" it into AOSP CachedAppOptimizer:
-    # on this OriginOS build that path throws inside mFreezeHandler and, more
-    # importantly, one fallback attempt could fan out into dozens of commands.
-    # Perform one bounded plain release pair and verify physical cgroup state.
-    recovery_command_count=0
-    run_parallel_pair release "${'$'}main_pid" "${'$'}persistent_pid" "defense_release_retry"
-    aggregate_rc "${'$'}PAIR_MAIN_RC" "${'$'}PAIR_PERSISTENT_RC"
-    gms_defense_release_rc="${'$'}AGG_RC"
-    gms_defense_commands=${'$'}((gms_defense_commands + recovery_command_count))
-    gms_defense_last_mode="defense_bounded_release_retry"
-    gms_defense_last_detail="${'$'}{gms_defense_last_detail},boundedRelease:main=${'$'}PAIR_MAIN_RC:${'$'}PAIR_MAIN_DETAIL,persistent=${'$'}PAIR_PERSISTENT_RC:${'$'}PAIR_PERSISTENT_DETAIL"
-    sleep 0.18
-    refresh_slot main "${'$'}main_target"; refresh_slot persistent "${'$'}persistent_target"
+    # At most one second release phase on the same physical freeze edge. The
+    # edge budget prevents repeated release phases from multiplying this into a loop.
+    if [ "${'$'}gms_defense_budget_exhausted" -eq 0 ]; then
+        run_parallel_pair release "${'$'}main_pid" "${'$'}persistent_pid" "defense_release_retry"
+        aggregate_rc "${'$'}PAIR_MAIN_RC" "${'$'}PAIR_PERSISTENT_RC"
+        gms_defense_release_rc="${'$'}AGG_RC"
+        gms_defense_last_mode="defense_edge_release_retry"
+        gms_defense_last_detail="${'$'}{gms_defense_last_detail},edgeRelease:main=${'$'}PAIR_MAIN_RC:${'$'}PAIR_MAIN_DETAIL,persistent=${'$'}PAIR_PERSISTENT_RC:${'$'}PAIR_PERSISTENT_DETAIL"
+        sleep 0.18
+        refresh_slot main "${'$'}main_target"; refresh_slot persistent "${'$'}persistent_target"
+    fi
+    if ! { [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}main_state" = "thawed" ] && \
+           [ "${'$'}persistent_pid" -gt 0 ] && [ "${'$'}persistent_state" = "thawed" ]; } && \
+       [ "${'$'}gms_defense_commands" -ge "${'$'}gms_defense_command_budget" ]; then
+        gms_defense_budget_exhausted=1
+    fi
+    defense_budget_enforced=0
     [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}main_state" = "thawed" ] && \
        [ "${'$'}persistent_pid" -gt 0 ] && [ "${'$'}persistent_state" = "thawed" ]
 }
@@ -1109,8 +1178,8 @@ escalate_gms_defense() {
 fail_gms_defense() {
     _def_reason="${'$'}1"
     read_uptime_cs
-    emit_gms_defense "${'$'}_def_reason" "lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
     escalate_gms_defense "${'$'}_def_reason"
+    emit_gms_defense "${'$'}_def_reason" "lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
     gms_defense_active=0
     gms_defense_stable_since_cs=0
     gms_defense_hold_until_cs=${'$'}((NOW_CS + ${GmsVendorDefensePolicy.RETRY_HOLD_CENTISECONDS}))
@@ -1139,22 +1208,34 @@ tick_gms_defense() {
             gms_defense_refreezes=${'$'}((gms_defense_refreezes + 1))
             gms_defense_stable_since_cs=0
             gms_defense_stable_hold_announced=0
+            gms_defense_pulse_sent=0
+            gms_defense_action_armed=1
             emit_gms_defense refrozen "main=${'$'}main_pid/${'$'}main_state,persistent=${'$'}persistent_pid/${'$'}persistent_state"
         fi
-        if [ "${'$'}gms_defense_last_action_cs" -eq 0 ] || \
-           [ ${'$'}((NOW_CS - gms_defense_last_action_cs)) -ge "${'$'}gms_defense_action_interval_cs" ]; then
+        if [ "${'$'}gms_defense_action_armed" -eq 1 ]; then
+            gms_defense_action_armed=0
             defense_release_gms_group "${'$'}((gms_defense_refreezes + 1))" || true
             read_uptime_cs
-            gms_defense_last_action_cs="${'$'}NOW_CS"
             if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
                 gms_defense_stable_since_cs="${'$'}NOW_CS"
                 gms_defense_last_thawed_cs="${'$'}NOW_CS"
+                # Re-arm only after an observed physical thaw. A subsequent
+                # frozen sample is therefore a new freeze edge, not a timer retry.
+                gms_defense_action_armed=1
             fi
         fi
         read_uptime_cs
+        if [ "${'$'}gms_defense_budget_exhausted" -ne 0 ]; then
+            if [ "${'$'}gms_defense_budget_exhausted" -eq 1 ]; then
+                emit_gms_defense budget_exhausted "commandBudget=${'$'}gms_defense_command_budget,edgeBudget=${'$'}gms_defense_edge_command_budget,lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
+                gms_defense_budget_exhausted=2
+            fi
+            escalate_gms_defense command_budget_exhausted
+            return 0
+        fi
         _def_since_thaw="${'$'}gms_defense_started_cs"
         [ "${'$'}gms_defense_last_thawed_cs" -gt 0 ] && _def_since_thaw="${'$'}gms_defense_last_thawed_cs"
-        if [ "${'$'}gms_defense_attempts" -ge 3 ] && \
+        if [ "${'$'}gms_defense_attempts" -ge 1 ] && \
            [ ${'$'}((NOW_CS - _def_since_thaw)) -ge "${'$'}gms_defense_stuck_required_cs" ]; then
             escalate_gms_defense no_physical_thaw
         elif [ ${'$'}((NOW_CS - gms_defense_started_cs)) -ge "${'$'}gms_defense_escalation_required_cs" ]; then
@@ -1164,6 +1245,7 @@ tick_gms_defense() {
     fi
 
     if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
+        gms_defense_action_armed=1
         if [ "${'$'}gms_defense_stable_since_cs" -le 0 ]; then
             gms_defense_stable_since_cs="${'$'}NOW_CS"
         fi

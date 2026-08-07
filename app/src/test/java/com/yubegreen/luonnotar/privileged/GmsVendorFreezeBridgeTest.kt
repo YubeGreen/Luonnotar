@@ -14,14 +14,15 @@ class GmsVendorFreezeBridgeTest {
         assertEquals(12_000L, GmsVendorDefensePolicy.STABLE_REQUIRED_MILLISECONDS)
         assertEquals(12_000L, GmsVendorDefensePolicy.PULSE_REQUIRED_MILLISECONDS)
         assertEquals(120_000L, GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS)
-        assertEquals(250L, GmsVendorDefensePolicy.ACTION_INTERVAL_CENTISECONDS)
+        assertEquals(12, GmsVendorDefensePolicy.MAX_EPISODE_COMMANDS)
+        assertEquals(4, GmsVendorDefensePolicy.MAX_EDGE_COMMANDS)
     }
 
     @Test
     fun parsesReadyHeartbeatDefenseRecoveryAndLockRecords() {
         val ready = GmsVendorFreezeBridgeProtocol.parse(
             "__LUONNOTAR_VENDOR_BRIDGE_READY__\ttimeout=1\tsticky=1" +
-                "\tstrategy=atomic_group_defense_episode\tshellPid=77" +
+                "\tstrategy=atomic_group_defense_edge_budget\tshellPid=77" +
                 "\tparentStartTicks=1001\tshellStartTicks=1002" +
                 "\theartbeatPath=/data/local/tmp/hb\townerPath=/data/local/tmp/owner"
         ) as GmsVendorFreezeBridgeRecord.Ready
@@ -149,10 +150,15 @@ class GmsVendorFreezeBridgeTest {
         assertTrue(script.contains("defense_stable_group"))
         assertTrue(script.contains("gms_defense_stable_required_cs=1200"))
         assertTrue(script.contains("gms_defense_stable_hold_cs=12000"))
-        assertTrue(script.contains("gms_defense_action_interval_cs=250"))
+        assertTrue(script.contains("gms_defense_command_budget=12"))
+        assertTrue(script.contains("gms_defense_edge_command_budget=4"))
+        assertTrue(script.contains("reserve_defense_command"))
+        assertTrue(script.contains("gms_defense_action_armed=1"))
+        assertTrue(script.contains("defense_command_budget_exhausted"))
+        assertFalse(script.contains("gms_defense_last_action_cs"))
         assertTrue(script.contains("stable_hold"))
         assertTrue(script.contains("framework_freezer_unsupported"))
-        assertTrue(script.contains("defense_bounded_release_retry"))
+        assertTrue(script.contains("defense_edge_release_retry"))
         assertTrue(script.contains("run_parallel_pair release \"${'$'}main_pid\" \"${'$'}persistent_pid\" \"defense_release_retry\""))
         assertTrue(script.contains("gms_defense_escalation_required_cs=12000"))
         assertFalse(script.contains("gms_failures="))
