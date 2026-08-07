@@ -19,7 +19,7 @@ adb "${adb_args[@]}" shell chmod 600 "$remote"
 adb "${adb_args[@]}" shell content call \
   --uri content://com.yubegreen.luonnotar.adb_runtime_config \
   --method self_update \
-  --extra string apk_path "$remote"
+  --extra "apk_path:s:$remote"
 for i in $(seq 1 60); do
   out=$(adb "${adb_args[@]}" shell content call \
     --uri content://com.yubegreen.luonnotar.adb_runtime_config \

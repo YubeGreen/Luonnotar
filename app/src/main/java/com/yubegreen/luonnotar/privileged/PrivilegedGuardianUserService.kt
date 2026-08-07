@@ -240,6 +240,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var lastGmsRecoveryElapsed = 0L
     private var lastGmsRecoveryCompletedElapsed = 0L
     private var gmsConsecutiveCampaignFailures = 0
+    private var gmsCooldownBypassMissingEpisodeElapsed = 0L
+    private var gmsCooldownBypassCount = 0L
+    private var gmsPostSuccessProtectionUntilElapsed = 0L
     private var gmsRecoveryAttemptCount = 0L
     private var gmsRecoverySuccessCount = 0L
     private var gmsRecoveryGeneration = 0L
@@ -4835,6 +4838,27 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         return true
     }
 
+    private fun gmsPostSuccessProtectionActiveLocked(nowElapsed: Long): Boolean =
+        gmsPostSuccessProtectionUntilElapsed > nowElapsed
+
+    private fun gmsVerifiedOutageDeadlineLocked(nowElapsed: Long): Long =
+        RecoveryCampaignPolicy.gmsVerifiedOutageDeadlineMs(
+            postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
+        )
+
+    private fun gmsCooldownBypassEligibleLocked(
+        nowElapsed: Long,
+        vendorFamily: BackgroundPolicyVendorFamily,
+        strongEvidence: Boolean
+    ): Boolean = RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+        vendorFamily = vendorFamily,
+        strongEvidence = strongEvidence,
+        nowElapsed = nowElapsed,
+        transportMissingSinceElapsed = gmsTransportMissingSinceElapsed,
+        lastBypassedMissingEpisodeElapsed = gmsCooldownBypassMissingEpisodeElapsed,
+        postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
+    )
+
     private fun maybeStartVerifiedGmsCampaignLocked() {
         if (gmsRecoveryInProgress || !config.vendorEmergencyRecoveryEnabled) return
         if (vendorDefenseOwnsGmsRecoveryLocked()) {
@@ -4911,20 +4935,35 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 !lastGmsTransportProbe.healthy &&
                 gmsTransportConsecutiveMissing >= 3
         val vendorFamily = currentVendorFamilyLocked()
+        val outageAgeMs = if (
+            gmsTransportMissingSinceElapsed > 0L &&
+            gmsTransportMissingSinceElapsed <= now
+        ) {
+            now - gmsTransportMissingSinceElapsed
+        } else {
+            0L
+        }
+        val verifiedOutageDeadlineReached = gmsCooldownBypassEligibleLocked(
+            nowElapsed = now,
+            vendorFamily = vendorFamily,
+            strongEvidence = strongEvidence
+        )
         val campaignDecision = RecoveryCampaignPolicy.decideGmsCampaign(
             nowElapsed = now,
             lastCampaignCompletedElapsed = lastGmsRecoveryCompletedElapsed,
             campaignHistory = gmsRecoveryHistory.toList(),
             manual = manual,
             strongEvidence = strongEvidence,
-            consecutiveFailureCount = gmsConsecutiveCampaignFailures
+            consecutiveFailureCount = gmsConsecutiveCampaignFailures,
+            verifiedOutageDeadlineReached = verifiedOutageDeadlineReached
         )
         if (!campaignDecision.allowed) {
             eventLocked(
                 "gms_recovery_blocked",
                 "manual=$manual reason=${campaignDecision.reason} strongEvidence=$strongEvidence " +
                     "frozen=$anyGmsFrozen transport=${lastGmsTransportProbe.healthy} " +
-                    "missing=$gmsTransportConsecutiveMissing"
+                    "missing=$gmsTransportConsecutiveMissing outageAgeMs=$outageAgeMs " +
+                    "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)}"
             )
             lastGmsRecoveryOutcome = GmsRecoveryOutcome(
                 trigger = trigger,
@@ -4933,6 +4972,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 completedElapsed = now
             )
             return statusJsonLocked()
+        }
+
+        val deadlineRescue = campaignDecision.reason == "verified_outage_deadline_rescue"
+        if (deadlineRescue) {
+            gmsCooldownBypassMissingEpisodeElapsed = gmsTransportMissingSinceElapsed
+            gmsCooldownBypassCount += 1
+            eventLocked(
+                "gms_recovery_cooldown_bypassed_verified_outage",
+                "missingSince=${gmsTransportMissingSinceElapsed} outageAgeMs=$outageAgeMs " +
+                    "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)} " +
+                    "consecutiveFailures=$gmsConsecutiveCampaignFailures"
+            )
         }
 
         val generation = gmsRecoveryGeneration + 1L
@@ -4946,8 +4997,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             startedElapsed = now,
             deadlineElapsed = now + RecoveryCampaignPolicy.GMS_CAMPAIGN_DURATION_MS,
             initialPids = oldPids,
-            nextResetEligibleElapsed = now +
-                RecoveryCampaignPolicy.gmsInitialResetDelayMs(vendorFamily)
+            nextResetEligibleElapsed = if (deadlineRescue) {
+                now
+            } else {
+                now + RecoveryCampaignPolicy.gmsInitialResetDelayMs(vendorFamily)
+            }
         )
         gmsRecoveryCampaign = campaign
         gmsRecoveryInProgress = true
@@ -4960,6 +5014,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "trigger=$trigger manual=$manual generation=$generation oldPids=${oldPids.sorted()} " +
                 "strongEvidence=$strongEvidence emergency=$emergency vendor=$vendorFamily " +
                 "decision=${campaignDecision.reason} evidence=${automaticEvidenceReason.orEmpty()} " +
+                "outageAgeMs=$outageAgeMs deadlineRescue=$deadlineRescue " +
                 "nextResetEligibleElapsed=${campaign.nextResetEligibleElapsed}"
         )
         ensureGmsPreconnectionLeaseLocked(
@@ -5898,6 +5953,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsTransportVerifiedRecoveryCount += 1
             gmsFreezeEvents.clear()
             gmsConsecutiveCampaignFailures = 0
+            gmsCooldownBypassMissingEpisodeElapsed = 0L
+            gmsPostSuccessProtectionUntilElapsed =
+                now + RecoveryCampaignPolicy.GMS_VIVO_POST_SUCCESS_PROTECTION_MS
+            eventLocked(
+                "gms_recovery_post_success_protection_started",
+                "generation=$generation untilElapsed=$gmsPostSuccessProtectionUntilElapsed " +
+                    "durationMs=${RecoveryCampaignPolicy.GMS_VIVO_POST_SUCCESS_PROTECTION_MS}"
+            )
         } else {
             errorCount += 1
             gmsConsecutiveCampaignFailures =
@@ -6615,6 +6678,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("lastGmsRecoveryElapsed", lastGmsRecoveryElapsed)
         .put("lastGmsRecoveryCompletedElapsed", lastGmsRecoveryCompletedElapsed)
         .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
+        .put("gmsCooldownBypassCount", gmsCooldownBypassCount)
+        .put("gmsCooldownBypassMissingEpisodeElapsed", gmsCooldownBypassMissingEpisodeElapsed)
+        .put("gmsPostSuccessProtectionUntilElapsed", gmsPostSuccessProtectionUntilElapsed)
         .put(
             "gmsNextAutomaticRetryIntervalMs",
             RecoveryCampaignPolicy.gmsAutomaticRetryIntervalMs(gmsConsecutiveCampaignFailures)
@@ -6938,7 +7004,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 22
+        private const val STATUS_SCHEMA = 23
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

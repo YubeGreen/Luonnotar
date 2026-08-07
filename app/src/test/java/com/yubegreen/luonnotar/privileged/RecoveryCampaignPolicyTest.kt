@@ -266,6 +266,99 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
+    fun sustainedVerifiedOutageCanBypassAdaptiveCooldownOnceCallerAllowsIt() {
+        val blocked = RecoveryCampaignPolicy.decideGmsCampaign(
+            nowElapsed = 130_000L,
+            lastCampaignCompletedElapsed = 100_000L,
+            campaignHistory = listOf(100_000L),
+            manual = false,
+            strongEvidence = true,
+            consecutiveFailureCount = 3,
+            verifiedOutageDeadlineReached = false
+        )
+        assertFalse(blocked.allowed)
+        assertEquals("campaign_adaptive_cooldown", blocked.reason)
+
+        val rescue = RecoveryCampaignPolicy.decideGmsCampaign(
+            nowElapsed = 130_000L,
+            lastCampaignCompletedElapsed = 100_000L,
+            campaignHistory = listOf(100_000L),
+            manual = false,
+            strongEvidence = true,
+            consecutiveFailureCount = 3,
+            verifiedOutageDeadlineReached = true
+        )
+        assertTrue(rescue.allowed)
+        assertEquals("verified_outage_deadline_rescue", rescue.reason)
+
+        val weakEvidence = RecoveryCampaignPolicy.decideGmsCampaign(
+            nowElapsed = 130_000L,
+            lastCampaignCompletedElapsed = 100_000L,
+            campaignHistory = listOf(100_000L),
+            manual = false,
+            strongEvidence = false,
+            consecutiveFailureCount = 3,
+            verifiedOutageDeadlineReached = true
+        )
+        assertFalse(weakEvidence.allowed)
+        assertEquals("strong_evidence_missing", weakEvidence.reason)
+    }
+
+    @Test
+    fun vivoVerifiedOutageDeadlineIsOncePerMissingEpisodeAndFasterAfterSuccess() {
+        assertFalse(
+            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                strongEvidence = true,
+                nowElapsed = 129_999L,
+                transportMissingSinceElapsed = 100_000L,
+                lastBypassedMissingEpisodeElapsed = 0L,
+                postSuccessProtectionActive = false
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                strongEvidence = true,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = 100_000L,
+                lastBypassedMissingEpisodeElapsed = 0L,
+                postSuccessProtectionActive = false
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                strongEvidence = true,
+                nowElapsed = 180_000L,
+                transportMissingSinceElapsed = 100_000L,
+                lastBypassedMissingEpisodeElapsed = 100_000L,
+                postSuccessProtectionActive = false
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                strongEvidence = true,
+                nowElapsed = 115_000L,
+                transportMissingSinceElapsed = 100_000L,
+                lastBypassedMissingEpisodeElapsed = 0L,
+                postSuccessProtectionActive = true
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                strongEvidence = true,
+                nowElapsed = 200_000L,
+                transportMissingSinceElapsed = 100_000L,
+                lastBypassedMissingEpisodeElapsed = 0L,
+                postSuccessProtectionActive = false
+            )
+        )
+    }
+
+    @Test
     fun gmsForceStopHasGlobalTenMinuteAndDailyBudgets() {
         assertTrue(
             RecoveryCampaignPolicy.decideGmsForceStop(

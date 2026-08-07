@@ -67,6 +67,13 @@ object RecoveryCampaignPolicy {
     const val GMS_RETRY_AFTER_TWO_FAILURES_MS = 5 * 60_000L
     const val GMS_RETRY_AFTER_THREE_FAILURES_MS = 15 * 60_000L
     const val GMS_RETRY_AFTER_REPEATED_FAILURES_MS = 30 * 60_000L
+    // r264: adaptive cooldown must not create a confirmed-delivery dead zone on
+    // VIVO. A continuous missing-MCS episode with verified frozen GMS gets one
+    // bounded cooldown bypass after this deadline. The caller is responsible
+    // for allowing it only once per continuous transport-missing episode.
+    const val GMS_VIVO_VERIFIED_OUTAGE_DEADLINE_MS = 30_000L
+    const val GMS_VIVO_POST_SUCCESS_PROTECTION_MS = 120_000L
+    const val GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS = 15_000L
     const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
     const val GMS_FORCE_STOP_MIN_INTERVAL_MS = 10 * 60_000L
     const val GMS_FORCE_STOP_MAX_PER_24_HOURS = 6
@@ -126,7 +133,8 @@ object RecoveryCampaignPolicy {
         campaignHistory: List<Long>,
         manual: Boolean,
         strongEvidence: Boolean,
-        consecutiveFailureCount: Int = 0
+        consecutiveFailureCount: Int = 0,
+        verifiedOutageDeadlineReached: Boolean = false
     ): GmsCampaignDecision {
         if (nowElapsed < 0L) return GmsCampaignDecision(false, "invalid_clock")
         if (!manual && !strongEvidence) {
@@ -146,10 +154,10 @@ object RecoveryCampaignPolicy {
         } else {
             gmsAutomaticRetryIntervalMs(consecutiveFailureCount)
         }
-        if (
+        val insideRetryCooldown =
             lastCampaignCompletedElapsed > 0L &&
-            nowElapsed - lastCampaignCompletedElapsed < retryInterval
-        ) {
+                nowElapsed - lastCampaignCompletedElapsed < retryInterval
+        if (insideRetryCooldown && !verifiedOutageDeadlineReached) {
             return GmsCampaignDecision(false, "campaign_adaptive_cooldown")
         }
 
@@ -157,6 +165,8 @@ object RecoveryCampaignPolicy {
             true,
             when {
                 manual -> "manual_campaign"
+                insideRetryCooldown && verifiedOutageDeadlineReached ->
+                    "verified_outage_deadline_rescue"
                 consecutiveFailureCount <= 0 -> "verified_frozen_mcs_missing"
                 else -> "verified_outage_adaptive_retry_$consecutiveFailureCount"
             }
@@ -168,6 +178,31 @@ object RecoveryCampaignPolicy {
         consecutiveFailureCount == 2 -> GMS_RETRY_AFTER_TWO_FAILURES_MS
         consecutiveFailureCount == 3 -> GMS_RETRY_AFTER_THREE_FAILURES_MS
         else -> GMS_RETRY_AFTER_REPEATED_FAILURES_MS
+    }
+
+    fun gmsVerifiedOutageDeadlineMs(postSuccessProtectionActive: Boolean): Long =
+        if (postSuccessProtectionActive) {
+            GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS
+        } else {
+            GMS_VIVO_VERIFIED_OUTAGE_DEADLINE_MS
+        }
+
+    fun shouldBypassGmsAdaptiveCooldown(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        strongEvidence: Boolean,
+        nowElapsed: Long,
+        transportMissingSinceElapsed: Long,
+        lastBypassedMissingEpisodeElapsed: Long,
+        postSuccessProtectionActive: Boolean
+    ): Boolean {
+        if (vendorFamily != BackgroundPolicyVendorFamily.VIVO || !strongEvidence) return false
+        if (nowElapsed < 0L) return false
+        if (transportMissingSinceElapsed <= 0L || transportMissingSinceElapsed > nowElapsed) {
+            return false
+        }
+        if (lastBypassedMissingEpisodeElapsed == transportMissingSinceElapsed) return false
+        return nowElapsed - transportMissingSinceElapsed >=
+            gmsVerifiedOutageDeadlineMs(postSuccessProtectionActive)
     }
 
     fun decideGmsForceStop(
