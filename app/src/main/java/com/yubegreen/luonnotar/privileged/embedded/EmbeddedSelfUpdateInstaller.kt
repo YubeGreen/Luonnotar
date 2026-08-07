@@ -40,6 +40,7 @@ internal object EmbeddedSelfUpdateInstaller {
     const val STAGING_ROOT = EmbeddedSelfUpdatePolicy.STAGING_ROOT
     const val MAX_APK_BYTES = EmbeddedSelfUpdatePolicy.MAX_APK_BYTES
     private const val SHELL_PACKAGE = "com.android.shell"
+    private const val SHELL_UID = 2000
     private const val FINAL_RESULT_TIMEOUT_MS = 45_000L
     private val activeSessionId = AtomicInteger(-1)
     private val activeInstaller = AtomicReference<PackageInstaller?>(null)
@@ -72,7 +73,7 @@ internal object EmbeddedSelfUpdateInstaller {
 
     fun install(apkPath: String): Result {
         val started = SystemClock.elapsedRealtime()
-        require(Process.myUid() == Process.SHELL_UID || Process.myUid() == 0) {
+        require(Process.myUid() == SHELL_UID || Process.myUid() == 0) {
             "self update requires shell/root uid"
         }
         log("self_update_request", "path=${safePathForLog(apkPath)}")
@@ -95,7 +96,7 @@ internal object EmbeddedSelfUpdateInstaller {
             val installed = installedInfo(context.packageManager)
             val validation = validateArchive(archive, installed, staged.length())
             if (validation != null) return failure(validation.first, validation.second, started)
-            val newVersion = archive.longVersionCode
+            val newVersion = versionCodeOf(archive)
             log("self_update_validation_success", "versionCode=$newVersion bytes=${staged.length()}")
 
             installer = context.packageManager.packageInstaller
@@ -310,7 +311,7 @@ internal object EmbeddedSelfUpdateInstaller {
         }
         val fd = Os.open(
             source.absolutePath,
-            OsConstants.O_RDONLY or OsConstants.O_CLOEXEC or OsConstants.O_NOFOLLOW,
+            OsConstants.O_RDONLY or OsConstants.O_NOFOLLOW,
             0
         )
         try {
@@ -343,7 +344,7 @@ internal object EmbeddedSelfUpdateInstaller {
             )
         } else {
             @Suppress("DEPRECATION")
-            pm.getPackageArchiveInfo(apk.absolutePath, PackageManager.GET_SIGNING_CERTIFICATES)
+            pm.getPackageArchiveInfo(apk.absolutePath, legacySigningFlags())
         }
 
     private fun installedInfo(pm: PackageManager): PackageInfo =
@@ -354,7 +355,23 @@ internal object EmbeddedSelfUpdateInstaller {
             )
         } else {
             @Suppress("DEPRECATION")
-            pm.getPackageInfo(TARGET_PACKAGE, PackageManager.GET_SIGNING_CERTIFICATES)
+            pm.getPackageInfo(TARGET_PACKAGE, legacySigningFlags())
+        }
+
+    @Suppress("DEPRECATION")
+    private fun legacySigningFlags(): Int =
+        if (Build.VERSION.SDK_INT >= 28) {
+            PackageManager.GET_SIGNING_CERTIFICATES
+        } else {
+            PackageManager.GET_SIGNATURES
+        }
+
+    @Suppress("DEPRECATION")
+    private fun versionCodeOf(info: PackageInfo): Long =
+        if (Build.VERSION.SDK_INT >= 28) {
+            info.longVersionCode
+        } else {
+            info.versionCode.toLong()
         }
 
     private fun validateArchive(
@@ -364,8 +381,8 @@ internal object EmbeddedSelfUpdateInstaller {
     ): Pair<String, String>? {
         val decision = EmbeddedSelfUpdatePolicy.validate(
             packageName = archive.packageName,
-            candidateVersionCode = archive.longVersionCode,
-            installedVersionCode = installed.longVersionCode,
+            candidateVersionCode = versionCodeOf(archive),
+            installedVersionCode = versionCodeOf(installed),
             candidateSignerDigests = signerDigests(archive),
             installedSignerDigests = signerDigests(installed),
             apkSize = apkSize
@@ -373,12 +390,17 @@ internal object EmbeddedSelfUpdateInstaller {
         return if (decision.allowed) null else decision.code to decision.message
     }
 
+    @Suppress("DEPRECATION")
     private fun signerDigests(info: PackageInfo): Set<String> {
-        val signing = info.signingInfo ?: return emptySet()
-        val signers = if (signing.hasMultipleSigners()) {
-            signing.apkContentsSigners
+        val signers = if (Build.VERSION.SDK_INT >= 28) {
+            val signing = info.signingInfo ?: return emptySet()
+            if (signing.hasMultipleSigners()) {
+                signing.apkContentsSigners
+            } else {
+                signing.signingCertificateHistory
+            }
         } else {
-            signing.signingCertificateHistory
+            info.signatures ?: emptyArray()
         }
         return signers.mapTo(linkedSetOf()) { signature ->
             MessageDigest.getInstance("SHA-256")
