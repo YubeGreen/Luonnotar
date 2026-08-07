@@ -222,26 +222,6 @@ object EmbeddedGuardianStore {
     }
 
     @Synchronized
-    fun prepareEngineRestart(context: Context, generation: Long, source: String): Boolean {
-        val prefs = prefs(context)
-        ensureRuntimeOwner(context, prefs)
-        val before = snapshotFrom(prefs)
-        if (!accepts(before, generation)) return false
-        val committed = prefs.edit()
-            .putString(KEY_SETUP_STATE, EmbeddedSetupState.STARTING.name)
-            .putString(KEY_CONNECTION_STATE, EmbeddedConnectionState.CONNECTING.name)
-            .putInt(KEY_REPORTED_UID, -1)
-            .remove(KEY_LAST_STATUS)
-            .putString(KEY_LAST_ERROR, "")
-            .putLong(KEY_UPDATED_ELAPSED, SystemClock.elapsedRealtime())
-            .commit()
-        if (committed) {
-            logState(context, "embedded_engine_restart_prepared", source, snapshotFrom(prefs))
-        }
-        return committed
-    }
-
-    @Synchronized
     fun markConnecting(context: Context, generation: Long, source: String): Boolean {
         val prefs = prefs(context)
         ensureRuntimeOwner(context, prefs)

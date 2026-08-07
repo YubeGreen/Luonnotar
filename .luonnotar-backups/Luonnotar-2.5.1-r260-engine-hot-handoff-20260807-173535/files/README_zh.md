@@ -1,17 +1,16 @@
 # 努昂诺塔（Luonnotar）
 
-## 2.5.1 r260 引擎热切换 + 厂商持续回冻防守
+## 2.5.1 r259 厂商持续回冻防守
 
-- 保留 r259 的单一防守 episode、GMS main/persistent 原子组与 12 秒真实解冻稳定门槛。
-- 修复覆盖安装后 UID 2000 `app_process` 仍运行旧 APK/旧引擎的问题：r260+ 通过已认证的本地 token 通道进行 hot handoff。
-- 接班引擎等待旧 PID + `/proc` start-time 精确实例退出后，复用同一 loopback 端口与 token 加载当前安装 APK。
-- 第一次从 r259/更早版本升级时，先用旧协议安全停止旧引擎，再复用持久化 Kadb 身份启动新引擎；仅 adbd 明确拒绝授权时才要求重新配对。
-- 新增 `android.permission.DUMP` 保护的 ADB-only 状态/重启入口，可从电脑直接读取真实 engine revision 或请求受控重启。
-- 仓库附带 `tools/adb-embedded-engine-control.sh --serial <设备> status|restart`，避免手敲完整 broadcast。
-- `MY_PACKAGE_REPLACED` 不再假定 shell 引擎已经死亡，而会自动走上述热切换/复用 ADB 路径。
-- 内置引擎修订号：**260**；状态 schema：**20**。
+- 保留 r258 的唯一冻结命令所有者与 GMS main/persistent 原子组；父服务退出后会按精确身份清理租约，不再残留假 owner。
+- 将 vivo/iQOO `fast_freezer` 的连续回冻合并为一个防守 episode，不再每次各自启动恢复。
+- 每一代 GMS PID 最多发送一次受限 MCS 重连脉冲；不会累计全局 exhaustion，也不会递归开启 emergency campaign。
+- main 与 persistent 必须连续真实解冻 12 秒，才允许报告恢复成功。
+- 每次回冻都会重置稳定计时；PID 更换会建立新代次，并获得新的一次重连机会。
+- 30 秒从未真实解冻或持续回冻两分钟时只升级一次，同时 bridge 继续防守。
+- 内置引擎修订号：**259**；状态 schema：**20**。
 
-> 当前本地版本：**2.5.1（versionCode 82）**，包名：`com.yubegreen.luonnotar`。
+> 当前本地版本：**2.5.1（versionCode 81）**，包名：`com.yubegreen.luonnotar`。
 
 ## 2.3.7 引擎连接后崩溃热修复
 

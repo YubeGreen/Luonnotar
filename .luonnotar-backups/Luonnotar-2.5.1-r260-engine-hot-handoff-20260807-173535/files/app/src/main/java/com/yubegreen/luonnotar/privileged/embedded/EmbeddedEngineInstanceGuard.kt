@@ -41,16 +41,6 @@ internal class EmbeddedEngineInstanceGuard private constructor(
         appendLifecycle("listening", mapOf("port" to port))
     }
 
-    fun recordHandoffScheduled(expectedRevision: Int, reason: String) {
-        appendLifecycle(
-            "hot_handoff_scheduled",
-            mapOf(
-                "expectedRevision" to expectedRevision,
-                "reason" to reason.take(120)
-            )
-        )
-    }
-
     fun recordDuplicateRejected(candidatePid: Int = Process.myPid()) {
         appendLifecycle("duplicate_engine_rejected", mapOf("candidatePid" to candidatePid))
     }

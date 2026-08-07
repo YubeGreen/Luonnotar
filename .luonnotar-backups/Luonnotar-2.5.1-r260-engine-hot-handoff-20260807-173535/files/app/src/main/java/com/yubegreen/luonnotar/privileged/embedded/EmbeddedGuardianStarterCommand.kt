@@ -2,7 +2,7 @@ package com.yubegreen.luonnotar.privileged.embedded
 
 internal object EmbeddedGuardianStarterCommand {
     const val PROCESS_NAME = "luonnotar_privileged_engine"
-    const val LOG_PATH = "/data/local/tmp/luonnotar-embedded-guardian.log"
+    private const val LOG_PATH = "/data/local/tmp/luonnotar-embedded-guardian.log"
 
     fun build(
         apkPath: String,

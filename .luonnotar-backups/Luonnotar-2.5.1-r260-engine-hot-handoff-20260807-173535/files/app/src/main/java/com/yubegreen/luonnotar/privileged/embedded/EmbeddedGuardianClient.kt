@@ -17,7 +17,6 @@ class EmbeddedGuardianClient(
     fun recoverGms(): String = call(EmbeddedGuardianProtocol.OP_RECOVER_GMS)
     fun applyBackgroundPolicy(requestJson: String): String =
         call(EmbeddedGuardianProtocol.OP_BACKGROUND_POLICY, requestJson)
-    fun handoff(requestJson: String): String = call(EmbeddedGuardianProtocol.OP_HANDOFF, requestJson)
     fun stop(): String = call(EmbeddedGuardianProtocol.OP_STOP)
     fun destroy(): String = call(EmbeddedGuardianProtocol.OP_DESTROY)
 

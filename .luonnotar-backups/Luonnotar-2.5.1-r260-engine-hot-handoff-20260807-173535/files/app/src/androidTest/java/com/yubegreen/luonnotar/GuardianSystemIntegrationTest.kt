@@ -11,7 +11,6 @@ import androidx.core.content.ContextCompat
 import androidx.test.core.app.ApplicationProvider
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import com.yubegreen.luonnotar.receiver.BootCompletedReceiver
-import com.yubegreen.luonnotar.receiver.AdbEmbeddedEngineControlReceiver
 import com.yubegreen.luonnotar.receiver.AdbFreezerDiagnosticsReceiver
 import com.yubegreen.luonnotar.receiver.AdbGmsBinderPulseReceiver
 import com.yubegreen.luonnotar.receiver.AdbNotificationDiagnosticsReceiver
@@ -104,10 +103,6 @@ class GuardianSystemIntegrationTest {
             ComponentName(context, GuardianCleanupReceiver::class.java),
             PackageManager.GET_META_DATA
         )
-        val adbEngineControl = context.packageManager.getReceiverInfo(
-            ComponentName(context, AdbEmbeddedEngineControlReceiver::class.java),
-            PackageManager.GET_META_DATA
-        )
         val adbVpn = context.packageManager.getReceiverInfo(
             ComponentName(context, AdbVpnVerificationReceiver::class.java),
             PackageManager.GET_META_DATA
@@ -151,18 +146,15 @@ class GuardianSystemIntegrationTest {
         assertTrue(adbRuntimeProvider.processName == service.processName)
         assertFalse(notificationListener.processName == service.processName)
         assertFalse(cleanup.processName.endsWith(":keeper"))
-        assertTrue(adbEngineControl.exported)
         assertTrue(adbVpn.exported)
         assertTrue(adbFreezer.exported)
         assertTrue(adbNotification.exported)
         assertTrue(adbGmsBinderPulse.exported)
         assertTrue(adbRuntimeConfig.exported)
-        assertTrue(adbEngineControl.directBootAware)
         assertTrue(adbVpn.directBootAware)
         assertTrue(adbFreezer.directBootAware)
         assertTrue(adbGmsBinderPulse.directBootAware)
         assertTrue(adbRuntimeConfig.directBootAware)
-        assertTrue(adbEngineControl.permission == "android.permission.DUMP")
         assertTrue(adbVpn.permission == "android.permission.DUMP")
         assertTrue(adbFreezer.permission == "android.permission.DUMP")
         assertTrue(adbNotification.permission == "android.permission.DUMP")

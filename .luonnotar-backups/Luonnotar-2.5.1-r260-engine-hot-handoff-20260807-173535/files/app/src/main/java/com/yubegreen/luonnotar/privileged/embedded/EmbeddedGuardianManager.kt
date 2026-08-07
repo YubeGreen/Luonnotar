@@ -28,44 +28,6 @@ object EmbeddedGuardianManager {
         refreshIfStale(app, minAgeMs = 0L)
     }
 
-    /**
-     * Requests a controlled engine restart without discarding the persisted ADB
-     * host identity. r260+ engines first try a loopback hot handoff; older or
-     * unreachable engines fall back to the existing local ADB startup path.
-     */
-    fun restartEngine(context: Context, source: String = "explicit_engine_restart") {
-        val app = context.applicationContext
-        val snapshot = EmbeddedGuardianStore.snapshot(app)
-        check(snapshot.featureEnabled) { "embedded feature disabled" }
-        check(EmbeddedGuardianStore.prepareEngineRestart(app, snapshot.generation, source)) {
-            "embedded restart generation superseded"
-        }
-        LogManager.event(
-            app,
-            "embedded_engine_restart_requested",
-            EmbeddedGuardianStore.eventFields(snapshot, source) +
-                mapOf("expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION)
-        )
-        runCatching {
-            ContextCompat.startForegroundService(
-                app,
-                Intent(app, EmbeddedAdbService::class.java)
-                    .setAction(EmbeddedAdbService.ACTION_RESTART_ENGINE)
-                    .putExtra(EmbeddedAdbService.EXTRA_GENERATION, snapshot.generation)
-                    .putExtra(EmbeddedAdbService.EXTRA_RESTART_SOURCE, source.take(120))
-            )
-        }.onFailure { error ->
-            EmbeddedGuardianStore.markConnectionUnavailable(
-                app,
-                snapshot.generation,
-                EmbeddedConnectionState.DEAD,
-                error.toString(),
-                "engine_restart_service_failed"
-            )
-            throw error
-        }
-    }
-
     fun startSetup(context: Context, source: String = "explicit_user_enable") {
         val app = context.applicationContext
         val session = EmbeddedGuardianStore.beginUserSetup(app, source)
@@ -371,210 +333,6 @@ object EmbeddedGuardianManager {
         }
     }
 
-    internal fun performHotHandoff(
-        context: Context,
-        generation: Long,
-        source: String
-    ): HandoffAttempt {
-        val app = context.applicationContext
-        if (!EmbeddedGuardianStore.isGenerationActive(app, generation)) {
-            return HandoffAttempt(false, "generation_superseded")
-        }
-        val identity = EmbeddedGuardianStore.identity(app)
-            ?: return HandoffAttempt(false, "identity_missing")
-        val client = EmbeddedGuardianClient(
-            identity.port,
-            identity.token,
-            connectTimeoutMs = FAST_PING_TIMEOUT_MS,
-            readTimeoutMs = FAST_PING_TIMEOUT_MS
-        )
-        val oldPing = runCatching { parsePing(client.ping(), requireCurrentRevision = false) }
-            .getOrElse { error ->
-                LogManager.event(
-                    app,
-                    "embedded_engine_handoff_unavailable",
-                    EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                        mapOf("reason" to "engine_unreachable", "error" to error.toString())
-                )
-                return HandoffAttempt(false, "engine_unreachable")
-            }
-        if (
-            oldPing.engineRevision < EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION ||
-            !oldPing.handoffSupported
-        ) {
-            // Pre-r260 engines cannot spawn a successor, but they already support the
-            // authenticated destroy operation. Retire the legacy UID 2000 process over
-            // loopback first, then let EmbeddedAdbService reuse the persisted Kadb key
-            // to start the new APK. This is the one-time bridge from r259 (and older)
-            // into the hot-handoff era and does not require re-pairing unless adbd later
-            // reports a real authorization failure.
-            val retired = retireLegacyEngine(identity, oldPing.pid)
-            LogManager.event(
-                app,
-                "embedded_engine_handoff_unavailable",
-                EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                    mapOf(
-                        "reason" to if (retired) {
-                            "old_revision_retired_for_adb_restart"
-                        } else {
-                            "old_revision_retire_failed"
-                        },
-                        "oldRevision" to oldPing.engineRevision,
-                        "oldPid" to oldPing.pid,
-                        "handoffSupported" to oldPing.handoffSupported
-                    )
-            )
-            return HandoffAttempt(
-                false,
-                if (retired) "old_revision_retired_for_adb_restart" else "old_revision_retire_failed",
-                oldPing.engineRevision
-            )
-        }
-
-        val apkPath = app.applicationInfo.sourceDir.orEmpty()
-        if (apkPath.isBlank()) return HandoffAttempt(false, "apk_path_missing", oldPing.engineRevision)
-        val request = JSONObject()
-            .put("apkPath", apkPath)
-            .put("expectedRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
-            .put("reason", source.take(120))
-            .toString()
-        LogManager.event(
-            app,
-            "embedded_engine_handoff_started",
-            EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                mapOf(
-                    "oldRevision" to oldPing.engineRevision,
-                    "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-                    "oldPid" to oldPing.pid
-                )
-        )
-        val response = runCatching {
-            EmbeddedGuardianClient(
-                identity.port,
-                identity.token,
-                connectTimeoutMs = 2_000,
-                readTimeoutMs = HANDOFF_REQUEST_TIMEOUT_MS
-            ).handoff(request)
-        }.getOrElse { error ->
-            LogManager.event(
-                app,
-                "embedded_engine_handoff_failed",
-                EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                    mapOf("stage" to "request", "error" to error.toString())
-            )
-            return HandoffAttempt(false, "handoff_request_failed", oldPing.engineRevision)
-        }
-        val accepted = runCatching { JSONObject(response).optBoolean("accepted", false) }
-            .getOrDefault(false)
-        if (!accepted) return HandoffAttempt(false, "handoff_rejected", oldPing.engineRevision)
-
-        var lastError: Throwable? = null
-        var verifiedPing: PingHandshake? = null
-        var verifiedAttempt = 0
-        for (attempt in 1..HANDOFF_VERIFY_ATTEMPTS) {
-            if (!EmbeddedGuardianStore.isGenerationActive(app, generation)) {
-                return HandoffAttempt(false, "generation_superseded", oldPing.engineRevision)
-            }
-            Thread.sleep(HANDOFF_VERIFY_DELAY_MS)
-            val result = runCatching {
-                validatePing(
-                    EmbeddedGuardianClient(
-                        identity.port,
-                        identity.token,
-                        connectTimeoutMs = HANDOFF_PING_TIMEOUT_MS,
-                        readTimeoutMs = HANDOFF_PING_TIMEOUT_MS
-                    ).ping()
-                )
-            }
-            val ping = result.getOrNull()
-            if (ping != null && (ping.pid != oldPing.pid || ping.engineRevision != oldPing.engineRevision)) {
-                verifiedPing = ping
-                verifiedAttempt = attempt
-                break
-            }
-            lastError = result.exceptionOrNull() ?: IllegalStateException("old engine still serving")
-        }
-        val newPing = verifiedPing
-        if (newPing == null) {
-            LogManager.event(
-                app,
-                "embedded_engine_handoff_failed",
-                EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                    mapOf(
-                        "stage" to "verify",
-                        "oldRevision" to oldPing.engineRevision,
-                        "error" to lastError.toString()
-                    )
-            )
-            return HandoffAttempt(false, "handoff_verify_timeout", oldPing.engineRevision)
-        }
-
-        val configured = runCatching { configure(app, generation) }
-        if (configured.isFailure) {
-            LogManager.event(
-                app,
-                "embedded_engine_handoff_failed",
-                EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                    mapOf(
-                        "stage" to "configure",
-                        "oldRevision" to oldPing.engineRevision,
-                        "newRevision" to newPing.engineRevision,
-                        "error" to configured.exceptionOrNull().toString()
-                    )
-            )
-            return HandoffAttempt(false, "handoff_configure_failed", oldPing.engineRevision, newPing.engineRevision)
-        }
-        LogManager.event(
-            app,
-            "embedded_engine_handoff_succeeded",
-            EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
-                mapOf(
-                    "oldRevision" to oldPing.engineRevision,
-                    "newRevision" to newPing.engineRevision,
-                    "oldPid" to oldPing.pid,
-                    "newPid" to newPing.pid,
-                    "verifyAttempt" to verifiedAttempt
-                )
-        )
-        return HandoffAttempt(true, "hot_handoff", oldPing.engineRevision, newPing.engineRevision)
-    }
-
-
-    private fun retireLegacyEngine(
-        identity: EmbeddedGuardianStore.EndpointIdentity,
-        oldPid: Int
-    ): Boolean {
-        // Old servers close their listen socket from inside OP_DESTROY before the reply
-        // is necessarily flushed, so transport failure here is not proof of failure.
-        runCatching {
-            EmbeddedGuardianClient(
-                identity.port,
-                identity.token,
-                connectTimeoutMs = 1_000,
-                readTimeoutMs = 2_000
-            ).destroy()
-        }
-        repeat(LEGACY_RETIRE_VERIFY_ATTEMPTS) {
-            Thread.sleep(LEGACY_RETIRE_VERIFY_DELAY_MS)
-            val ping = runCatching {
-                parsePing(
-                    EmbeddedGuardianClient(
-                        identity.port,
-                        identity.token,
-                        connectTimeoutMs = HANDOFF_PING_TIMEOUT_MS,
-                        readTimeoutMs = HANDOFF_PING_TIMEOUT_MS
-                    ).ping(),
-                    requireCurrentRevision = false
-                )
-            }.getOrNull()
-            if (ping == null) return true
-            // A different PID means the legacy instance is gone. Do not destroy a
-            // successor that may already have been started by another recovery path.
-            if (oldPid > 0 && ping.pid != oldPid) return true
-        }
-        return false
-    }
-
     fun reconfigure(context: Context, callback: (Result<String>) -> Unit = {}) {
         val app = context.applicationContext
         execute(app, "reconfigure", callback) { client ->
@@ -729,10 +487,7 @@ object EmbeddedGuardianManager {
         return validateStatus(ping, client.status())
     }
 
-    private fun validatePing(rawPing: String): PingHandshake =
-        parsePing(rawPing, requireCurrentRevision = true)
-
-    private fun parsePing(rawPing: String, requireCurrentRevision: Boolean): PingHandshake {
+    private fun validatePing(rawPing: String): PingHandshake {
         val ping = JSONObject(rawPing)
         check(ping.optString("engine") == "LuonnotarEmbeddedGuardian") {
             "unexpected embedded engine identity"
@@ -742,19 +497,10 @@ object EmbeddedGuardianManager {
             "embedded handshake rejected uid=$uid"
         }
         val engineRevision = ping.optInt("engineRevision", -1)
-        if (requireCurrentRevision) {
-            check(engineRevision == EmbeddedGuardianProtocol.ENGINE_REVISION) {
-                "embedded engine revision mismatch expected=${EmbeddedGuardianProtocol.ENGINE_REVISION} actual=$engineRevision"
-            }
-        } else {
-            check(engineRevision > 0) { "embedded engine revision missing" }
+        check(engineRevision == EmbeddedGuardianProtocol.ENGINE_REVISION) {
+            "embedded engine revision mismatch expected=${EmbeddedGuardianProtocol.ENGINE_REVISION} actual=$engineRevision"
         }
-        return PingHandshake(
-            uid = uid,
-            engineRevision = engineRevision,
-            pid = ping.optInt("pid", -1),
-            handoffSupported = ping.optBoolean("handoffSupported", false)
-        )
+        return PingHandshake(uid, engineRevision)
     }
 
     private fun validateStatus(ping: PingHandshake, rawStatus: String): LiveHandshake {
@@ -905,19 +651,7 @@ object EmbeddedGuardianManager {
     private class EmbeddedEngineStatusStaleException(message: String) :
         IllegalStateException(message)
 
-    internal data class HandoffAttempt(
-        val success: Boolean,
-        val reason: String,
-        val oldRevision: Int? = null,
-        val newRevision: Int? = null
-    )
-
-    private data class PingHandshake(
-        val uid: Int,
-        val engineRevision: Int,
-        val pid: Int,
-        val handoffSupported: Boolean
-    )
+    private data class PingHandshake(val uid: Int, val engineRevision: Int)
     private data class LiveHandshake(val uid: Int, val status: String)
 
     private const val FAST_PING_TIMEOUT_MS = 2_000
@@ -927,10 +661,4 @@ object EmbeddedGuardianManager {
     private const val CONFIGURE_READ_TIMEOUT_MS = 30_000
     private const val OPERATION_READ_TIMEOUT_MS = 30_000
     private const val RECOVERY_REQUEST_TIMEOUT_MS = 10_000
-    private const val HANDOFF_REQUEST_TIMEOUT_MS = 5_000
-    private const val HANDOFF_PING_TIMEOUT_MS = 750
-    private const val HANDOFF_VERIFY_ATTEMPTS = 40
-    private const val HANDOFF_VERIFY_DELAY_MS = 200L
-    private const val LEGACY_RETIRE_VERIFY_ATTEMPTS = 12
-    private const val LEGACY_RETIRE_VERIFY_DELAY_MS = 150L
 }

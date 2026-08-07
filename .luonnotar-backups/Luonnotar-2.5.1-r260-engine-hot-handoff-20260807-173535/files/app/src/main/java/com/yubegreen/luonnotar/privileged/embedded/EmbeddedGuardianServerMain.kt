@@ -4,7 +4,7 @@ import android.os.Process
 import com.yubegreen.luonnotar.privileged.PrivilegedGuardianUserService
 import org.json.JSONObject
 import java.io.IOException
-import java.net.InetSocketAddress
+import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
 import java.util.concurrent.Executors
@@ -31,10 +31,7 @@ object EmbeddedGuardianServerMain {
         val executor = Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "luonnotar-embedded-client").apply { isDaemon = true }
         }
-        val server = ServerSocket().apply {
-            reuseAddress = true
-            bind(InetSocketAddress(EmbeddedGuardianProtocol.HOST, port), 16)
-        }
+        val server = ServerSocket(port, 16, InetAddress.getByName(EmbeddedGuardianProtocol.HOST))
         Runtime.getRuntime().addShutdownHook(Thread {
             runCatching { engine.stop() }
             runCatching { server.close() }
@@ -44,9 +41,9 @@ object EmbeddedGuardianServerMain {
         println("Luonnotar embedded guardian listening on ${server.localSocketAddress}; uid=${Process.myUid()}")
         while (!stopping.get()) {
             val socket = runCatching { server.accept() }.getOrNull() ?: break
-            executor.execute { handle(socket, token, port, engine, instanceGuard, stopping, server) }
+            executor.execute { handle(socket, token, engine, stopping, server) }
         }
-        executor.shutdown()
+        executor.shutdownNow()
         runCatching { engine.stop() }
         runCatching { instanceGuard.close() }
         exitProcess(0)
@@ -55,13 +52,10 @@ object EmbeddedGuardianServerMain {
     private fun handle(
         socket: Socket,
         token: String,
-        port: Int,
         engine: PrivilegedGuardianUserService,
-        instanceGuard: EmbeddedEngineInstanceGuard,
         stopping: AtomicBoolean,
         server: ServerSocket
     ) {
-        var shutdownAfterResponse = false
         try {
             socket.use { client ->
                 client.soTimeout = 60_000
@@ -80,34 +74,17 @@ object EmbeddedGuardianServerMain {
                             .put("uid", Process.myUid())
                             .put("pid", Process.myPid())
                             .put("engineRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
-                            .put("handoffSupported", true)
                             .toString()
                         EmbeddedGuardianProtocol.OP_CONFIGURE -> engine.configureAndStart(payload)
                         EmbeddedGuardianProtocol.OP_STATUS -> engine.getStatusJson()
                         EmbeddedGuardianProtocol.OP_CYCLE -> engine.runCycle()
                         EmbeddedGuardianProtocol.OP_RECOVER_GMS -> engine.recoverGms()
                         EmbeddedGuardianProtocol.OP_BACKGROUND_POLICY -> engine.applyBackgroundPolicy(payload)
-                        EmbeddedGuardianProtocol.OP_HANDOFF -> {
-                            val value = EmbeddedGuardianHandoffLauncher.schedule(
-                                payload = payload,
-                                port = port,
-                                token = token
-                            )
-                            val accepted = JSONObject(value)
-                            instanceGuard.recordHandoffScheduled(
-                                expectedRevision = accepted.optInt("expectedRevision", -1),
-                                reason = runCatching { JSONObject(payload).optString("reason") }.getOrDefault("")
-                            )
-                            engine.stop()
-                            stopping.set(true)
-                            shutdownAfterResponse = true
-                            value
-                        }
                         EmbeddedGuardianProtocol.OP_STOP -> engine.stop()
                         EmbeddedGuardianProtocol.OP_DESTROY -> {
                             val value = engine.stop()
                             stopping.set(true)
-                            shutdownAfterResponse = true
+                            runCatching { server.close() }
                             value
                         }
                         else -> error("unsupported operation")
@@ -127,8 +104,6 @@ object EmbeddedGuardianServerMain {
                 "Luonnotar embedded client session ended: " +
                     "${error.javaClass.simpleName}: ${error.message.orEmpty()}"
             )
-        } finally {
-            if (shutdownAfterResponse) runCatching { server.close() }
         }
     }
 

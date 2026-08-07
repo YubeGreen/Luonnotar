@@ -82,12 +82,6 @@ class EmbeddedAdbService : Service() {
                 reset = command.action == ACTION_RETRY || generationChanged,
                 generation = generation
             )
-            ACTION_RESTART_ENGINE -> startEngineRestart(
-                generation = generation,
-                source = command.getStringExtra(EXTRA_RESTART_SOURCE)
-                    .orEmpty()
-                    .ifBlank { "engine_restart" }
-            )
             ACTION_PAIR -> {
                 val code = RemoteInput.getResultsFromIntent(command)
                     ?.getCharSequence(EmbeddedGuardianNotifier.REMOTE_INPUT_KEY)
@@ -149,57 +143,6 @@ class EmbeddedAdbService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
-
-    private fun startEngineRestart(generation: Long, source: String) {
-        if (!isActive(generation)) return
-        state(
-            generation,
-            EmbeddedSetupState.STARTING,
-            "正在热切换 shell UID 特权引擎…",
-            waitingCode = false
-        )
-        executor.execute {
-            if (!isActive(generation)) return@execute
-            discovery?.close()
-            discovery = null
-            cancelCandidateRetry()
-            val attempt = runCatching {
-                EmbeddedGuardianManager.performHotHandoff(this, generation, source)
-            }.getOrElse { error ->
-                LogManager.event(
-                    this,
-                    "embedded_engine_handoff_failed",
-                    mapOf(
-                        "source" to source,
-                        "generation" to generation,
-                        "stage" to "service",
-                        "error" to error.toString()
-                    )
-                )
-                EmbeddedGuardianManager.HandoffAttempt(false, "exception")
-            }
-            if (attempt.success) {
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-                return@execute
-            }
-
-            LogManager.event(
-                this,
-                "embedded_engine_restart_fallback_adb",
-                mapOf(
-                    "source" to source,
-                    "generation" to generation,
-                    "reason" to attempt.reason,
-                    "oldRevision" to attempt.oldRevision
-                )
-            )
-            // Do not reset the persisted Kadb identity or paired flag here. An old
-            // engine revision is not an authorization failure. Existing local TCP
-            // 5555 / wireless-ADB authorization should be reused automatically.
-            startDiscovery(reset = true, generation = generation)
-        }
-    }
 
     private fun startDiscovery(reset: Boolean, generation: Long) {
         if (!isActive(generation)) return
@@ -723,10 +666,7 @@ class EmbeddedAdbService : Service() {
         const val ACTION_RETRY = "com.yubegreen.luonnotar.action.EMBEDDED_ADB_RETRY"
         const val ACTION_PAIR = "com.yubegreen.luonnotar.action.EMBEDDED_ADB_PAIR"
         const val ACTION_STOP = "com.yubegreen.luonnotar.action.EMBEDDED_ADB_STOP"
-        const val ACTION_RESTART_ENGINE =
-            "com.yubegreen.luonnotar.action.EMBEDDED_ADB_RESTART_ENGINE"
         const val EXTRA_GENERATION = "embedded_guardian_generation"
-        const val EXTRA_RESTART_SOURCE = "embedded_guardian_restart_source"
         private const val LOCAL_PROPERTY_TIMEOUT_MS = 1_000L
         private const val LOCAL_TCP_PROBE_TIMEOUT_MS = 600
         private const val MIN_RETRY_DELAY_MS = 1_000L
