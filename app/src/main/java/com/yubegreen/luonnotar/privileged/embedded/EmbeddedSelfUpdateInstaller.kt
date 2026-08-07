@@ -26,6 +26,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
@@ -171,7 +172,7 @@ internal object EmbeddedSelfUpdateInstaller {
         val finalStatus = AtomicInteger(Int.MIN_VALUE)
         val finalMessage = AtomicReference("")
         val approvalAttempt = AtomicInteger(0)
-        val approvalElapsed = AtomicReference(-1L)
+        val approvalElapsed = AtomicLong(-1L)
         val committedAt = SystemClock.elapsedRealtime()
         val finished = AtomicBoolean(false)
         val handlerThread = HandlerThread("luonnotar-self-update-result").apply { start() }
@@ -251,7 +252,7 @@ internal object EmbeddedSelfUpdateInstaller {
         installer: PackageInstaller,
         sessionId: Int,
         attemptCounter: AtomicInteger,
-        approvedElapsed: AtomicReference<Long>,
+        approvedElapsed: AtomicLong,
         committedAt: Long
     ) {
         if (approvedElapsed.get() >= 0L) return
