@@ -1,5 +1,19 @@
 # Luonnotar
 
+## 2.5.1 r262 vendor-defense ownership + self-update PoC
+
+- Keeps r261 provider-first engine control and r260 hot handoff.
+- Gives an active VIVO `fast_freezer` defense episode temporary ownership of GMS recovery, suppressing the older reset/force-stop campaign while the vendor-defense owner is active.
+- Adds a 120-second stable-hold phase after the 12-second physical-thaw gate, so a refreeze returns to the same defense episode instead of creating a fresh episode immediately.
+- Slows defense command cadence to 2.5 seconds and removes AOSP freeze-adoption from the VIVO defense fallback; a defense retry is now a bounded release-only pair.
+- Detects the OriginOS `CachedAppOptimizer`/`mFreezeHandler` failure signature and marks framework freezing unsupported for the current bridge process instead of repeatedly issuing doomed freeze commands.
+- Clamps `Long.MAX_VALUE` recovery-wait telemetry to `-1` instead of emitting meaningless multi-billion-year waits.
+- Adds the first-stage shell-only self-update PoC: `install_self_update` accepts only a newer `com.yubegreen.luonnotar` APK with the same signing certificate, from `/data/local/tmp/luonnotar-self-update/`, snapshots it before validation, writes a `PackageInstaller` session, and uses the shell UID's `INSTALL_PACKAGES` capability to approve a pending permission prompt through `PackageInstaller.setPermissionsResult()`.
+- Self-update is deliberately not a generic APK installer and has no production update UI yet.
+- Embedded engine revision: **262**. Status schema: **21**.
+
+> Current local version: **2.5.1 (versionCode 84)** — package: `com.yubegreen.luonnotar`.
+
 ## 2.5.1 r261 provider-first engine control + hot handoff
 
 - Keeps r260's authenticated loopback hot handoff and r259's sustained vendor-refreeze defense.

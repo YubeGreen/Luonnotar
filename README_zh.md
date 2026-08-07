@@ -1,5 +1,19 @@
 # 努昂诺塔（Luonnotar）
 
+## 2.5.1 r262 厂商回冻 Recovery Owner + 自更新 PoC
+
+- 保留 r261 Provider-first 引擎控制和 r260 hot handoff。
+- VIVO `fast_freezer` 防守 episode 活跃时临时取得 GMS recovery 所有权，旧的 reset/force-stop campaign 只能继续观察，不能并行做破坏性重置。
+- 12 秒物理解冻稳定门之后增加 120 秒 stable-hold；hold 内再次回冻继续同一 episode，不再立刻创建新的 seq。
+- defense 命令节流从 250 ms 拉到 2.5 s，并移除 VIVO defense fallback 里的 AOSP freeze-adoption；失败时最多再做一组有界 release，不允许单次 fallback 扩散成几十条命令。
+- 识别 OriginOS `CachedAppOptimizer` / `mFreezeHandler` NPE 特征，本 bridge 生命周期内标记 framework freezer unsupported，后续不再反复调用必炸的 `am/cmd activity freeze`。
+- `Long.MAX_VALUE` 的恢复等待遥测改为 `-1`，不再打印巨大的伪等待时间。
+- 同时加入第一阶段 shell-only 静默自更新 PoC：只接受 `/data/local/tmp/luonnotar-self-update/` 下、包名为 `com.yubegreen.luonnotar`、同签名且 versionCode 更高的 APK；先固定快照再校验/写入 `PackageInstaller` session，并利用 UID 2000 已有 `INSTALL_PACKAGES` 能力通过 `PackageInstaller.setPermissionsResult()` 批准必要的 OriginOS pending-user-action。
+- 该 PoC 不是任意 APK 安装器，也暂不加入正式自动更新 UI。
+- 内置引擎修订号：**262**；状态 schema：**21**。
+
+> 当前本地版本：**2.5.1（versionCode 84）**，包名：`com.yubegreen.luonnotar`。
+
 ## 2.5.1 r261 Provider-first 引擎控制 + 热切换
 
 - 保留 r260 的已认证 loopback hot handoff，以及 r259 的持续厂商回冻防守。

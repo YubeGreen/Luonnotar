@@ -62,6 +62,8 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             METHOD_STATUS -> status(appContext)
             METHOD_ENGINE_STATUS -> engineStatus(appContext)
             METHOD_ENGINE_RESTART -> engineRestart(appContext)
+            METHOD_SELF_UPDATE -> selfUpdate(appContext, extras ?: Bundle.EMPTY)
+            METHOD_SELF_UPDATE_STATUS -> selfUpdateStatus(appContext)
             METHOD_SET -> setRuntimeConfig(appContext, extras ?: Bundle.EMPTY)
             METHOD_PROBE -> probeNow(appContext, extras ?: Bundle.EMPTY)
             METHOD_EXPERIMENT_START -> experimentStart(
@@ -836,6 +838,121 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         )
     }
 
+
+    private fun selfUpdate(
+        context: android.content.Context,
+        extras: Bundle
+    ): Bundle {
+        val apkPath = extras.getString(EXTRA_APK_PATH).orEmpty().trim()
+        if (apkPath.isBlank()) {
+            return engineResultBundle(
+                ok = false,
+                reason = "apk_path_required",
+                values = mapOf("dispatched" to false)
+            )
+        }
+        val identity = EmbeddedGuardianStore.identity(context)
+            ?: return engineResultBundle(
+                ok = false,
+                reason = "identity_missing",
+                values = mapOf("dispatched" to false)
+            )
+        val raw = runCatching {
+            EmbeddedGuardianClient(
+                identity.port,
+                identity.token,
+                connectTimeoutMs = 1_000,
+                readTimeoutMs = 2_000
+            ).installSelfUpdate(
+                JSONObject().put("apkPath", apkPath).toString()
+            )
+        }.getOrElse { error ->
+            LogManager.event(
+                context,
+                "self_update_dispatch_failed",
+                mapOf("error" to error.toString())
+            )
+            return engineResultBundle(
+                ok = false,
+                reason = "engine_rpc_failed",
+                values = mapOf(
+                    "dispatched" to false,
+                    "error" to error.toString().take(400)
+                )
+            )
+        }
+        val response = runCatching { JSONObject(raw) }.getOrNull()
+            ?: return engineResultBundle(
+                ok = false,
+                reason = "invalid_engine_response",
+                values = mapOf("dispatched" to false)
+            )
+        val accepted = response.optBoolean("accepted", false)
+        LogManager.event(
+            context,
+            "self_update_request",
+            mapOf(
+                "transport" to "content_provider",
+                "accepted" to accepted,
+                "apkName" to java.io.File(apkPath).name
+            )
+        )
+        return engineResultBundle(
+            ok = accepted,
+            reason = if (accepted) "" else response.optString("reason", "rejected"),
+            values = linkedMapOf<String, Any>(
+                "dispatched" to accepted,
+                "state" to response.optString("state", "unknown"),
+                "engineRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
+                "apkName" to java.io.File(apkPath).name
+            )
+        )
+    }
+
+    private fun selfUpdateStatus(context: android.content.Context): Bundle {
+        val identity = EmbeddedGuardianStore.identity(context)
+            ?: return engineResultBundle(
+                ok = false,
+                reason = "identity_missing",
+                values = emptyMap()
+            )
+        val raw = runCatching {
+            EmbeddedGuardianClient(
+                identity.port,
+                identity.token,
+                connectTimeoutMs = 1_000,
+                readTimeoutMs = 2_000
+            ).selfUpdateStatus()
+        }.getOrElse { error ->
+            return engineResultBundle(
+                ok = false,
+                reason = "engine_rpc_failed",
+                values = mapOf("error" to error.toString().take(400))
+            )
+        }
+        val response = runCatching { JSONObject(raw) }.getOrNull()
+            ?: return engineResultBundle(
+                ok = false,
+                reason = "invalid_engine_response",
+                values = emptyMap()
+            )
+        val values = linkedMapOf<String, Any>(
+            "state" to response.optString("state", "unknown"),
+            "running" to response.optBoolean("running", false),
+            "resultOk" to response.optBoolean("ok", false),
+            "code" to response.optString("code", ""),
+            "message" to response.optString("message", "").take(400),
+            "sessionId" to response.optInt("sessionId", -1),
+            "packageName" to response.optString("packageName", ""),
+            "versionCode" to response.optLong("versionCode", -1L),
+            "apkSize" to response.optLong("apkSize", -1L),
+            "durationMs" to response.optLong("durationMs", -1L),
+            "permissionApprovalAttempt" to response.optInt("permissionApprovalAttempt", 0),
+            "permissionApprovalElapsed" to response.optLong("permissionApprovalElapsed", -1L)
+        )
+        return engineResultBundle(ok = true, reason = "", values = values)
+    }
+
     private fun probeEngine(context: android.content.Context): EngineRuntimeProbe {
         val snapshot = EmbeddedGuardianStore.snapshot(context)
         val identity = EmbeddedGuardianStore.identity(context)
@@ -1003,6 +1120,8 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val METHOD_STATUS = "status"
         const val METHOD_ENGINE_STATUS = "engine_status"
         const val METHOD_ENGINE_RESTART = "engine_restart"
+        const val METHOD_SELF_UPDATE = "self_update"
+        const val METHOD_SELF_UPDATE_STATUS = "self_update_status"
         const val METHOD_SET = "set"
         const val METHOD_PROBE = "probe"
         const val METHOD_EXPERIMENT_START = "experiment_start"
@@ -1012,6 +1131,7 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val EXTRA_SESSION_NAME = "session_name"
         const val EXTRA_MARK_LABEL = "mark_label"
         const val EXTRA_PROBE = "probe"
+        const val EXTRA_APK_PATH = "apk_path"
         const val EXTRA_LAB_LEVEL = "lab_level"
         const val RESULT_OK = "ok"
         const val RESULT_REASON = "reason"

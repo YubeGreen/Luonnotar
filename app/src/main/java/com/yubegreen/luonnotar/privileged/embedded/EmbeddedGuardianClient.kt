@@ -18,6 +18,9 @@ class EmbeddedGuardianClient(
     fun applyBackgroundPolicy(requestJson: String): String =
         call(EmbeddedGuardianProtocol.OP_BACKGROUND_POLICY, requestJson)
     fun handoff(requestJson: String): String = call(EmbeddedGuardianProtocol.OP_HANDOFF, requestJson)
+    fun installSelfUpdate(requestJson: String): String =
+        call(EmbeddedGuardianProtocol.OP_INSTALL_SELF_UPDATE, requestJson)
+    fun selfUpdateStatus(): String = call(EmbeddedGuardianProtocol.OP_SELF_UPDATE_STATUS)
     fun stop(): String = call(EmbeddedGuardianProtocol.OP_STOP)
     fun destroy(): String = call(EmbeddedGuardianProtocol.OP_DESTROY)
 

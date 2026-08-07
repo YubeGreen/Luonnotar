@@ -153,6 +153,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var vendorBridgeDefenseAccountingSequence = 0L
     private var vendorBridgeDefenseLastCommandCount = 0
     private var vendorBridgeDefenseCommandCount = 0L
+    private var vendorBridgeDefenseOwnershipUntilElapsed = 0L
+    private var vendorBridgeDefenseOwnershipSequence = 0L
+    private var vendorBridgeDefenseOwnershipPhase = "never"
+    private var vendorBridgeDefenseRecoverySuppressionCount = 0L
     private val vendorBridgeDefensePulsedSequences = LinkedHashSet<Long>()
     private var legacyGuardianDetectedCount = 0L
     private var legacyGuardianStoppedCount = 0L
@@ -1299,6 +1303,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 var schedulePulse = false
                 synchronized(lock) {
                     if (vendorBridgeProcess !== process) return@synchronized
+                    val nowElapsed = SystemClock.elapsedRealtime()
                     val elapsedMs = (record.elapsedCentiseconds * 10L).coerceAtLeast(0L)
                     val stableMs = (record.stableCentiseconds * 10L).coerceAtLeast(0L)
                     if (record.sequence != vendorBridgeDefenseAccountingSequence) {
@@ -1325,10 +1330,32 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                             schedulePulse = vendorBridgeDefensePulsedSequences.add(record.sequence)
                         }
                         "refrozen" -> vendorBridgeDefenseRefreezeCount += 1
+                        "stable_hold" -> Unit
                         "escalating" -> vendorBridgeDefenseEscalationCount += 1
                         "pid_changed" -> vendorBridgeDefensePidChangeCount += 1
                         "stable" -> vendorBridgeDefenseStableCount += 1
                         "expired" -> vendorBridgeDefenseExpiredCount += 1
+                    }
+                    when (record.phase) {
+                        "stable", "expired" -> {
+                            if (vendorBridgeDefenseOwnershipSequence == record.sequence) {
+                                vendorBridgeDefenseOwnershipUntilElapsed = 0L
+                                vendorBridgeDefenseOwnershipPhase = record.phase
+                            }
+                        }
+                        "stable_hold" -> {
+                            vendorBridgeDefenseOwnershipSequence = record.sequence
+                            vendorBridgeDefenseOwnershipPhase = record.phase
+                            vendorBridgeDefenseOwnershipUntilElapsed =
+                                nowElapsed + GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS +
+                                    VENDOR_DEFENSE_OWNER_GRACE_MS
+                        }
+                        else -> {
+                            vendorBridgeDefenseOwnershipSequence = record.sequence
+                            vendorBridgeDefenseOwnershipPhase = record.phase
+                            vendorBridgeDefenseOwnershipUntilElapsed =
+                                nowElapsed + VENDOR_DEFENSE_OWNER_ACTIVE_TTL_MS
+                        }
                     }
                     while (vendorBridgeDefensePulsedSequences.size > MAX_FAST_LANE_SEQUENCE_HISTORY) {
                         vendorBridgeDefensePulsedSequences.remove(
@@ -4238,17 +4265,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         if (frozen.isNotEmpty() && probe.observable && !probe.healthy &&
                             !gmsRecoveryInProgress
                         ) {
-                            vendorBridgeLockEscalationCount += 1
-                            eventLocked(
-                                "vendor_bridge_lock_escalated",
-                                "seq=$sequence signalElapsed=$signalElapsed frozen=${frozen.map { "${it.name}:${it.pid}" }}"
-                            )
-                            recoverGmsLocked(
-                                trigger = "vendor_bridge_refreeze_lock",
-                                manual = false,
-                                automaticEvidenceReason = "vendor_bridge_refreeze_lock",
-                                emergency = true
-                            )
+                            if (vendorDefenseOwnsGmsRecoveryLocked()) {
+                                vendorBridgeDefenseRecoverySuppressionCount += 1
+                                eventLocked(
+                                    "vendor_bridge_lock_escalation_suppressed_defense_owner",
+                                    "seq=$sequence signalElapsed=$signalElapsed " +
+                                        "ownerSeq=$vendorBridgeDefenseOwnershipSequence " +
+                                        "phase=$vendorBridgeDefenseOwnershipPhase " +
+                                        "frozen=${frozen.map { "${it.name}:${it.pid}" }}"
+                                )
+                            } else {
+                                vendorBridgeLockEscalationCount += 1
+                                eventLocked(
+                                    "vendor_bridge_lock_escalated",
+                                    "seq=$sequence signalElapsed=$signalElapsed frozen=${frozen.map { "${it.name}:${it.pid}" }}"
+                                )
+                                recoverGmsLocked(
+                                    trigger = "vendor_bridge_refreeze_lock",
+                                    manual = false,
+                                    automaticEvidenceReason = "vendor_bridge_refreeze_lock",
+                                    emergency = true
+                                )
+                            }
                         }
                     }
                 },
@@ -4746,8 +4784,33 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
     }
 
+    private fun vendorDefenseOwnsGmsRecoveryLocked(
+        nowElapsed: Long = SystemClock.elapsedRealtime()
+    ): Boolean {
+        val explicitOwner =
+            vendorBridgeReady &&
+                vendorBridgeDefenseOwnershipSequence > 0L &&
+                vendorBridgeDefenseOwnershipUntilElapsed > nowElapsed
+        if (explicitOwner) return true
+        // Close the small race between the event watcher seeing VIVO's
+        // am_app_frozen line and the bridge emitting its `defense started` record.
+        val lastFreeze = gmsFreezeEvents.lastOrNull() ?: return false
+        return vendorBridgeOwnsGmsCommandsLocked() &&
+            nowElapsed >= lastFreeze &&
+            nowElapsed - lastFreeze <= VENDOR_DEFENSE_OWNER_SIGNAL_GRACE_MS
+    }
+
     private fun maybeStartVerifiedGmsCampaignLocked() {
         if (gmsRecoveryInProgress || !config.vendorEmergencyRecoveryEnabled) return
+        if (vendorDefenseOwnsGmsRecoveryLocked()) {
+            vendorBridgeDefenseRecoverySuppressionCount += 1
+            eventLocked(
+                "gms_recovery_suppressed_vendor_defense_owner",
+                "source=verified_outage seq=$vendorBridgeDefenseOwnershipSequence " +
+                    "phase=$vendorBridgeDefenseOwnershipPhase"
+            )
+            return
+        }
         if (!lastGmsTransportProbe.observable || lastGmsTransportProbe.healthy) return
         if (gmsTransportConsecutiveMissing < 3) return
         val gmsProcesses = listGmsProcessesLocked()
@@ -4774,6 +4837,21 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     ): String {
         val now = SystemClock.elapsedRealtime()
         pruneGmsStateLocked(now)
+        if (!manual && vendorDefenseOwnsGmsRecoveryLocked(now)) {
+            vendorBridgeDefenseRecoverySuppressionCount += 1
+            eventLocked(
+                "gms_recovery_suppressed_vendor_defense_owner",
+                "source=$trigger seq=$vendorBridgeDefenseOwnershipSequence " +
+                    "phase=$vendorBridgeDefenseOwnershipPhase"
+            )
+            lastGmsRecoveryOutcome = GmsRecoveryOutcome(
+                trigger = trigger,
+                result = "suppressed:vendor_defense_owner",
+                startedElapsed = now,
+                completedElapsed = now
+            )
+            return statusJsonLocked()
+        }
         if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) {
             eventLocked("gms_recovery_rejected", "already_in_progress")
             return statusJsonLocked()
@@ -5142,7 +5220,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         vendorFamily
                     )
                 )
-        if (
+        val vendorDefenseOwnsRecovery = vendorDefenseOwnsGmsRecoveryLocked(now)
+        if (vendorDefenseOwnsRecovery && !probe.healthy) {
+            if (campaign.resetWaitReportedForCount != Int.MIN_VALUE) {
+                campaign.resetWaitReportedForCount = Int.MIN_VALUE
+                vendorBridgeDefenseRecoverySuppressionCount += 1
+                eventLocked(
+                    "gms_recovery_reset_suppressed_vendor_defense_owner",
+                    "generation=$generation seq=$vendorBridgeDefenseOwnershipSequence " +
+                        "phase=$vendorBridgeDefenseOwnershipPhase frozen=$anyFrozen " +
+                        "ports=${probe.establishedPorts.sorted()}"
+                )
+            }
+        } else if (
             !stabilizationGraceActive &&
             resetEligible &&
             resetPolicyAllows
@@ -5169,8 +5259,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         "ports=${probe.establishedPorts.sorted()}"
                 )
             } else {
-                val waitRemaining =
+                val waitRemaining = if (campaign.nextResetEligibleElapsed == Long.MAX_VALUE) {
+                    -1L
+                } else {
                     (campaign.nextResetEligibleElapsed - now).coerceAtLeast(0L)
+                }
                 eventLocked(
                     "gms_recovery_reset_deferred_preconnection_lease",
                     "generation=$generation resetCount=${campaign.resetCount} " +
@@ -6304,7 +6397,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("defenseLastCommandCount", vendorBridgeDefenseLastCommandCount)
             .put("defenseCommandCount", vendorBridgeDefenseCommandCount)
             .put("defenseStableRequiredMs", GmsVendorDefensePolicy.STABLE_REQUIRED_MILLISECONDS)
+            .put("defenseStableHoldMs", GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS)
             .put("defensePulseRequiredMs", GmsVendorDefensePolicy.PULSE_REQUIRED_MILLISECONDS)
+            .put("defenseRecoveryOwnerActive", vendorDefenseOwnsGmsRecoveryLocked())
+            .put("defenseRecoveryOwnerSequence", vendorBridgeDefenseOwnershipSequence)
+            .put("defenseRecoveryOwnerPhase", vendorBridgeDefenseOwnershipPhase)
+            .put(
+                "defenseRecoveryOwnerRemainingMs",
+                (vendorBridgeDefenseOwnershipUntilElapsed - SystemClock.elapsedRealtime())
+                    .coerceAtLeast(0L)
+            )
+            .put("defenseRecoverySuppressionCount", vendorBridgeDefenseRecoverySuppressionCount)
             .put("legacyGuardianDetectedCount", legacyGuardianDetectedCount)
             .put("legacyGuardianStoppedCount", legacyGuardianStoppedCount)
             .put("legacyGuardianLastResult", legacyGuardianLastResult)
@@ -6800,7 +6903,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 20
+        private const val STATUS_SCHEMA = 21
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
@@ -6810,6 +6913,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val VENDOR_BRIDGE_READY_TIMEOUT_MS = 3_000L
         private const val VENDOR_BRIDGE_STALE_HEARTBEAT_MS = 30_000L
         private const val VENDOR_BRIDGE_LOCK_ESCALATION_DELAY_MS = 750L
+        private const val VENDOR_DEFENSE_OWNER_ACTIVE_TTL_MS = 30_000L
+        private const val VENDOR_DEFENSE_OWNER_GRACE_MS = 5_000L
+        private const val VENDOR_DEFENSE_OWNER_SIGNAL_GRACE_MS = 15_000L
         private const val DELEGATED_UNFREEZE_LOG_INTERVAL_MS = 5_000L
         private const val LEGACY_GUARDIAN_PID_PATH = "/data/local/tmp/luonnotar2/guardian.pid"
         private const val LEGACY_GUARDIAN_AUDIT_INTERVAL_MS = 60_000L

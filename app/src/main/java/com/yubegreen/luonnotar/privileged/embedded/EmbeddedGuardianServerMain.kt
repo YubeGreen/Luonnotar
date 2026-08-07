@@ -36,6 +36,7 @@ object EmbeddedGuardianServerMain {
             bind(InetSocketAddress(EmbeddedGuardianProtocol.HOST, port), 16)
         }
         Runtime.getRuntime().addShutdownHook(Thread {
+            runCatching { EmbeddedSelfUpdateCoordinator.shutdown() }
             runCatching { engine.stop() }
             runCatching { server.close() }
             runCatching { instanceGuard.close() }
@@ -47,6 +48,7 @@ object EmbeddedGuardianServerMain {
             executor.execute { handle(socket, token, port, engine, instanceGuard, stopping, server) }
         }
         executor.shutdown()
+        runCatching { EmbeddedSelfUpdateCoordinator.shutdown() }
         runCatching { engine.stop() }
         runCatching { instanceGuard.close() }
         exitProcess(0)
@@ -87,6 +89,10 @@ object EmbeddedGuardianServerMain {
                         EmbeddedGuardianProtocol.OP_CYCLE -> engine.runCycle()
                         EmbeddedGuardianProtocol.OP_RECOVER_GMS -> engine.recoverGms()
                         EmbeddedGuardianProtocol.OP_BACKGROUND_POLICY -> engine.applyBackgroundPolicy(payload)
+                        EmbeddedGuardianProtocol.OP_INSTALL_SELF_UPDATE ->
+                            EmbeddedSelfUpdateCoordinator.start(payload)
+                        EmbeddedGuardianProtocol.OP_SELF_UPDATE_STATUS ->
+                            EmbeddedSelfUpdateCoordinator.status()
                         EmbeddedGuardianProtocol.OP_HANDOFF -> {
                             val value = EmbeddedGuardianHandoffLauncher.schedule(
                                 payload = payload,
