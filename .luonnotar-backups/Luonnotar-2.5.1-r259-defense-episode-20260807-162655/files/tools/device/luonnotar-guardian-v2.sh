@@ -8,7 +8,6 @@ STATUS_FILE="$BASE/status.json"
 LOG_FILE="$BASE/guardian.log"
 STATE_DIR="$BASE/state"
 EVENT_TRIGGER_FILE="$BASE/freezer-event.trigger"
-MODERN_OWNER_FILE="/data/local/tmp/luonnotar-freezer-command-owner"
 POLL_SECONDS="${LUONNOTAR_POLL_SECONDS:-15}"
 REASSERT_SECONDS="${LUONNOTAR_REASSERT_SECONDS:-60}"
 TUNE_SECONDS="${LUONNOTAR_TUNE_SECONDS:-900}"
@@ -46,72 +45,6 @@ mkdir -p "$BASE" "$STATE_DIR" 2>/dev/null
 
 now_epoch() { date +%s 2>/dev/null || echo 0; }
 now_elapsed() { cut -d. -f1 /proc/uptime 2>/dev/null || now_epoch; }
-now_centiseconds() {
-    awk '{printf "%d\n", $1 * 100}' /proc/uptime 2>/dev/null || echo 0
-}
-
-proc_start_time_ticks() {
-    identity_pid="$1"
-    identity_stat=$(cat "/proc/$identity_pid/stat" 2>/dev/null) || return 1
-    case "$identity_stat" in *') '*) ;; *) return 1 ;; esac
-    identity_tail="${identity_stat##*) }"
-    identity_start=$(printf '%s\n' "$identity_tail" | awk '{print $20}')
-    case "$identity_start" in ''|*[!0-9]*) return 1 ;; esac
-    printf '%s\n' "$identity_start"
-}
-
-pid_start_matches() {
-    identity_pid="$1"
-    identity_expected="$2"
-    case "$identity_pid:$identity_expected" in *[!0-9:]*|:|0:*|*:0) return 1 ;; esac
-    is_alive "$identity_pid" || return 1
-    identity_current=$(proc_start_time_ticks "$identity_pid") || return 1
-    [ "$identity_current" = "$identity_expected" ]
-}
-
-# r258 and newer own all freezer commands through a narrow lease. This retired
-# fallback remains usable on old/manual installations, but must never overlap a
-# live modern bridge. The heartbeat check prevents a stale owner file or reused
-# PID from suppressing the fallback indefinitely.
-modern_owner_active() {
-    [ -r "$MODERN_OWNER_FILE" ] || return 1
-    owner=""; owner_parent=""; owner_shell=""; owner_parent_start=""; owner_shell_start=""; owner_heartbeat=""
-    while IFS='=' read -r key value; do
-        case "$key" in
-            owner) owner="$value" ;;
-            parentPid) owner_parent="$value" ;;
-            shellPid) owner_shell="$value" ;;
-            parentStartTicks) owner_parent_start="$value" ;;
-            shellStartTicks) owner_shell_start="$value" ;;
-            heartbeatPath) owner_heartbeat="$value" ;;
-        esac
-    done < "$MODERN_OWNER_FILE"
-    [ "$owner" = "vendor_bridge" ] || return 1
-    case "$owner_parent:$owner_shell" in *[!0-9:]*|:|0:*|*:0) return 1 ;; esac
-    case "$owner_heartbeat" in /data/local/tmp/luonnotar-vendor-freeze-bridge-*.heartbeat) ;; *) return 1 ;; esac
-    pid_start_matches "$owner_parent" "$owner_parent_start" || return 1
-    pid_start_matches "$owner_shell" "$owner_shell_start" || return 1
-    [ -r "$owner_heartbeat" ] || return 1
-    hb_parent=""; hb_shell=""; hb_parent_start=""; hb_shell_start=""; hb_at=""; hb_owner=""
-    while IFS='=' read -r key value; do
-        case "$key" in
-            owner) hb_owner="$value" ;;
-            parentPid) hb_parent="$value" ;;
-            shellPid) hb_shell="$value" ;;
-            parentStartTicks) hb_parent_start="$value" ;;
-            shellStartTicks) hb_shell_start="$value" ;;
-            atCs) hb_at="$value" ;;
-        esac
-    done < "$owner_heartbeat"
-    [ "$hb_owner" = "vendor_bridge" ] || return 1
-    [ "$hb_parent" = "$owner_parent" ] && [ "$hb_shell" = "$owner_shell" ] || return 1
-    [ "$hb_parent_start" = "$owner_parent_start" ] && [ "$hb_shell_start" = "$owner_shell_start" ] || return 1
-    case "$hb_at" in ''|*[!0-9]*) return 1 ;; esac
-    current_cs=$(now_centiseconds)
-    case "$current_cs" in ''|*[!0-9]*) return 1 ;; esac
-    [ "$current_cs" -ge "$hb_at" ] || return 1
-    [ $((current_cs - hb_at)) -le 500 ]
-}
 
 rotate_log() {
     [ -f "$LOG_FILE" ] || return 0
@@ -137,16 +70,11 @@ is_guardian_pid() {
     guardian_pid="$1"
     is_alive "$guardian_pid" || return 1
     [ -r "/proc/$guardian_pid/cmdline" ] || return 1
-    previous=""
-    while IFS= read -r token; do
-        if [ "${previous##*/}" = "luonnotar-guardian-v2.sh" ] && [ "$token" = "daemon" ]; then
-            return 0
-        fi
-        previous="$token"
-    done <<EOF
-$(tr '\000' '\n' < "/proc/$guardian_pid/cmdline" 2>/dev/null)
-EOF
-    return 1
+    cmdline=$(tr '\000' ' ' < "/proc/$guardian_pid/cmdline" 2>/dev/null)
+    case "$cmdline" in
+        *luonnotar-guardian-v2.sh*daemon*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 read_pid_file() {
@@ -266,10 +194,6 @@ freeze_evidence() {
 unfreeze_process() {
     name="$1"
     pid="$2"
-    if modern_owner_active; then
-        log "unfreeze_suppressed owner=vendor_bridge name=$name pid=$pid"
-        return 75
-    fi
     if [ "$sticky_supported" -eq 1 ]; then
         output=$(am unfreeze --sticky "$name" --user 0 2>&1)
         rc=$?
@@ -387,11 +311,6 @@ run_cycle() {
 }
 
 daemon() {
-    if modern_owner_active; then
-        echo "refusing to overlap live r258+ freezer-command owner" >&2
-        log "engine_start_refused owner=vendor_bridge"
-        exit 75
-    fi
     old=$(read_pid_file)
     if is_guardian_pid "$old" && [ "$old" != "$$" ]; then
         echo "already running pid=$old" >&2
@@ -410,10 +329,6 @@ daemon() {
     start_event_watcher
     log "engine_started pid=$$ poll=${POLL_SECONDS}s reassert=${REASSERT_SECONDS}s"
     while :; do
-        if modern_owner_active; then
-            log "engine_stopping owner=vendor_bridge"
-            exit 0
-        fi
         run_cycle
         is_alive "$watcher_pid" || start_event_watcher
         wait_for_next_cycle

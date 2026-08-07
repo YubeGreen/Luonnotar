@@ -29,7 +29,7 @@ class EmbeddedGuardianProtocolTest {
         assertFalse(JSONObject(EmbeddedGuardianProtocol.failure("bad")).getBoolean("ok"))
     }
 
-    @Test fun engineRevisionMatches250ReleaseR257() {
-        assertEquals(257, EmbeddedGuardianProtocol.ENGINE_REVISION)
+    @Test fun engineRevisionMatches251ReleaseR259() {
+        assertEquals(259, EmbeddedGuardianProtocol.ENGINE_REVISION)
     }
 }

@@ -27,7 +27,7 @@ It explicitly does **not** force-stop Google Play services, clear application da
 
 ### 2. Standalone ADB shell guardian
 
-`tools/device/luonnotar-guardian-v2.sh` is a retired independent fallback for testing before or without the APK UserService. It runs from `/data/local/tmp/luonnotar2`, survives the Luonnotar APK UID being frozen, watches freezer events, performs the old target unfreeze/reassert policy, and writes machine-readable status plus a rotated log. It must not run alongside r258 or newer: the script now detects the live freezer-command owner lease, suppresses every unfreeze, and exits its daemon loop rather than racing the embedded bridge.
+`tools/device/luonnotar-guardian-v2.sh` is an independent fallback for testing before, without, or alongside the APK UserService. It runs from `/data/local/tmp/luonnotar2`, survives the Luonnotar APK UID being frozen, watches freezer events, performs the same target unfreeze/reassert policy, and writes machine-readable status plus a rotated log.
 
 It is installed and controlled by `tools/install-luonnotar-2.0-shell-engine.ps1`.
 

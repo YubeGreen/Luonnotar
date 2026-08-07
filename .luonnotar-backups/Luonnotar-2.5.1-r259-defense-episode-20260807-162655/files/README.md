@@ -1,17 +1,5 @@
 # Luonnotar
 
-## 2.5.1 r259 sustained vendor-refreeze defense
-
-- Keeps r258's single validated freezer-command owner and atomic GMS main/persistent group; exact lease cleanup no longer leaves a stale owner when the parent service exits.
-- Treats repeated Vivo/iQOO `fast_freezer` activity as one sustained defense episode instead of independent recoveries.
-- Sends at most one bounded MCS reconnect pulse per GMS PID generation; it cannot build the global exhaustion streak or recursively trigger an emergency campaign.
-- Requires both GMS core processes to remain physically thawed for 12 continuous seconds before reporting recovery.
-- Resets stability on every refreeze, records PID-generation changes, and permits a fresh one-shot pulse for replacement processes.
-- Escalates once after 30 seconds without any physical thaw or two minutes of sustained refreezing, while continuing to defend.
-- Embedded engine revision: **259**. Status schema: **20**.
-
-> Current local version: **2.5.1 (versionCode 81)** — package: `com.yubegreen.luonnotar`.
-
 ## 2.3.7 embedded engine post-connect crash hotfix
 
 - Prevents a timed-out status socket from killing the UID 2000 `app_process` engine with `Broken pipe`.
@@ -28,6 +16,7 @@
 
 
 > Android VPN-path guardian and diagnostics tool. Current release identity: **YubeGreen**.  
+> Current local version: **2.3.7 (versionCode 59)** — package: `com.yubegreen.luonnotar`.
 
 Luonnotar observes and guards the VPN network path, foreground guardian service,
 system recovery chain, and local notification-arrival evidence on Android. It is

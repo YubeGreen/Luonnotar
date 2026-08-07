@@ -186,7 +186,6 @@ internal object GmsFreezerFastLaneScript {
             stopping=0
             monitor_pid=""
             pipeline_pid=""
-            command_owner_file="/data/local/tmp/luonnotar-freezer-command-owner"
 
             rm -rf "${'$'}base"
             mkdir -p "${'$'}base" || exit 70
@@ -204,24 +203,6 @@ internal object GmsFreezerFastLaneScript {
                     '') _frac=0 ;;
                 esac
                 NOW_CS=${'$'}((_sec * 100 + _frac))
-            }
-
-            proc_start_time_ticks() {
-                _identity_stat=${'$'}(cat "/proc/${'$'}1/stat" 2>/dev/null) || return 1
-                case "${'$'}_identity_stat" in *') '*) ;; *) return 1 ;; esac
-                _identity_tail="${'$'}{_identity_stat##*) }"
-                _identity_start=${'$'}(printf '%s\n' "${'$'}_identity_tail" | awk '{print ${'$'}20}')
-                case "${'$'}_identity_start" in ''|*[!0-9]*) return 1 ;; esac
-                printf '%s\n' "${'$'}_identity_start"
-            }
-
-            pid_start_matches() {
-                _identity_pid="${'$'}1"
-                _identity_expected="${'$'}2"
-                case "${'$'}_identity_pid:${'$'}_identity_expected" in *[!0-9:]*|:|0:*|*:0) return 1 ;; esac
-                kill -0 "${'$'}_identity_pid" >/dev/null 2>&1 || return 1
-                _identity_current=${'$'}(proc_start_time_ticks "${'$'}_identity_pid") || return 1
-                [ "${'$'}_identity_current" = "${'$'}_identity_expected" ]
             }
 
             read_number() {
@@ -257,70 +238,8 @@ internal object GmsFreezerFastLaneScript {
                 wait "${'$'}_limited_pid"
             }
 
-            vendor_bridge_owns_commands() {
-                [ -r "${'$'}command_owner_file" ] || return 1
-                _owner=""
-                _owner_parent=0
-                _owner_shell=0
-                _owner_parent_start=""
-                _owner_shell_start=""
-                _owner_heartbeat=""
-                while IFS='=' read -r _key _value; do
-                    case "${'$'}_key" in
-                        owner) _owner="${'$'}_value" ;;
-                        parentPid) _owner_parent="${'$'}_value" ;;
-                        shellPid) _owner_shell="${'$'}_value" ;;
-                        parentStartTicks) _owner_parent_start="${'$'}_value" ;;
-                        shellStartTicks) _owner_shell_start="${'$'}_value" ;;
-                        heartbeatPath) _owner_heartbeat="${'$'}_value" ;;
-                    esac
-                done < "${'$'}command_owner_file"
-                case "${'$'}_owner_parent:${'$'}_owner_shell" in
-                    *[!0-9:]*|:|0:*|*:0) return 1 ;;
-                esac
-                case "${'$'}_owner_heartbeat" in
-                    /data/local/tmp/luonnotar-vendor-freeze-bridge-*.heartbeat) ;;
-                    *) return 1 ;;
-                esac
-                [ "${'$'}_owner" = "vendor_bridge" ] || return 1
-                [ -r "${'$'}_owner_heartbeat" ] || return 1
-                _hb_owner=""
-                _hb_parent=0
-                _hb_shell=0
-                _hb_parent_start=""
-                _hb_shell_start=""
-                _hb_at=0
-                while IFS='=' read -r _key _value; do
-                    case "${'$'}_key" in
-                        owner) _hb_owner="${'$'}_value" ;;
-                        parentPid) _hb_parent="${'$'}_value" ;;
-                        shellPid) _hb_shell="${'$'}_value" ;;
-                        parentStartTicks) _hb_parent_start="${'$'}_value" ;;
-                        shellStartTicks) _hb_shell_start="${'$'}_value" ;;
-                        atCs) _hb_at="${'$'}_value" ;;
-                    esac
-                done < "${'$'}_owner_heartbeat"
-                case "${'$'}_hb_parent:${'$'}_hb_shell:${'$'}_hb_at" in
-                    *[!0-9:]*|*::*) return 1 ;;
-                esac
-                [ "${'$'}_hb_owner" = "vendor_bridge" ] || return 1
-                [ "${'$'}_hb_parent" = "${'$'}_owner_parent" ] || return 1
-                [ "${'$'}_hb_shell" = "${'$'}_owner_shell" ] || return 1
-                [ "${'$'}_hb_parent_start" = "${'$'}_owner_parent_start" ] || return 1
-                [ "${'$'}_hb_shell_start" = "${'$'}_owner_shell_start" ] || return 1
-                pid_start_matches "${'$'}_owner_parent" "${'$'}_owner_parent_start" || return 1
-                pid_start_matches "${'$'}_owner_shell" "${'$'}_owner_shell_start" || return 1
-                read_uptime_cs
-                [ "${'$'}NOW_CS" -ge "${'$'}_hb_at" ] || return 1
-                [ ${'$'}((NOW_CS - _hb_at)) -le 500 ]
-            }
-
             unfreeze_process() {
                 _target="${'$'}1"
-                if vendor_bridge_owns_commands; then
-                    printf '__LUONNOTAR_FAST_LANE_DIAG__\ttype=command_owner_suppressed\tdetail=target_%s_owner_vendor_bridge\n' "${'$'}_target"
-                    return 75
-                fi
                 case "${'$'}_target" in
                     com.google.android.gms|com.google.android.gms.persistent) ;;
                     *) return 64 ;;

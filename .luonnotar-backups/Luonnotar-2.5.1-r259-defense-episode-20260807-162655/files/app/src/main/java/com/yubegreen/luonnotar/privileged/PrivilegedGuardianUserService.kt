@@ -7,7 +7,6 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
 import java.util.ArrayDeque
-import java.util.LinkedHashSet
 import java.util.concurrent.Executors
 import java.util.concurrent.ScheduledFuture
 import java.util.concurrent.TimeUnit
@@ -84,14 +83,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var eventFastLaneLastPostRecoveryElapsed = 0L
     private var eventFastLanePostRecoveryCount = 0L
 
-    // r259: the independent cgroup sentinel is the single command owner and
-    // treats repeated OEM refreezes as one durable defense episode.
+    // r257: an independent cgroup sentinel catches vendor freezes that never
+    // produce am_app_frozen and may not update AOSP freezer bookkeeping.
     private var vendorBridgeRestartFuture: ScheduledFuture<*>? = null
     private var vendorBridgeReadyTimeoutFuture: ScheduledFuture<*>? = null
     private var vendorBridgeProcess: java.lang.Process? = null
     private var vendorBridgeThread: Thread? = null
     private var vendorBridgeDeviceFamily: BackgroundPolicyVendorFamily? = null
-    private var vendorBridgeConfiguredTargets: Set<String> = emptySet()
     private var vendorBridgeAlive = false
     private var vendorBridgeReady = false
     private var vendorBridgeTimeoutSupported = false
@@ -104,8 +102,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var vendorBridgeRecoveryAttemptCount = 0L
     private var vendorBridgePlainRecoveryCount = 0L
     private var vendorBridgeAdoptReleaseCount = 0L
-    private var vendorBridgeAdoptUnconfirmedCount = 0L
-    private var vendorBridgeFrameworkLedgerRetryCount = 0L
     private var vendorBridgeVerifiedRecoveryCount = 0L
     private var vendorBridgeFailedRecoveryCount = 0L
     private var vendorBridgeLockCount = 0L
@@ -118,47 +114,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var vendorBridgeMainState = "unknown"
     private var vendorBridgePersistentPid = 0
     private var vendorBridgePersistentState = "unknown"
-    private var vendorBridgeWhatsappPid = 0
-    private var vendorBridgeWhatsappState = "disabled"
-    private var vendorBridgeSignalPid = 0
-    private var vendorBridgeSignalState = "disabled"
     private var vendorBridgeLastRecoveryLatencyMs = 0L
     private var vendorBridgeMaxRecoveryLatencyMs = 0L
-    private var vendorBridgeShellPid = 0
-    private var vendorBridgeParentStartTimeTicks = ""
-    private var vendorBridgeShellStartTimeTicks = ""
-    private var vendorBridgeHeartbeatPath = ""
-    private var vendorBridgeOwnerPath = ""
-    private var vendorBridgeHeartbeatFileAgeMs = -1L
-    private var vendorBridgeHeartbeatFileValid = false
-    private var vendorBridgeOwnerLeaseValid = false
-    private var vendorBridgeGroupRecoveryCount = 0L
-    private var vendorBridgeReleaseRetryCount = 0L
-    private var vendorBridgeAdoptObservedCount = 0L
-    private var vendorBridgeSuppressedInternalUnfreezeCount = 0L
-    private var vendorBridgeLastCommandDetail = ""
-    private var vendorBridgeLockEscalationCount = 0L
-    private var vendorBridgeDefenseEpisodeCount = 0L
-    private var vendorBridgeDefensePulseCount = 0L
-    private var vendorBridgeDefenseStableCount = 0L
-    private var vendorBridgeDefenseRefreezeCount = 0L
-    private var vendorBridgeDefenseEscalationCount = 0L
-    private var vendorBridgeDefensePidChangeCount = 0L
-    private var vendorBridgeDefenseExpiredCount = 0L
-    private var vendorBridgeDefenseLastSequence = 0L
-    private var vendorBridgeDefenseLastPhase = "never"
-    private var vendorBridgeDefenseLastElapsedMs = 0L
-    private var vendorBridgeDefenseLastStableMs = 0L
-    private var vendorBridgeDefenseLastAttempts = 0
-    private var vendorBridgeDefenseAccountingSequence = 0L
-    private var vendorBridgeDefenseLastCommandCount = 0
-    private var vendorBridgeDefenseCommandCount = 0L
-    private val vendorBridgeDefensePulsedSequences = LinkedHashSet<Long>()
-    private var legacyGuardianDetectedCount = 0L
-    private var legacyGuardianStoppedCount = 0L
-    private var legacyGuardianLastResult = "never"
-    private var lastLegacyGuardianAuditElapsed = 0L
-    private val lastDelegatedUnfreezeLogByPackage = linkedMapOf<String, Long>()
     private var eventTriggerCount = 0L
     private var config = GuardianEngineConfig().normalized()
     private var running = false
@@ -477,13 +434,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun startEventWatcherLocked(forceLegacy: Boolean = false) {
         val targetEnabled = isGmsFastLaneTargetedLocked()
-        val vendorBridgeOwnsGms = vendorBridgeOwnsGmsLocked()
+        val vendorBridgeTargeted = isVendorBridgeTargetedLocked()
         val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
-        // When the cgroup bridge owns GMS, the r256 logcat sidecar must remain
-        // observational only; otherwise two unfreeze loops can split the
-        // bounded adopt-release transaction. A Xiaomi bridge that only owns
-        // WhatsApp/Signal does not disable the independent GMS fast lane.
-        val wantsFastLane = !forceLegacy && targetEnabled && !vendorBridgeOwnsGms
+        // On vivo/OriginOS the cgroup watcher is the sole immediate owner.
+        // Keeping the r256 logcat sidecar active would race its adopt-release
+        // transaction with a second unfreeze loop.
+        val wantsFastLane = !forceLegacy && targetEnabled && !vendorBridgeTargeted
         val currentProcessAlive = eventWatcherProcess?.isAlive == true
         val currentThreadAlive = eventWatcherThread?.isAlive == true
         val currentCompatible = currentProcessAlive && currentThreadAlive && when {
@@ -509,7 +465,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (!wantsFastLane) {
             val reason = when {
                 forceLegacy -> "fast_lane_runtime_fallback"
-                vendorBridgeOwnsGms -> "vendor_cgroup_bridge"
+                vendorBridgeTargeted -> "vendor_cgroup_bridge"
                 else -> "gms_target_disabled"
             }
             startLegacyEventWatcherLocked(reason)
@@ -911,47 +867,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
-    private fun scheduleVendorDefenseMcsPulse(
-        sequence: Long,
-        sourceProcess: java.lang.Process
-    ) {
-        runCatching {
-            gmsFastThawExecutor.execute {
-                val stillCurrent = synchronized(lock) {
-                    running && vendorBridgeReady && vendorBridgeProcess === sourceProcess
-                }
-                if (!stillCurrent) return@execute
-                requestPostThawAnchorQuery()
-                if (shouldKickMcsAfterThaw()) {
-                    val plan = GmsVendorDefensePolicy.reconnectPlan()
-                    runGmsMcsKickWindow(
-                        trigger = "vendor_defense_pulse:seq=$sequence",
-                        maxRounds = plan.maxRounds,
-                        allowEmergencyEscalation = plan.allowEmergencyEscalation
-                    )
-                } else {
-                    synchronized(lock) {
-                        eventLocked(
-                            "gms_mcs_defense_pulse_skipped",
-                            "seq=$sequence transport_already_healthy_or_not_required"
-                        )
-                    }
-                }
-            }
-        }.onFailure { error ->
-            synchronized(lock) {
-                if (vendorBridgeProcess === sourceProcess) {
-                    vendorBridgeDefensePulsedSequences.remove(sequence)
-                }
-                errorCount += 1
-                eventLocked(
-                    "gms_mcs_defense_pulse_schedule_failed",
-                    "seq=$sequence ${error.javaClass.simpleName}:${error.message.orEmpty()}"
-                )
-            }
-        }
-    }
-
     private fun handleEventWatcherRawLine(process: java.lang.Process, line: String) {
         if (!synchronized(lock) { eventWatcherProcess === process }) return
         val now = SystemClock.elapsedRealtime()
@@ -974,18 +889,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val accepted = synchronized(lock) {
             recordVendorSignalLocked(signal, now)
             val gmsFreezeSignal = signal.packageName == GMS_PACKAGE
-            val bridgeOwnedFreezeSignal =
-                vendorBridgeOwnsPackageLocked(signal.packageName) &&
-                    signal.kind in setOf(
-                        VendorFreezeSignalKind.AOSP_APP_FROZEN,
-                        VendorFreezeSignalKind.XIAOMI_GREEZER_DENIAL,
-                        VendorFreezeSignalKind.UID_FROZEN_WAKELOCK
-                    )
-            // Ownership is policy-based. During bridge startup/restart we must
-            // still suppress every fallback unfreeze path; otherwise an event
-            // arriving inside that transition recreates a second command owner.
             delegatedToVendorBridge =
-                running && bridgeOwnedFreezeSignal
+                running && vendorBridgeReady && gmsFreezeSignal
             delegatedToFastLane =
                 running &&
                     !delegatedToVendorBridge &&
@@ -1048,59 +953,32 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     private fun startVendorBridgeLocked() {
-        val targets = vendorBridgeTargetsLocked()
-        if (targets.isEmpty()) {
+        val targetEnabled = isVendorBridgeTargetedLocked()
+        if (!targetEnabled) {
             stopVendorBridgeLocked()
-            vendorBridgeConfiguredTargets = emptySet()
-            vendorBridgeLastState = "disabled"
+            vendorBridgeLastState = if (isGmsFastLaneTargetedLocked()) {
+                "not_vivo"
+            } else {
+                "disabled"
+            }
             return
         }
-        val previousTargets = vendorBridgeConfiguredTargets
-        if (GMS_PACKAGE in targets && gmsFastThawWorkerActive.get()) {
-            gmsFastThawPendingSignalElapsed.set(0L)
-            vendorBridgeAlive = false
-            vendorBridgeReady = false
-            vendorBridgeLastState = "waiting_for_internal_unfreeze_owner"
-            eventLocked(
-                "vendor_bridge_start_deferred",
-                "reason=gms_fast_thaw_worker_active targets=${targets.sorted()}"
-            )
-            scheduleVendorBridgeRestartLocked()
-            return
-        }
-        gmsFastThawPendingSignalElapsed.set(0L)
         val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
         val processAlive = vendorBridgeProcess?.isAlive == true
         val threadAlive = vendorBridgeThread?.isAlive == true
-        if (
-            processAlive &&
-            threadAlive &&
-            vendorBridgeStickyConfigured == sticky &&
-            vendorBridgeConfiguredTargets == targets
-        ) {
+        if (processAlive && threadAlive && vendorBridgeStickyConfigured == sticky) {
             vendorBridgeAlive = true
             return
         }
 
         if (processAlive || threadAlive) {
             eventLocked(
-                "vendor_bridge_reconfigured",
-                "sticky=$sticky processAlive=$processAlive threadAlive=$threadAlive " +
-                    "oldTargets=${previousTargets.sorted()} newTargets=${targets.sorted()}"
+                "gms_vendor_bridge_reconfigured",
+                "sticky=$sticky processAlive=$processAlive threadAlive=$threadAlive"
             )
         }
         stopVendorBridgeLocked()
-        quarantineLegacyUnfreezeShellsLocked()
-        vendorBridgeConfiguredTargets = targets
         vendorBridgeStickyConfigured = sticky
-        vendorBridgeMainPid = 0
-        vendorBridgeMainState = if (GMS_PACKAGE in targets) "starting" else "disabled"
-        vendorBridgePersistentPid = 0
-        vendorBridgePersistentState = if (GMS_PACKAGE in targets) "starting" else "disabled"
-        vendorBridgeWhatsappPid = 0
-        vendorBridgeWhatsappState = if (WHATSAPP_PACKAGE in targets) "starting" else "disabled"
-        vendorBridgeSignalPid = 0
-        vendorBridgeSignalState = if (SIGNAL_PACKAGE in targets) "starting" else "disabled"
         vendorBridgeLastState = "starting"
 
         val startResult = runCatching {
@@ -1112,10 +990,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         writer.write(
                             GmsVendorFreezeBridgeScript.build(
                                 parentPid = Process.myPid(),
-                                stickyUnfreeze = sticky,
-                                monitorGms = GMS_PACKAGE in targets,
-                                monitorWhatsApp = WHATSAPP_PACKAGE in targets,
-                                monitorSignal = SIGNAL_PACKAGE in targets
+                                stickyUnfreeze = sticky
                             )
                         )
                         writer.flush()
@@ -1130,7 +1005,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             vendorBridgeAlive = false
             vendorBridgeLastState = "start_failed"
             eventLocked(
-                "vendor_bridge_start_failed",
+                "gms_vendor_bridge_start_failed",
                 "${error?.javaClass?.simpleName}:${error?.message.orEmpty()}"
             )
             scheduleVendorBridgeRestartLocked()
@@ -1142,7 +1017,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         vendorBridgeReady = false
         vendorBridgeStartCount += 1
         vendorBridgeThread = thread(
-            name = "luonnotar-vendor-freeze-bridge",
+            name = "luonnotar-gms-vendor-freeze-bridge",
             isDaemon = true
         ) {
             var failure: Throwable? = null
@@ -1167,8 +1042,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         errorCount += 1
                         vendorBridgeLastState = "ready_timeout"
                         eventLocked(
-                            "vendor_bridge_ready_timeout",
-                            "processAlive=${process.isAlive} sticky=$sticky targets=${targets.sorted()}"
+                            "gms_vendor_bridge_ready_timeout",
+                            "processAlive=${process.isAlive} sticky=$sticky"
                         )
                         stopVendorBridgeLocked()
                         if (running) scheduleVendorBridgeRestartLocked()
@@ -1180,15 +1055,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }.getOrElse { error ->
             errorCount += 1
             eventLocked(
-                "vendor_bridge_ready_timeout_schedule_failed",
+                "gms_vendor_bridge_ready_timeout_schedule_failed",
                 "${error.javaClass.simpleName}:${error.message.orEmpty()}"
             )
             null
         }
         eventLocked(
-            "vendor_bridge_started",
-            "strategy=${GmsVendorDefensePolicy.STRATEGY} sticky=$sticky parentPid=${Process.myPid()} " +
-                "targets=${targets.sorted()}"
+            "gms_vendor_bridge_started",
+            "strategy=cgroup_adopt_release sticky=$sticky parentPid=${Process.myPid()}"
         )
     }
 
@@ -1197,61 +1071,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         when (val record = GmsVendorFreezeBridgeProtocol.parse(line)) {
             is GmsVendorFreezeBridgeRecord.Ready -> synchronized(lock) {
                 if (vendorBridgeProcess !== process) return@synchronized
-                val expectedHeartbeatPath = if (record.shellPid > 1) {
-                    GmsVendorFreezeBridgeScript.heartbeatPath(
-                        parentPid = Process.myPid(),
-                        shellPid = record.shellPid
-                    )
-                } else {
-                    ""
-                }
-                val expectedParentStart = readProcStartTimeTicks(Process.myPid()).orEmpty()
-                val expectedShellStart = readProcStartTimeTicks(record.shellPid).orEmpty()
-                val readyIdentityValid =
-                    record.shellPid > 1 &&
-                        record.strategy == GmsVendorDefensePolicy.STRATEGY &&
-                        record.parentStartTimeTicks.isNotBlank() &&
-                        record.shellStartTimeTicks.isNotBlank() &&
-                        record.parentStartTimeTicks == expectedParentStart &&
-                        record.shellStartTimeTicks == expectedShellStart &&
-                        record.heartbeatPath == expectedHeartbeatPath &&
-                        record.ownerPath == GmsVendorFreezeBridgeScript.COMMAND_OWNER_PATH
-                if (!readyIdentityValid) {
-                    vendorBridgeFailureCount += 1
-                    errorCount += 1
-                    vendorBridgeLastState = "ready_identity_invalid"
-                    eventLocked(
-                        "vendor_bridge_ready_rejected",
-                        "shellPid=${record.shellPid} strategy=${record.strategy} " +
-                            "parentStart=${record.parentStartTimeTicks} " +
-                            "shellStart=${record.shellStartTimeTicks} expectedParent=$expectedParentStart " +
-                            "expectedShell=$expectedShellStart heartbeat=${record.heartbeatPath.take(180)} " +
-                            "owner=${record.ownerPath.take(180)}"
-                    )
-                    stopVendorBridgeLocked()
-                    if (running) scheduleVendorBridgeRestartLocked()
-                    return@synchronized
-                }
                 vendorBridgeReadyTimeoutFuture?.cancel(false)
                 vendorBridgeReadyTimeoutFuture = null
                 vendorBridgeReady = true
                 vendorBridgeAlive = true
                 vendorBridgeTimeoutSupported = record.timeout
                 vendorBridgeStickyConfigured = record.sticky
-                vendorBridgeShellPid = record.shellPid
-                vendorBridgeParentStartTimeTicks = record.parentStartTimeTicks
-                vendorBridgeShellStartTimeTicks = record.shellStartTimeTicks
-                vendorBridgeHeartbeatPath = record.heartbeatPath
-                vendorBridgeOwnerPath = record.ownerPath
                 vendorBridgeLastState = "ready"
                 vendorBridgeLastHeartbeatElapsed = SystemClock.elapsedRealtime()
-                updateVendorBridgeFileHeartbeatLocked(vendorBridgeLastHeartbeatElapsed)
                 eventLocked(
-                    "vendor_bridge_ready",
-                    "strategy=${record.strategy} sticky=${record.sticky} " +
-                        "timeout=${record.timeout} shellPid=${record.shellPid} " +
-                            "parentStart=${record.parentStartTimeTicks} shellStart=${record.shellStartTimeTicks} " +
-                        "heartbeat=${record.heartbeatPath} targets=${vendorBridgeConfiguredTargets.sorted()}"
+                    "gms_vendor_bridge_ready",
+                    "strategy=adopt_release sticky=${record.sticky} timeout=${record.timeout}"
                 )
                 persistStatusLocked(force = true)
             }
@@ -1263,21 +1093,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 vendorBridgeMainState = record.mainState
                 vendorBridgePersistentPid = record.persistentPid
                 vendorBridgePersistentState = record.persistentState
-                vendorBridgeWhatsappPid = record.whatsappPid
-                vendorBridgeWhatsappState = record.whatsappState
-                vendorBridgeSignalPid = record.signalPid
-                vendorBridgeSignalState = record.signalState
-                val activeStates = listOf(
-                    record.mainState,
-                    record.persistentState,
-                    record.whatsappState,
-                    record.signalState
-                ).filterNot { it == "disabled" }
                 vendorBridgeLastState = when {
-                    activeStates.any { it == "frozen" } -> "frozen"
-                    activeStates.any { it == "thawed" } -> "thawed"
-                    activeStates.isEmpty() -> "disabled"
-                    else -> activeStates.joinToString("/")
+                    record.mainState == "frozen" || record.persistentState == "frozen" -> "frozen"
+                    record.mainState == "thawed" || record.persistentState == "thawed" -> "thawed"
+                    else -> "${record.mainState}/${record.persistentState}"
                 }
                 // Keep the socket snapshot fresh every heartbeat, while the
                 // on-disk diagnostic file remains under its 30-second throttle.
@@ -1290,72 +1109,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 vendorBridgeLastPid = record.pid
                 vendorBridgeLastState = "frozen"
                 eventLocked(
-                    "vendor_cgroup_frozen",
+                    "gms_vendor_cgroup_frozen",
                     "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
                         "path=${record.cgroupPath} consecutive=${record.consecutive}"
                 )
             }
-            is GmsVendorFreezeBridgeRecord.Defense -> {
-                var schedulePulse = false
-                synchronized(lock) {
-                    if (vendorBridgeProcess !== process) return@synchronized
-                    val elapsedMs = (record.elapsedCentiseconds * 10L).coerceAtLeast(0L)
-                    val stableMs = (record.stableCentiseconds * 10L).coerceAtLeast(0L)
-                    if (record.sequence != vendorBridgeDefenseAccountingSequence) {
-                        vendorBridgeDefenseAccountingSequence = record.sequence
-                        vendorBridgeDefenseLastCommandCount = 0
-                    }
-                    val commandDelta =
-                        (record.commandCount - vendorBridgeDefenseLastCommandCount).coerceAtLeast(0)
-                    vendorBridgeDefenseLastCommandCount = record.commandCount
-                    vendorBridgeDefenseCommandCount += commandDelta.toLong()
-                    actionCount += commandDelta.toLong()
-                    vendorBridgeDefenseLastSequence = record.sequence
-                    vendorBridgeDefenseLastPhase = record.phase
-                    vendorBridgeDefenseLastElapsedMs = elapsedMs
-                    vendorBridgeDefenseLastStableMs = stableMs
-                    vendorBridgeDefenseLastAttempts = record.attempts
-                    vendorBridgeMainPid = record.mainPid
-                    vendorBridgePersistentPid = record.persistentPid
-                    vendorBridgeLastState = "defense_${record.phase}"
-                    when (record.phase) {
-                        "started" -> vendorBridgeDefenseEpisodeCount += 1
-                        "pulse_ready" -> {
-                            vendorBridgeDefensePulseCount += 1
-                            schedulePulse = vendorBridgeDefensePulsedSequences.add(record.sequence)
-                        }
-                        "refrozen" -> vendorBridgeDefenseRefreezeCount += 1
-                        "escalating" -> vendorBridgeDefenseEscalationCount += 1
-                        "pid_changed" -> vendorBridgeDefensePidChangeCount += 1
-                        "stable" -> vendorBridgeDefenseStableCount += 1
-                        "expired" -> vendorBridgeDefenseExpiredCount += 1
-                    }
-                    while (vendorBridgeDefensePulsedSequences.size > MAX_FAST_LANE_SEQUENCE_HISTORY) {
-                        vendorBridgeDefensePulsedSequences.remove(
-                            vendorBridgeDefensePulsedSequences.first()
-                        )
-                    }
-                    eventLocked(
-                        "vendor_bridge_defense_${record.phase}",
-                        "seq=${record.sequence} elapsedMs=$elapsedMs stableMs=$stableMs " +
-                            "refreezes=${record.refreezes} attempts=${record.attempts} " +
-                            "commands=${record.commandCount} commandDelta=$commandDelta " +
-                            "mainPid=${record.mainPid} persistentPid=${record.persistentPid} " +
-                            "detail=${record.detail.take(360)}"
-                    )
-                    persistStatusLocked(force = true)
-                }
-                if (schedulePulse) {
-                    scheduleVendorDefenseMcsPulse(record.sequence, process)
-                }
-            }
             is GmsVendorFreezeBridgeRecord.Recovery -> {
                 var schedulePostRecovery = false
-                var scheduleDefenseFallbackPulse = false
                 synchronized(lock) {
                     if (vendorBridgeProcess !== process) return@synchronized
-                    val isGmsTarget = record.target == GMS_PACKAGE ||
-                        record.target == "$GMS_PACKAGE.persistent"
                     val durationMs = (record.durationCentiseconds * 10L).coerceAtLeast(0L)
                     vendorBridgeRecoveryAttemptCount += 1
                     vendorBridgeLastTarget = record.target
@@ -1364,46 +1126,29 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     vendorBridgeLastRecoveryLatencyMs = durationMs
                     vendorBridgeMaxRecoveryLatencyMs =
                         maxOf(vendorBridgeMaxRecoveryLatencyMs, durationMs)
-                    when {
-                        record.mode.startsWith("plain") -> vendorBridgePlainRecoveryCount += 1
-                        record.mode.startsWith("adopt_release") -> vendorBridgeAdoptReleaseCount += 1
-                        record.mode.startsWith("adopt_unconfirmed") -> {
-                            vendorBridgeAdoptUnconfirmedCount += 1
-                            vendorBridgeReleaseRetryCount += 1
-                        }
-                        record.mode.startsWith("framework_release_retry") -> {
-                            vendorBridgeFrameworkLedgerRetryCount += 1
-                            vendorBridgeReleaseRetryCount += 1
-                        }
-                        record.mode.startsWith("release_retry") -> vendorBridgeReleaseRetryCount += 1
+                    when (record.mode) {
+                        "plain" -> vendorBridgePlainRecoveryCount += 1
+                        "adopt_release" -> vendorBridgeAdoptReleaseCount += 1
                     }
-                    if (record.group) vendorBridgeGroupRecoveryCount += 1
-                    if (record.adoptObserved) vendorBridgeAdoptObservedCount += 1
-                    vendorBridgeLastCommandDetail = record.detail.take(MAX_EVENT_DETAIL)
-                    if (!record.mode.startsWith("defense_stable")) {
-                        actionCount += record.commandCount.coerceAtLeast(0).toLong()
+                    val commandCount = when (record.mode) {
+                        "adopt_release" -> if (record.stickyExitCode == 125) 3L else 4L
+                        else -> if (record.stickyExitCode == 125) 1L else 2L
                     }
+                    actionCount += commandCount
                     if (record.verified) {
                         vendorBridgeVerifiedRecoveryCount += 1
                         effectiveThawCount += 1
                         vendorBridgeLastState = "thawed"
-                        if (isGmsTarget) {
-                            gmsFastThawSuccessCount += 1
-                            gmsFastThawFinalVerifiedCount += 1
-                            gmsFastThawLastCompletedElapsed = SystemClock.elapsedRealtime()
-                            if (!lastGmsTransportProbe.healthy &&
-                                gmsFastThawAwaitingReconnectSinceElapsed <= 0L
-                            ) {
-                                gmsFastThawAwaitingReconnectSinceElapsed =
-                                    gmsFastThawLastCompletedElapsed
-                            }
-                            if (record.mode.startsWith("defense_stable")) {
-                                scheduleDefenseFallbackPulse =
-                                    vendorBridgeDefensePulsedSequences.add(record.sequence)
-                            } else {
-                                schedulePostRecovery = true
-                            }
+                        gmsFastThawSuccessCount += 1
+                        gmsFastThawFinalVerifiedCount += 1
+                        gmsFastThawLastCompletedElapsed = SystemClock.elapsedRealtime()
+                        if (!lastGmsTransportProbe.healthy &&
+                            gmsFastThawAwaitingReconnectSinceElapsed <= 0L
+                        ) {
+                            gmsFastThawAwaitingReconnectSinceElapsed =
+                                gmsFastThawLastCompletedElapsed
                         }
+                        schedulePostRecovery = true
                     } else {
                         vendorBridgeFailedRecoveryCount += 1
                         verificationFailureCount += 1
@@ -1411,17 +1156,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     }
                     eventLocked(
                         if (record.verified) {
-                            "vendor_bridge_recovery_verified"
+                            "gms_vendor_bridge_recovery_verified"
                         } else {
-                            "vendor_bridge_recovery_failed"
+                            "gms_vendor_bridge_recovery_failed"
                         },
                         "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
-                            "peerPid=${record.peerPid} group=${record.group} mode=${record.mode} " +
-                            "plainRc=${record.plainExitCode} freezeRc=${record.freezeExitCode} " +
-                            "releaseRc=${record.releaseExitCode} stickyRc=${record.stickyExitCode} " +
-                            "adoptObserved=${record.adoptObserved} durationMs=$durationMs " +
-                            "consecutive=${record.consecutive} commands=${record.commandCount} " +
-                            "detail=${record.detail.take(360)}"
+                            "mode=${record.mode} plainRc=${record.plainExitCode} " +
+                            "freezeRc=${record.freezeExitCode} releaseRc=${record.releaseExitCode} " +
+                            "stickyRc=${record.stickyExitCode} durationMs=$durationMs " +
+                            "consecutive=${record.consecutive}"
                     )
                     persistStatusLocked(force = true)
                 }
@@ -1430,8 +1173,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         sequence = record.sequence,
                         state = "vendor_bridge:${record.mode}"
                     )
-                } else if (scheduleDefenseFallbackPulse) {
-                    scheduleVendorDefenseMcsPulse(record.sequence, process)
                 }
             }
             is GmsVendorFreezeBridgeRecord.VendorLock -> {
@@ -1444,33 +1185,27 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     vendorBridgeLastPid = record.pid
                     vendorBridgeLastState = "vendor_lock"
                     eventLocked(
-                        "vendor_refreeze_lock",
+                        "gms_vendor_refreeze_lock",
                         "seq=${record.sequence} target=${record.target} pid=${record.pid} " +
                             "failures=${record.failures} cooldownMs=${record.cooldownCentiseconds * 10L}"
                     )
                     persistStatusLocked(force = true)
                 }
-                // Only GMS owns a destructive transport-rebuild campaign.
-                // WhatsApp and Signal remain on bounded adopt-release retries;
-                // Signal is intentionally included without a separate kill or
-                // force-stop campaign.
-                if (
-                    record.target == GMS_PACKAGE ||
-                    record.target == "$GMS_PACKAGE.persistent"
-                ) {
-                    scheduleVendorBridgeLockEscalation(signalElapsed, record.sequence)
-                }
+                // The sidecar has already proven that normal and adopt-release
+                // thaw paths cannot hold. Escalate immediately instead of
+                // waiting for the old 45-96 second shield exhaustion path.
+                scheduleGmsFastThaw(signalElapsed)
             }
             is GmsVendorFreezeBridgeRecord.Diagnostic -> synchronized(lock) {
                 if (vendorBridgeProcess !== process) return@synchronized
                 eventLocked(
-                    "vendor_bridge_diagnostic",
+                    "gms_vendor_bridge_diagnostic",
                     "type=${record.type} detail=${record.detail}"
                 )
             }
             null -> synchronized(lock) {
                 if (vendorBridgeProcess !== process) return@synchronized
-                eventLocked("vendor_bridge_unparsed_output", line.take(MAX_EVENT_DETAIL))
+                eventLocked("gms_vendor_bridge_unparsed_output", line.take(MAX_EVENT_DETAIL))
             }
         }
     }
@@ -1489,7 +1224,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (!running) return
             errorCount += 1
             eventLocked(
-                "vendor_bridge_failed",
+                "gms_vendor_bridge_failed",
                 "${failure?.javaClass?.simpleName ?: "eof"}:${failure?.message.orEmpty()}"
             )
             scheduleVendorBridgeRestartLocked()
@@ -1514,7 +1249,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }.getOrElse { error ->
             errorCount += 1
             eventLocked(
-                "vendor_bridge_restart_schedule_failed",
+                "gms_vendor_bridge_restart_schedule_failed",
                 "${error.javaClass.simpleName}:${error.message.orEmpty()}"
             )
             null
@@ -1532,22 +1267,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val process = vendorBridgeProcess
         vendorBridgeProcess = null
         process?.destroy()
-        if (process != null) {
-            runCatching {
-                if (!process.waitFor(500L, TimeUnit.MILLISECONDS)) process.destroyForcibly()
-            }
-        }
         vendorBridgeThread?.interrupt()
         vendorBridgeThread = null
-        vendorBridgeShellPid = 0
-        vendorBridgeParentStartTimeTicks = ""
-        vendorBridgeShellStartTimeTicks = ""
-        vendorBridgeHeartbeatFileValid = false
-        vendorBridgeOwnerLeaseValid = false
-        vendorBridgeHeartbeatFileAgeMs = -1L
-        vendorBridgeDefensePulsedSequences.clear()
-        vendorBridgeDefenseAccountingSequence = 0L
-        vendorBridgeDefenseLastCommandCount = 0
     }
 
     private fun handleEventWatcherEnded(
@@ -2832,15 +2553,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     private fun scheduleGmsFastThaw(signalElapsed: Long) {
-        val delegated = synchronized(lock) {
-            if (vendorBridgeOwnsGmsCommandsLocked()) {
-                recordVendorBridgeSuppressedUnfreezeLocked(GMS_PACKAGE, "gms_fast_thaw")
-                true
-            } else {
-                false
-            }
-        }
-        if (delegated) return
         if (!gmsFastThawWorkerActive.compareAndSet(false, true)) {
             gmsFastThawPendingSignalElapsed.set(signalElapsed)
             synchronized(lock) {
@@ -3007,15 +2719,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         backend: ActivityManagerUnfreezeCommand.Backend,
         timeoutMs: Long
     ): FastThawPassResult {
-        val delegated = synchronized(lock) {
-            if (vendorBridgeOwnsGmsCommandsLocked()) {
-                recordVendorBridgeSuppressedUnfreezeLocked(GMS_PACKAGE, "gms_fast_thaw_pass")
-                true
-            } else {
-                false
-            }
-        }
-        if (delegated) return FastThawPassResult(success = true, durationMs = 0L)
         val commands = mutableListOf(
             ActivityManagerUnfreezeCommand.shellWithAmFallback(GMS_PACKAGE, sticky, backend)
         )
@@ -3063,13 +2766,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         }
     }
-    private fun runGmsMcsKickWindow(
-        trigger: String,
-        maxRounds: Int = GMS_MCS_KICK_MAX_ROUNDS,
-        allowEmergencyEscalation: Boolean = true
-    ) {
+    private fun runGmsMcsKickWindow(trigger: String) {
         val startedElapsed = SystemClock.elapsedRealtime()
-        val boundedRounds = maxRounds.coerceIn(1, GMS_MCS_KICK_MAX_ROUNDS)
         val connectAttemptBefore = synchronized(lock) {
             lastGmsMcsConnectAttemptElapsed
         }
@@ -3085,13 +2783,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         synchronized(lock) {
             eventLocked(
                 "gms_mcs_kick_started",
-                "trigger=$trigger maxRounds=$boundedRounds " +
-                    "allowEmergencyEscalation=$allowEmergencyEscalation"
+                "trigger=$trigger maxRounds=$GMS_MCS_KICK_MAX_ROUNDS"
             )
         }
 
-        kickRounds@ for (round in 1..boundedRounds) {
-            val bridgeOwnsGms = synchronized(lock) { vendorBridgeOwnsGmsCommandsLocked() }
+        for (round in 1..GMS_MCS_KICK_MAX_ROUNDS) {
             val sticky = synchronized(lock) {
                 config.stickyUnfreeze && supportsStickyUnfreeze
             }
@@ -3106,28 +2802,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 }
             }
 
-            // With the vendor bridge active, the bridge is the only freezer
-            // command owner. A verified bridge recovery is the prerequisite for
-            // this transport kick; never race it with another shell unfreeze.
-            if (bridgeOwnsGms) {
-                val frozen = fastReadFrozenGmsProcesses()
-                if (frozen.isNotEmpty()) {
-                    synchronized(lock) {
-                        eventLocked(
-                            "gms_mcs_kick_deferred_to_vendor_bridge",
-                            "trigger=$trigger round=$round frozen=${frozen.map { "${it.first}:${it.second}" }}"
-                        )
-                    }
-                    break@kickRounds
-                }
-            } else {
-                runGmsFastThawPass(
-                    sticky = sticky,
-                    secondarySupported = secondarySupported,
-                    backend = backend,
-                    timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
-                )
-            }
+            // 广播发送前先确保 main 和 persistent 都处于解冻状态。
+            runGmsFastThawPass(
+                sticky = sticky,
+                secondarySupported = secondarySupported,
+                backend = backend,
+                timeoutMs = GMS_MCS_KICK_THAW_TIMEOUT_MS
+            )
 
             val broadcast = runner.run(
                 "am", "broadcast",
@@ -3156,17 +2837,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 SystemClock.elapsedRealtime() + GMS_MCS_KICK_GUARD_MS
 
             while (SystemClock.elapsedRealtime() < guardDeadline) {
-                val refrozen = fastReadFrozenGmsProcesses()
-                if (refrozen.isNotEmpty()) {
-                    if (bridgeOwnsGms) {
-                        synchronized(lock) {
-                            eventLocked(
-                                "gms_mcs_kick_guard_delegated_to_vendor_bridge",
-                                "trigger=$trigger round=$round frozen=${refrozen.map { "${it.first}:${it.second}" }}"
-                            )
-                        }
-                        break
-                    }
+                if (fastReadFrozenGmsProcesses().isNotEmpty()) {
                     runGmsFastThawPass(
                         sticky = sticky,
                         secondarySupported = secondarySupported,
@@ -3229,7 +2900,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     persistentRunning = persistentRunning,
                     source = "mcs_kick"
                 )
-            } else if (allowEmergencyEscalation) {
+            } else {
                 consecutiveGmsMcsKickExhaustions += 1
                 exhaustionCountForEscalation =
                     consecutiveGmsMcsKickExhaustions
@@ -3284,21 +2955,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         consecutiveGmsMcsKickExhaustions = 0
                     }
                 }
-            } else {
-                // A defense-episode pulse is deliberately diagnostic and
-                // one-shot. It must never build the global exhaustion streak
-                // or recursively start a destructive GMS campaign.
-                exhaustionCountForEscalation = consecutiveGmsMcsKickExhaustions
             }
 
             val usedRounds =
-                if (success) successfulRound else boundedRounds
+                if (success) successfulRound else GMS_MCS_KICK_MAX_ROUNDS
 
             eventLocked(
                 if (success) {
                     "gms_mcs_kick_succeeded"
-                } else if (!allowEmergencyEscalation) {
-                    "gms_mcs_defense_pulse_inconclusive"
                 } else {
                     "gms_mcs_kick_exhausted"
                 },
@@ -3306,8 +2970,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     " mcsConnectLatencyMs=$mcsConnectLatencyMs" +
                     " transportLatencyMs=$transportLatencyMs" +
                     " ports=${finalProbe.establishedPorts.sorted()}" +
-                    " consecutiveExhaustions=$exhaustionCountForEscalation" +
-                    " escalationAllowed=$allowEmergencyEscalation"
+                    " consecutiveExhaustions=$exhaustionCountForEscalation"
             )
 
             if (escalationMode != "none") {
@@ -4046,273 +3709,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
-    private fun vendorBridgeOwnerPackageLocked(processName: String): String? {
-        val packageName = packageForProcess(processName) ?: processName
-        return packageName.takeIf {
-            running && it in vendorBridgeTargetsLocked()
-        }
-    }
-
-    /**
-     * Command ownership follows configured policy, not subprocess liveness.
-     * During bridge startup or restart, falling back to a second unfreeze loop
-     * would recreate the exact race this bridge exists to remove.
-     */
-    private fun vendorBridgeOwnsGmsCommandsLocked(): Boolean =
-        running && GMS_PACKAGE in vendorBridgeTargetsLocked()
-
-    private fun recordVendorBridgeSuppressedUnfreezeLocked(packageName: String, source: String) {
-        vendorBridgeSuppressedInternalUnfreezeCount += 1
-        val now = SystemClock.elapsedRealtime()
-        val previous = lastDelegatedUnfreezeLogByPackage[packageName] ?: 0L
-        if (previous <= 0L || now < previous || now - previous >= DELEGATED_UNFREEZE_LOG_INTERVAL_MS) {
-            lastDelegatedUnfreezeLogByPackage[packageName] = now
-            eventLocked(
-                "unfreeze_delegated_to_vendor_bridge",
-                "package=$packageName source=$source count=$vendorBridgeSuppressedInternalUnfreezeCount"
-            )
-        }
-    }
-
-    private fun updateVendorBridgeFileHeartbeatLocked(now: Long) {
-        val path = vendorBridgeHeartbeatPath.ifBlank {
-            GmsVendorFreezeBridgeScript.heartbeatPath(Process.myPid())
-        }
-        val values = runCatching {
-            File(path).takeIf { it.isFile }?.readLines()?.mapNotNull { line ->
-                val separator = line.indexOf('=')
-                if (separator > 0) line.substring(0, separator) to line.substring(separator + 1)
-                else null
-            }?.toMap()
-        }.getOrNull().orEmpty()
-        val shellPid = values["shellPid"]?.toIntOrNull() ?: 0
-        val parentPid = values["parentPid"]?.toIntOrNull() ?: 0
-        val owner = values["owner"].orEmpty()
-        val heartbeatParentStart = values["parentStartTicks"].orEmpty()
-        val heartbeatShellStart = values["shellStartTicks"].orEmpty()
-        val atCs = values["atCs"]?.toLongOrNull() ?: 0L
-        val ageMs = if (atCs > 0L) (now - atCs * 10L).coerceAtLeast(0L) else -1L
-        val ownerPath = vendorBridgeOwnerPath.ifBlank {
-            GmsVendorFreezeBridgeScript.COMMAND_OWNER_PATH
-        }
-        val ownerValues = runCatching {
-            File(ownerPath).takeIf { it.isFile }?.readLines()?.mapNotNull { line ->
-                val separator = line.indexOf('=')
-                if (separator > 0) line.substring(0, separator) to line.substring(separator + 1)
-                else null
-            }?.toMap()
-        }.getOrNull().orEmpty()
-        val currentParentStart = readProcStartTimeTicks(Process.myPid()).orEmpty()
-        val currentShellStart = readProcStartTimeTicks(vendorBridgeShellPid).orEmpty()
-        vendorBridgeOwnerLeaseValid =
-            ownerValues["owner"] == "vendor_bridge" &&
-                ownerValues["parentPid"]?.toIntOrNull() == Process.myPid() &&
-                ownerValues["shellPid"]?.toIntOrNull() == vendorBridgeShellPid &&
-                ownerValues["parentStartTicks"] == vendorBridgeParentStartTimeTicks &&
-                ownerValues["shellStartTicks"] == vendorBridgeShellStartTimeTicks &&
-                vendorBridgeParentStartTimeTicks == currentParentStart &&
-                vendorBridgeShellStartTimeTicks == currentShellStart &&
-                ownerValues["heartbeatPath"] == path
-        vendorBridgeHeartbeatFileValid =
-            owner == "vendor_bridge" &&
-                parentPid == Process.myPid() &&
-                shellPid > 1 &&
-                shellPid == vendorBridgeShellPid &&
-                heartbeatParentStart == vendorBridgeParentStartTimeTicks &&
-                heartbeatShellStart == vendorBridgeShellStartTimeTicks &&
-                ageMs >= 0L &&
-                vendorBridgeOwnerLeaseValid
-        vendorBridgeHeartbeatFileAgeMs = ageMs
-    }
-
-    private fun readProcStartTimeTicks(pid: Int): String? {
-        val raw = runCatching { File("/proc/$pid/stat").readText() }.getOrNull() ?: return null
-        val close = raw.lastIndexOf(')')
-        if (close < 0 || close + 1 >= raw.length) return null
-        // The first token after ')' is field 3 (state); starttime is field 22.
-        return raw.substring(close + 1)
-            .trim()
-            .split(Regex("\\s+"))
-            .getOrNull(19)
-            ?.takeIf { it.all(Char::isDigit) }
-    }
-
-    private fun isExactLegacyGuardianCommand(cmdline: String): Boolean {
-        val tokens = cmdline.trim().split(Regex("\\s+")).filter(String::isNotBlank)
-        val scriptIndex = tokens.indexOfFirst { token ->
-            token.substringAfterLast('/') == "luonnotar-guardian-v2.sh"
-        }
-        return scriptIndex >= 0 && tokens.getOrNull(scriptIndex + 1) == "daemon"
-    }
-
-    private fun readVerifiedLegacyGuardianIdentity(pid: Int): Pair<String, String>? {
-        if (pid <= 1) return null
-        val startTime = readProcStartTimeTicks(pid) ?: return null
-        val cmdline = runCatching {
-            File("/proc/$pid/cmdline").readBytes().toString(Charsets.UTF_8).replace('\u0000', ' ')
-        }.getOrNull() ?: return null
-        if (!isExactLegacyGuardianCommand(cmdline)) return null
-        return startTime to cmdline
-    }
-
-    private fun legacyGuardianIdentityStillMatches(
-        pid: Int,
-        startTime: String,
-        expectedCmdline: String
-    ): Boolean {
-        val current = readVerifiedLegacyGuardianIdentity(pid) ?: return false
-        return current.first == startTime && current.second == expectedCmdline
-    }
-
-    private fun quarantineLegacyUnfreezeShellsLocked() {
-        val candidates = linkedSetOf<Int>()
-        val pidFile = runner.run("cat", LEGACY_GUARDIAN_PID_PATH, timeoutMs = 1_000L)
-        pidFile.stdout.trim().toIntOrNull()?.takeIf { it > 1 }?.let(candidates::add)
-        val ps = runner.run("ps", "-A", "-o", "PID,PPID,ARGS", timeoutMs = 3_000L)
-        if (ps.success) {
-            val pattern = Regex("""^\s*(\d+)\s+\d+\s+(.+)$""")
-            ps.stdout.lineSequence().forEach { line ->
-                val match = pattern.matchEntire(line) ?: return@forEach
-                if (isExactLegacyGuardianCommand(match.groupValues[2])) {
-                    match.groupValues[1].toIntOrNull()?.takeIf { it > 1 }?.let(candidates::add)
-                }
-            }
-        }
-        if (candidates.isEmpty()) {
-            legacyGuardianLastResult = "none"
-            return
-        }
-        candidates.forEach { pid ->
-            val identity = readVerifiedLegacyGuardianIdentity(pid)
-            if (identity == null) {
-                legacyGuardianLastResult = "ignored_unverified_or_reused_pid:$pid"
-                eventLocked("legacy_unfreeze_shell_ignored", "pid=$pid identity_not_exact")
-                return@forEach
-            }
-            legacyGuardianDetectedCount += 1
-            val (startTime, cmdline) = identity
-            // Revalidate immediately before every signal. A PID file alone is
-            // never authority because Android may have already reused the PID.
-            if (!legacyGuardianIdentityStillMatches(pid, startTime, cmdline)) {
-                legacyGuardianLastResult = "identity_changed_before_term:$pid"
-                eventLocked("legacy_unfreeze_shell_ignored", legacyGuardianLastResult)
-                return@forEach
-            }
-            val term = runner.run("kill", "-TERM", pid.toString(), timeoutMs = 1_000L)
-            SystemClock.sleep(150L)
-            val sameProcessAlive = legacyGuardianIdentityStillMatches(pid, startTime, cmdline)
-            val kill = if (sameProcessAlive) {
-                runner.run("kill", "-KILL", pid.toString(), timeoutMs = 1_000L)
-            } else {
-                null
-            }
-            val stopped = !legacyGuardianIdentityStillMatches(pid, startTime, cmdline)
-            if (stopped) legacyGuardianStoppedCount += 1
-            legacyGuardianLastResult =
-                "pid=$pid start=$startTime stopped=$stopped term=${term.exitCode} kill=${kill?.exitCode ?: 125}"
-            eventLocked(
-                if (stopped) "legacy_unfreeze_shell_quarantined" else "legacy_unfreeze_shell_stop_failed",
-                legacyGuardianLastResult
-            )
-        }
-    }
-
-    private fun scheduleVendorBridgeLockEscalation(signalElapsed: Long, sequence: Long) {
-        runCatching {
-            executor.schedule(
-                {
-                    synchronized(lock) {
-                        if (!running || !vendorBridgeOwnsGmsCommandsLocked()) return@synchronized
-                        val frozen = listGmsProcessesLocked().filter {
-                            readFreezeState(it.pid).frozen == true
-                        }
-                        val probe = probeGmsTransportLocked()
-                        applyGmsTransportProbeLocked(
-                            probe = probe,
-                            now = SystemClock.elapsedRealtime(),
-                            persistentRunning = listGmsProcessesLocked().any {
-                                it.name == "$GMS_PACKAGE.persistent"
-                            },
-                            source = "vendor_lock"
-                        )
-                        if (frozen.isNotEmpty() && probe.observable && !probe.healthy &&
-                            !gmsRecoveryInProgress
-                        ) {
-                            vendorBridgeLockEscalationCount += 1
-                            eventLocked(
-                                "vendor_bridge_lock_escalated",
-                                "seq=$sequence signalElapsed=$signalElapsed frozen=${frozen.map { "${it.name}:${it.pid}" }}"
-                            )
-                            recoverGmsLocked(
-                                trigger = "vendor_bridge_refreeze_lock",
-                                manual = false,
-                                automaticEvidenceReason = "vendor_bridge_refreeze_lock",
-                                emergency = true
-                            )
-                        }
-                    }
-                },
-                VENDOR_BRIDGE_LOCK_ESCALATION_DELAY_MS,
-                TimeUnit.MILLISECONDS
-            )
-        }.onFailure { error ->
-            synchronized(lock) {
-                errorCount += 1
-                eventLocked(
-                    "vendor_bridge_lock_escalation_schedule_failed",
-                    "seq=$sequence ${error.javaClass.simpleName}:${error.message.orEmpty()}"
-                )
-            }
-        }
-    }
-
     private fun isVendorBridgeTargetedLocked(): Boolean =
-        vendorBridgeTargetsLocked().isNotEmpty()
-
-    private fun vendorBridgeTargetsLocked(): Set<String> {
-        val family = vendorBridgeFamilyLocked()
-        if (
-            family != BackgroundPolicyVendorFamily.VIVO &&
-            family != BackgroundPolicyVendorFamily.XIAOMI
-        ) {
-            return emptySet()
-        }
-        return buildSet {
-            // GMS adopt-release remains an OriginOS-specific response to the
-            // proven PEM/framework bookkeeping split.
-            if (
-                family == BackgroundPolicyVendorFamily.VIVO &&
-                isPackageTargetedLocked(GMS_PACKAGE)
-            ) {
-                add(GMS_PACKAGE)
-            }
-            // Xiaomi tablets have shown the same physical-freeze symptom on
-            // WhatsApp. Signal follows the same bounded, non-destructive path
-            // but intentionally has no separate recovery campaign.
-            if (isPackageTargetedLocked(WHATSAPP_PACKAGE)) add(WHATSAPP_PACKAGE)
-            if (isPackageTargetedLocked(SIGNAL_PACKAGE)) add(SIGNAL_PACKAGE)
-        }
-    }
-
-    private fun vendorBridgeOwnsGmsLocked(): Boolean =
-        GMS_PACKAGE in vendorBridgeTargetsLocked()
-
-    private fun vendorBridgeOwnsPackageLocked(packageName: String?): Boolean =
-        packageName != null && packageName in vendorBridgeTargetsLocked()
+        isGmsFastLaneTargetedLocked() &&
+            vendorBridgeFamilyLocked() == BackgroundPolicyVendorFamily.VIVO
 
     private fun vendorBridgeFamilyLocked(): BackgroundPolicyVendorFamily {
         vendorBridgeDeviceFamily?.let { return it }
         return currentVendorFamilyLocked().also { vendorBridgeDeviceFamily = it }
     }
 
-    private fun isPackageTargetedLocked(packageName: String): Boolean =
-        packageName in config.packageTargets ||
-            config.processTargets.any { processName ->
-                processName == packageName || processName.startsWith("$packageName:")
-            }
-
     private fun isGmsFastLaneTargetedLocked(): Boolean =
-        isPackageTargetedLocked(GMS_PACKAGE)
+        GMS_PACKAGE in config.packageTargets ||
+            config.processTargets.any { processName ->
+                processName == GMS_PACKAGE ||
+                    processName == "$GMS_PACKAGE.persistent" ||
+                    processName.startsWith("$GMS_PACKAGE:")
+            }
 
     private fun processTargetsForPackage(packageName: String): List<String> {
         val configured = config.processTargets.filter { processName ->
@@ -4407,38 +3819,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         vendorRecoveryExhaustedUntilByPackage.entries.removeAll { (_, until) -> until <= now }
         ensureCapabilitiesLocked()
         if (!eventWatcherAlive) startEventWatcherLocked()
-        if (isVendorBridgeTargetedLocked() &&
-            (lastLegacyGuardianAuditElapsed <= 0L || now < lastLegacyGuardianAuditElapsed ||
-                now - lastLegacyGuardianAuditElapsed >= LEGACY_GUARDIAN_AUDIT_INTERVAL_MS)
-        ) {
-            lastLegacyGuardianAuditElapsed = now
-            quarantineLegacyUnfreezeShellsLocked()
-        }
         if (isVendorBridgeTargetedLocked()) {
-            updateVendorBridgeFileHeartbeatLocked(now)
-            val protocolAgeMs = if (vendorBridgeLastHeartbeatElapsed > 0L &&
-                now >= vendorBridgeLastHeartbeatElapsed
-            ) now - vendorBridgeLastHeartbeatElapsed else Long.MAX_VALUE
-            val protocolStale = vendorBridgeReady &&
-                protocolAgeMs > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
-            val fileStale = !vendorBridgeHeartbeatFileValid ||
-                vendorBridgeHeartbeatFileAgeMs > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
-            val vendorBridgeHeartbeatStale = protocolStale && fileStale
+            val vendorBridgeHeartbeatStale = vendorBridgeReady &&
+                vendorBridgeLastHeartbeatElapsed > 0L &&
+                now >= vendorBridgeLastHeartbeatElapsed &&
+                now - vendorBridgeLastHeartbeatElapsed > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
             if (!vendorBridgeAlive || vendorBridgeHeartbeatStale) {
                 if (vendorBridgeHeartbeatStale) {
                     eventLocked(
-                        "vendor_bridge_heartbeat_stale",
-                        "protocolAgeMs=$protocolAgeMs fileAgeMs=$vendorBridgeHeartbeatFileAgeMs " +
-                            "fileValid=$vendorBridgeHeartbeatFileValid processAlive=${vendorBridgeProcess?.isAlive == true}"
+                        "gms_vendor_bridge_heartbeat_stale",
+                        "ageMs=${now - vendorBridgeLastHeartbeatElapsed}"
                     )
                     stopVendorBridgeLocked()
                 }
                 startVendorBridgeLocked()
-            } else if (protocolStale && vendorBridgeHeartbeatFileValid) {
-                eventLocked(
-                    "vendor_bridge_protocol_heartbeat_delayed",
-                    "protocolAgeMs=$protocolAgeMs fileAgeMs=$vendorBridgeHeartbeatFileAgeMs"
-                )
             }
         } else if (vendorBridgeAlive || vendorBridgeProcess != null) {
             stopVendorBridgeLocked()
@@ -4460,12 +3854,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 reassertIntervalMs = config.reassertIntervalMs
             )
             val guardedPackage = packageForProcess(process.name)
-            // A bridge-owned package must have exactly one freezer command
-            // owner. Concurrent poller unfreezes can split the bounded
-            // adopt -> release transaction and recreate the stale-state race.
-            val vendorBridgeOwnsPackage =
-                vendorBridgeOwnsPackageLocked(guardedPackage)
-            val shouldAct = (force || policyDue) && !vendorBridgeOwnsPackage
+            // On vivo/OriginOS, the direct cgroup bridge is the sole owner of
+            // GMS freeze/unfreeze commands. Letting the normal poller issue a
+            // concurrent framework unfreeze can split the bridge's bounded
+            // adopt -> release transaction and recreate the stale-state race
+            // that this release is specifically designed to repair.
+            val vendorBridgeOwnsGms = isVendorBridgeTargetedLocked() && guardedPackage == GMS_PACKAGE
+            val shouldAct = (force || policyDue) && !vendorBridgeOwnsGms
             var action = "observed"
             var commandDetail = ""
             var amAttempted = false
@@ -5913,10 +5308,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         unfreezeProcessNameLocked(packageName)
 
     private fun unfreezeProcessNameLocked(processName: String): GuardianCommandResult {
-        vendorBridgeOwnerPackageLocked(processName)?.let { ownerPackage ->
-            recordVendorBridgeSuppressedUnfreezeLocked(ownerPackage, "kotlin_unfreeze:$processName")
-            return notApplicableUnfreezeResult(processName, "delegated_vendor_bridge_owner")
-        }
         val sticky = config.stickyUnfreeze && supportsStickyUnfreeze
         if (supportsDirectActivityUnfreeze) {
             val direct = runner.run(
@@ -5946,10 +5337,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun isUnfreezeAccepted(result: GuardianCommandResult): Boolean {
         if (!result.success) return false
-        // A configured vendor bridge is the accepted owner of this action.
-        // No duplicate command was issued; physical success is still decided by
-        // the caller's cgroup verification, never by this delegated marker.
-        if (result.stdout.contains("delegated_vendor_bridge_owner")) return true
         val directBackend = result.command.take(2) == listOf("cmd", "activity")
         return directBackend ||
             result.stdout.contains("Unfreezing process", ignoreCase = true) ||
@@ -6251,11 +5638,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
         .put("gmsVendorFreezeBridge", JSONObject()
             .put("targetEnabled", isVendorBridgeTargetedLocked())
-            .put("targets", JSONArray(vendorBridgeTargetsLocked().toList().sorted()))
             .put("vendorFamily", vendorBridgeFamilyLocked().name)
             .put("alive", vendorBridgeAlive)
             .put("ready", vendorBridgeReady)
-            .put("strategy", GmsVendorDefensePolicy.STRATEGY)
+            .put("strategy", "cgroup_adopt_release")
             .put("timeoutSupported", vendorBridgeTimeoutSupported)
             .put("stickyConfigured", vendorBridgeStickyConfigured)
             .put("startCount", vendorBridgeStartCount)
@@ -6267,49 +5653,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             } else {
                 -1L
             })
-            .put("shellPid", vendorBridgeShellPid)
-            .put("parentStartTimeTicks", vendorBridgeParentStartTimeTicks)
-            .put("shellStartTimeTicks", vendorBridgeShellStartTimeTicks)
-            .put("heartbeatPath", vendorBridgeHeartbeatPath)
-            .put("heartbeatFileValid", vendorBridgeHeartbeatFileValid)
-            .put("heartbeatFileAgeMs", vendorBridgeHeartbeatFileAgeMs)
-            .put("ownerLeaseValid", vendorBridgeOwnerLeaseValid)
-            .put("ownerPath", vendorBridgeOwnerPath)
-            .put("commandOwnerPolicy", "vendor_bridge")
-            .put("ownershipPolicyActive", running && isVendorBridgeTargetedLocked())
-            .put("gmsFallbackSuppressed", vendorBridgeOwnsGmsCommandsLocked())
             .put("frozenCount", vendorBridgeFrozenCount)
             .put("recoveryAttemptCount", vendorBridgeRecoveryAttemptCount)
             .put("plainRecoveryCount", vendorBridgePlainRecoveryCount)
             .put("adoptReleaseCount", vendorBridgeAdoptReleaseCount)
-            .put("adoptUnconfirmedCount", vendorBridgeAdoptUnconfirmedCount)
-            .put("frameworkLedgerRetryCount", vendorBridgeFrameworkLedgerRetryCount)
-            .put("releaseRetryCount", vendorBridgeReleaseRetryCount)
-            .put("adoptObservedCount", vendorBridgeAdoptObservedCount)
-            .put("groupRecoveryCount", vendorBridgeGroupRecoveryCount)
-            .put("suppressedInternalUnfreezeCount", vendorBridgeSuppressedInternalUnfreezeCount)
-            .put("lockEscalationCount", vendorBridgeLockEscalationCount)
-            .put("defenseEpisodeCount", vendorBridgeDefenseEpisodeCount)
-            .put("defensePulseCount", vendorBridgeDefensePulseCount)
-            .put("defenseStableCount", vendorBridgeDefenseStableCount)
-            .put("defenseRefreezeCount", vendorBridgeDefenseRefreezeCount)
-            .put("defenseEscalationCount", vendorBridgeDefenseEscalationCount)
-            .put("defensePidChangeCount", vendorBridgeDefensePidChangeCount)
-            .put("defenseExpiredCount", vendorBridgeDefenseExpiredCount)
-            .put("defenseLastSequence", vendorBridgeDefenseLastSequence)
-            .put("defenseLastPhase", vendorBridgeDefenseLastPhase)
-            .put("defenseLastElapsedMs", vendorBridgeDefenseLastElapsedMs)
-            .put("defenseLastStableMs", vendorBridgeDefenseLastStableMs)
-            .put("defenseLastAttempts", vendorBridgeDefenseLastAttempts)
-            .put("defenseLastCommandCount", vendorBridgeDefenseLastCommandCount)
-            .put("defenseCommandCount", vendorBridgeDefenseCommandCount)
-            .put("defenseStableRequiredMs", GmsVendorDefensePolicy.STABLE_REQUIRED_MILLISECONDS)
-            .put("defensePulseRequiredMs", GmsVendorDefensePolicy.PULSE_REQUIRED_MILLISECONDS)
-            .put("legacyGuardianDetectedCount", legacyGuardianDetectedCount)
-            .put("legacyGuardianStoppedCount", legacyGuardianStoppedCount)
-            .put("legacyGuardianLastResult", legacyGuardianLastResult)
-            .put("legacyGuardianLastAuditElapsed", lastLegacyGuardianAuditElapsed)
-            .put("lastCommandDetail", vendorBridgeLastCommandDetail)
             .put("verifiedRecoveryCount", vendorBridgeVerifiedRecoveryCount)
             .put("failedRecoveryCount", vendorBridgeFailedRecoveryCount)
             .put("vendorLockCount", vendorBridgeLockCount)
@@ -6322,10 +5669,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("mainState", vendorBridgeMainState)
             .put("persistentPid", vendorBridgePersistentPid)
             .put("persistentState", vendorBridgePersistentState)
-            .put("whatsappPid", vendorBridgeWhatsappPid)
-            .put("whatsappState", vendorBridgeWhatsappState)
-            .put("signalPid", vendorBridgeSignalPid)
-            .put("signalState", vendorBridgeSignalState)
             .put("lastRecoveryLatencyMs", vendorBridgeLastRecoveryLatencyMs)
             .put("maxRecoveryLatencyMs", vendorBridgeMaxRecoveryLatencyMs)
         )
@@ -6800,19 +6143,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 20
+        private const val STATUS_SCHEMA = 18
         private const val GMS_PACKAGE = "com.google.android.gms"
-        private const val WHATSAPP_PACKAGE = "com.whatsapp"
-        private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
         private const val EVENT_WATCHER_RESTART_DELAY_MS = 1_000L
         private const val FAST_LANE_READY_TIMEOUT_MS = 3_000L
         private const val VENDOR_BRIDGE_RESTART_DELAY_MS = 1_000L
         private const val VENDOR_BRIDGE_READY_TIMEOUT_MS = 3_000L
-        private const val VENDOR_BRIDGE_STALE_HEARTBEAT_MS = 30_000L
-        private const val VENDOR_BRIDGE_LOCK_ESCALATION_DELAY_MS = 750L
-        private const val DELEGATED_UNFREEZE_LOG_INTERVAL_MS = 5_000L
-        private const val LEGACY_GUARDIAN_PID_PATH = "/data/local/tmp/luonnotar2/guardian.pid"
-        private const val LEGACY_GUARDIAN_AUDIT_INTERVAL_MS = 60_000L
+        private const val VENDOR_BRIDGE_STALE_HEARTBEAT_MS = 15_000L
         private const val FAST_LANE_POST_RECOVERY_COOLDOWN_MS = 3_000L
         private const val MAX_FAST_LANE_SEQUENCE_HISTORY = 128
         private const val GMS_STOP_APP_TIMEOUT_MS = 10_000L

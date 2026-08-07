@@ -1,23 +1,12 @@
 # 努昂诺塔（Luonnotar）
 
-## 2.5.1 r259 厂商持续回冻防守
-
-- 保留 r258 的唯一冻结命令所有者与 GMS main/persistent 原子组；父服务退出后会按精确身份清理租约，不再残留假 owner。
-- 将 vivo/iQOO `fast_freezer` 的连续回冻合并为一个防守 episode，不再每次各自启动恢复。
-- 每一代 GMS PID 最多发送一次受限 MCS 重连脉冲；不会累计全局 exhaustion，也不会递归开启 emergency campaign。
-- main 与 persistent 必须连续真实解冻 12 秒，才允许报告恢复成功。
-- 每次回冻都会重置稳定计时；PID 更换会建立新代次，并获得新的一次重连机会。
-- 30 秒从未真实解冻或持续回冻两分钟时只升级一次，同时 bridge 继续防守。
-- 内置引擎修订号：**259**；状态 schema：**20**。
-
-> 当前本地版本：**2.5.1（versionCode 81）**，包名：`com.yubegreen.luonnotar`。
-
 ## 2.3.7 引擎连接后崩溃热修复
 
 - 防止状态请求超时断开后，服务端写回触发 `Broken pipe` 并杀死 UID 2000 `app_process` 引擎。
 - 启动流程进行中暂停普通实时刷新，并将首次重型守护循环移到握手成功之后。
 - 内置引擎修订号升级为 237。
 
+> 当前本地版本：**2.3.7（versionCode 59）**，包名：`com.yubegreen.luonnotar`。
 
 ## 2.3.6 内置 ADB 端口热修复
 
