@@ -447,6 +447,109 @@ class RecoveryCampaignPolicyTest {
         )
     }
 
+
+    @Test
+    fun vivoRecentFastFreezerEvidenceBridgesProbeRaceWithoutCrossingPidOrHealthyBoundary() {
+        val missingSince = 100_000L
+        val pids = setOf(101, 102)
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 129_999L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(115_000L, 125_000L)
+            )
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(115_000L, 125_000L)
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = true,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(115_000L, 125_000L)
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = setOf(201, 202),
+                recentFastFreezerEventElapsed = listOf(115_000L, 125_000L)
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.XIAOMI,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(115_000L, 125_000L)
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 130_000L,
+                transportMissingSinceElapsed = missingSince,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 30_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(109_000L, 125_000L)
+            )
+        )
+    }
+
+    @Test
+    fun recentFastFreezerEvidenceHonorsFifteenSecondPostSuccessDeadline() {
+        val pids = setOf(301, 302)
+        assertTrue(
+            RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = 115_000L,
+                transportMissingSinceElapsed = 100_000L,
+                consecutiveMissing = 3,
+                transportHealthy = false,
+                requiredOutageMs = 15_000L,
+                missingEpisodePids = pids,
+                currentPids = pids,
+                recentFastFreezerEventElapsed = listOf(105_000L, 112_000L)
+            )
+        )
+    }
+
     @Test
     fun vivoInCampaignOutageDeadlineOverridesOnlyAfterResetAndPostResetRefreeze() {
         val base = 100_000L

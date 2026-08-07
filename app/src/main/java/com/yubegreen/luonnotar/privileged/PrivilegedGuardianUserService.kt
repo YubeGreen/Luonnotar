@@ -231,6 +231,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var packageSuccessorGuardVerifiedCount = 0L
     private var latestProcesses = emptyList<GuardianProcessState>()
     private val gmsFreezeEvents = ArrayDeque<Long>()
+    private val gmsVivoFastFreezerEvents = ArrayDeque<Long>()
+    private var gmsTransportMissingEpisodePids: Set<Int> = emptySet()
+    private var gmsRecentFreezerEvidenceLatchCount = 0L
+    private var gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed = 0L
     private val gmsRecoveryHistory = ArrayDeque<Long>()
     private val gmsForceStopHistory = ArrayDeque<Long>()
     private var gmsRecoveryInProgress = false
@@ -4691,9 +4695,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             return
         }
         gmsFreezeEvents.addLast(now)
+        if (rawLine.contains("fast_freezer", ignoreCase = true)) {
+            gmsVivoFastFreezerEvents.addLast(now)
+        }
         eventLocked(
             "gms_freeze_evidence",
-            "count=${gmsFreezeEvents.size} ${rawLine.take(220)}"
+            "count=${gmsFreezeEvents.size} fastFreezerCount=${gmsVivoFastFreezerEvents.size} " +
+                rawLine.take(220)
         )
     }
 
@@ -4768,14 +4776,24 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsTransportUnobservableCount += 1
             gmsTransportConsecutiveMissing = 0
             gmsTransportMissingSinceElapsed = 0L
+            gmsTransportMissingEpisodePids = emptySet()
+            gmsVivoFastFreezerEvents.clear()
         } else if (probe.healthy) {
             gmsTransportHealthyCount += 1
             lastGmsTransportHealthyElapsed = now
             gmsTransportConsecutiveMissing = 0
             gmsTransportMissingSinceElapsed = 0L
+            gmsTransportMissingEpisodePids = emptySet()
+            gmsVivoFastFreezerEvents.clear()
         } else {
             if (gmsTransportMissingSinceElapsed <= 0L || gmsTransportMissingSinceElapsed > now) {
                 gmsTransportMissingSinceElapsed = now
+                gmsTransportMissingEpisodePids =
+                    listGmsProcessesLocked().mapTo(linkedSetOf()) { it.pid }
+                gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed = 0L
+            } else if (gmsTransportMissingEpisodePids.isEmpty()) {
+                gmsTransportMissingEpisodePids =
+                    listGmsProcessesLocked().mapTo(linkedSetOf()) { it.pid }
             }
             gmsTransportConsecutiveMissing += 1
         }
@@ -4846,6 +4864,53 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
         )
 
+    private fun recentVivoFastFreezerEvidenceLocked(
+        nowElapsed: Long,
+        vendorFamily: BackgroundPolicyVendorFamily,
+        currentPids: Set<Int>,
+        logActivation: Boolean
+    ): Boolean {
+        val eligible = RecoveryCampaignPolicy.shouldUseRecentVivoFastFreezerEvidence(
+            vendorFamily = vendorFamily,
+            nowElapsed = nowElapsed,
+            transportMissingSinceElapsed = gmsTransportMissingSinceElapsed,
+            consecutiveMissing = gmsTransportConsecutiveMissing,
+            transportHealthy = lastGmsTransportProbe.healthy,
+            requiredOutageMs = gmsVerifiedOutageDeadlineLocked(nowElapsed),
+            missingEpisodePids = gmsTransportMissingEpisodePids,
+            currentPids = currentPids,
+            recentFastFreezerEventElapsed = gmsVivoFastFreezerEvents.toList()
+        )
+        if (
+            eligible &&
+            logActivation &&
+            gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed !=
+                gmsTransportMissingSinceElapsed
+        ) {
+            gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed =
+                gmsTransportMissingSinceElapsed
+            gmsRecentFreezerEvidenceLatchCount += 1
+            val recentCutoff =
+                (nowElapsed -
+                    RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS)
+                    .coerceAtLeast(0L)
+            val recentCount = gmsVivoFastFreezerEvents.count {
+                it in maxOf(recentCutoff, gmsTransportMissingSinceElapsed)..nowElapsed
+            }
+            eventLocked(
+                "gms_recent_vivo_fast_freezer_evidence_latched",
+                "missingSince=$gmsTransportMissingSinceElapsed " +
+                    "outageAgeMs=" +
+                    (nowElapsed - gmsTransportMissingSinceElapsed).coerceAtLeast(0L) +
+                    " missing=$gmsTransportConsecutiveMissing events=$recentCount " +
+                    "windowMs=" +
+                    RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS +
+                    " pids=${currentPids.sorted()}"
+            )
+        }
+        return eligible
+    }
+
     private fun gmsCooldownBypassEligibleLocked(
         nowElapsed: Long,
         vendorFamily: BackgroundPolicyVendorFamily,
@@ -4863,18 +4928,36 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (gmsRecoveryInProgress || !config.vendorEmergencyRecoveryEnabled) return
         if (!lastGmsTransportProbe.observable || lastGmsTransportProbe.healthy) return
         if (gmsTransportConsecutiveMissing < 3) return
+        val now = SystemClock.elapsedRealtime()
         val gmsProcesses = listGmsProcessesLocked()
+        val currentPids = gmsProcesses.mapTo(linkedSetOf()) { it.pid }
         val frozen = gmsProcesses.filter { process -> readFreezeState(process.pid).frozen == true }
-        if (frozen.isEmpty()) return
+        val vendorFamily = currentVendorFamilyLocked()
+        val recentFreezerEvidence =
+            frozen.isEmpty() &&
+                recentVivoFastFreezerEvidenceLocked(
+                    nowElapsed = now,
+                    vendorFamily = vendorFamily,
+                    currentPids = currentPids,
+                    logActivation = true
+                )
+        if (frozen.isEmpty() && !recentFreezerEvidence) return
+        val evidenceReason = if (frozen.isNotEmpty()) {
+            "verified_cgroup_frozen_mcs_missing"
+        } else {
+            "verified_recent_vivo_fast_freezer_mcs_missing"
+        }
         eventLocked(
             "gms_verified_outage_detected",
             "frozen=${frozen.joinToString { "${it.name}:${it.pid}" }} " +
-                "missing=$gmsTransportConsecutiveMissing ports=${lastGmsTransportProbe.establishedPorts.sorted()}"
+                "recentFastFreezer=$recentFreezerEvidence " +
+                "missing=$gmsTransportConsecutiveMissing " +
+                "ports=${lastGmsTransportProbe.establishedPorts.sorted()}"
         )
         recoverGmsLocked(
-            trigger = "verified_cgroup_frozen_mcs_missing",
+            trigger = evidenceReason,
             manual = false,
-            automaticEvidenceReason = "verified_cgroup_frozen_mcs_missing",
+            automaticEvidenceReason = evidenceReason,
             emergency = true
         )
     }
@@ -4904,13 +4987,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         val gmsProcesses = listGmsProcessesLocked()
+        val currentGmsPids = gmsProcesses.mapTo(linkedSetOf()) { it.pid }
         val anyGmsFrozen = gmsProcesses.any { process -> readFreezeState(process.pid).frozen == true }
+        val vendorFamily = currentVendorFamilyLocked()
+        val recentFreezerEvidence =
+            !anyGmsFrozen &&
+                recentVivoFastFreezerEvidenceLocked(
+                    nowElapsed = now,
+                    vendorFamily = vendorFamily,
+                    currentPids = currentGmsPids,
+                    logActivation = true
+                )
         val strongEvidence =
-            anyGmsFrozen &&
+            (anyGmsFrozen || recentFreezerEvidence) &&
                 lastGmsTransportProbe.observable &&
                 !lastGmsTransportProbe.healthy &&
                 gmsTransportConsecutiveMissing >= 3
-        val vendorFamily = currentVendorFamilyLocked()
         val outageAgeMs = if (
             gmsTransportMissingSinceElapsed > 0L &&
             gmsTransportMissingSinceElapsed <= now
@@ -4965,7 +5057,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             eventLocked(
                 "gms_recovery_blocked",
                 "manual=$manual reason=${campaignDecision.reason} strongEvidence=$strongEvidence " +
-                    "frozen=$anyGmsFrozen transport=${lastGmsTransportProbe.healthy} " +
+                    "frozen=$anyGmsFrozen recentFastFreezer=$recentFreezerEvidence " +
+                    "transport=${lastGmsTransportProbe.healthy} " +
                     "missing=$gmsTransportConsecutiveMissing outageAgeMs=$outageAgeMs " +
                     "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)}"
             )
@@ -5016,7 +5109,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         eventLocked(
             "gms_recovery_campaign_started",
             "trigger=$trigger manual=$manual generation=$generation oldPids=${oldPids.sorted()} " +
-                "strongEvidence=$strongEvidence emergency=$emergency vendor=$vendorFamily " +
+                "strongEvidence=$strongEvidence frozenNow=$anyGmsFrozen " +
+                "recentFastFreezer=$recentFreezerEvidence emergency=$emergency vendor=$vendorFamily " +
                 "decision=${campaignDecision.reason} evidence=${automaticEvidenceReason.orEmpty()} " +
                 "outageAgeMs=$outageAgeMs deadlineRescue=$deadlineRescue " +
                 "nextResetEligibleElapsed=${campaign.nextResetEligibleElapsed}"
@@ -6105,6 +6199,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         while (gmsFreezeEvents.firstOrNull()?.let { it < freezeCutoff || it > now } == true) {
             gmsFreezeEvents.removeFirst()
         }
+        val recentFastFreezerCutoff =
+            (now - RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS)
+                .coerceAtLeast(0L)
+        while (
+            gmsVivoFastFreezerEvents.firstOrNull()?.let {
+                it < recentFastFreezerCutoff || it > now
+            } == true
+        ) {
+            gmsVivoFastFreezerEvents.removeFirst()
+        }
         val historyCutoff = (now - RECOVERY_HISTORY_WINDOW_MS).coerceAtLeast(0L)
         while (gmsRecoveryHistory.firstOrNull()?.let { it < historyCutoff || it > now } == true) {
             gmsRecoveryHistory.removeFirst()
@@ -6666,6 +6770,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsManualRecoveryRequestId", gmsManualRecoveryRequestId)
         .put("gmsManualRecoveryState", gmsManualRecoveryState)
         .put("gmsFreezeEventsInWindow", gmsFreezeEvents.size)
+        .put("gmsVivoFastFreezerEventsInWindow", gmsVivoFastFreezerEvents.size)
+        .put("gmsTransportMissingEpisodePids", JSONArray(gmsTransportMissingEpisodePids.toList().sorted()))
+        .put("gmsRecentFreezerEvidenceLatchCount", gmsRecentFreezerEvidenceLatchCount)
+        .put("gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed",
+            gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed)
         .put("gmsRecoveryAttemptCount", gmsRecoveryAttemptCount)
         .put("gmsRecoverySuccessCount", gmsRecoverySuccessCount)
         .put("gmsRecoveryGeneration", gmsRecoveryGeneration)
@@ -7079,7 +7188,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 24
+        private const val STATUS_SCHEMA = 25
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

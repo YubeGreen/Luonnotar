@@ -77,6 +77,12 @@ object RecoveryCampaignPolicy {
     // postpone reset #2 forever while the successor keeps refreezing and MCS
     // stays continuously absent. This deadline is per post-reset outage phase.
     const val GMS_VIVO_IN_CAMPAIGN_OUTAGE_DEADLINE_MS = 30_000L
+    // r266: OriginOS can thaw/refreeze GMS between the freezer signal and the
+    // transport probe. Keep a short, VIVO-only evidence latch so a probe that
+    // happens to observe frozen=false does not erase repeated fast_freezer
+    // evidence from the same continuously missing-MCS episode.
+    const val GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS = 20_000L
+    const val GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_MIN_EVENTS = 2
     const val GMS_VIVO_POST_SUCCESS_PROTECTION_MS = 120_000L
     const val GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS = 15_000L
     const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
@@ -208,6 +214,39 @@ object RecoveryCampaignPolicy {
         if (lastBypassedMissingEpisodeElapsed == transportMissingSinceElapsed) return false
         return nowElapsed - transportMissingSinceElapsed >=
             gmsVerifiedOutageDeadlineMs(postSuccessProtectionActive)
+    }
+
+    fun shouldUseRecentVivoFastFreezerEvidence(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        nowElapsed: Long,
+        transportMissingSinceElapsed: Long,
+        consecutiveMissing: Int,
+        transportHealthy: Boolean,
+        requiredOutageMs: Long,
+        missingEpisodePids: Set<Int>,
+        currentPids: Set<Int>,
+        recentFastFreezerEventElapsed: List<Long>
+    ): Boolean {
+        if (vendorFamily != BackgroundPolicyVendorFamily.VIVO) return false
+        if (nowElapsed < 0L || transportHealthy || consecutiveMissing < 3) return false
+        if (requiredOutageMs < 0L) return false
+        if (
+            transportMissingSinceElapsed <= 0L ||
+            transportMissingSinceElapsed > nowElapsed ||
+            nowElapsed - transportMissingSinceElapsed < requiredOutageMs
+        ) {
+            return false
+        }
+        if (missingEpisodePids.isEmpty() || currentPids.isEmpty()) return false
+        if (missingEpisodePids != currentPids) return false
+
+        val recentCutoff =
+            (nowElapsed - GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS).coerceAtLeast(0L)
+        val evidenceStart = maxOf(recentCutoff, transportMissingSinceElapsed)
+        val recentCount = recentFastFreezerEventElapsed.count {
+            it in evidenceStart..nowElapsed
+        }
+        return recentCount >= GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_MIN_EVENTS
     }
 
     fun shouldOverrideGmsInCampaignRecoveryGuards(
