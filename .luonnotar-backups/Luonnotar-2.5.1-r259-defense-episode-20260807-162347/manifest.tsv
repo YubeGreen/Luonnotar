@@ -1,0 +1,15 @@
+present	README.md
+present	README_zh.md
+present	app/build.gradle.kts
+present	app/src/main/java/com/yubegreen/luonnotar/privileged/GmsFreezerFastLane.kt
+present	app/src/main/java/com/yubegreen/luonnotar/privileged/GmsVendorFreezeBridge.kt
+present	app/src/main/java/com/yubegreen/luonnotar/privileged/PrivilegedGuardianUserService.kt
+present	app/src/main/java/com/yubegreen/luonnotar/privileged/embedded/EmbeddedGuardianProtocol.kt
+present	app/src/test/java/com/yubegreen/luonnotar/privileged/GmsFreezerFastLaneScriptTest.kt
+present	app/src/test/java/com/yubegreen/luonnotar/privileged/GmsVendorFreezeBridgeTest.kt
+present	docs/LUONNOTAR-2.0-ARCHITECTURE.md
+absent	docs/changelog-2.5.0-r258.md
+absent	docs/changelog-2.5.1-r259.md
+present	tools/device/luonnotar-guardian-v2.sh
+absent	tools/audit-unfreeze-owners.sh
+absent	tools/check-unfreeze-owner-surface.sh
