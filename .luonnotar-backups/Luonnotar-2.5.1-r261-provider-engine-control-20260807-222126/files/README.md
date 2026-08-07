@@ -1,16 +1,17 @@
 # Luonnotar
 
-## 2.5.1 r261 provider-first engine control + hot handoff
+## 2.5.1 r260 engine hot handoff + sustained vendor-refreeze defense
 
-- Keeps r260's authenticated loopback hot handoff and r259's sustained vendor-refreeze defense.
-- Moves the primary computer-side engine lifecycle control to the existing synchronous `adb_runtime_config` ContentProvider because real OriginOS testing showed manifest ADB broadcasts can complete with `result=0` without running the receiver.
-- Adds shell-only `engine_status` and `engine_restart` provider methods behind both `android.permission.DUMP` and an explicit caller-UID allowlist.
-- `engine_status` reports the actual live UID 2000 engine PID/revision, handoff capability, pairing state and revision convergence instead of trusting APK metadata.
-- `engine_restart` preserves the persisted Kadb identity; r260+ performs hot handoff, while older/unreachable engines use the existing local-ADB fallback. Re-pairing occurs only after a real adbd authorization failure.
-- The broadcast receiver remains as a compatibility fallback, but host tooling is provider-first.
-- Embedded engine revision: **261**. Status schema: **20**.
+- Keeps r259's single defense episode, atomic GMS main/persistent group, and 12-second durable-thaw gate.
+- Fixes APK replacement leaving the UID 2000 `app_process` on old mapped code: r260+ performs an authenticated loopback hot handoff.
+- The successor waits for the exact old PID + `/proc` start-time instance to exit, then reuses the same loopback port/token while loading the currently installed APK.
+- The first upgrade from r259/older retires the legacy engine through the old authenticated protocol and reuses the persisted Kadb identity; a pairing code is requested only after a real adbd authorization failure.
+- Adds `android.permission.DUMP`-protected ADB-only status/restart actions for reading the actual engine revision and requesting a controlled restart from a computer.
+- Includes `tools/adb-embedded-engine-control.sh --serial <device> status|restart` as a host-side shortcut.
+- `MY_PACKAGE_REPLACED` now initiates hot handoff/local-ADB reuse rather than assuming the shell engine died with the app process.
+- Embedded engine revision: **260**. Status schema: **20**.
 
-> Current local version: **2.5.1 (versionCode 83)** — package: `com.yubegreen.luonnotar`.
+> Current local version: **2.5.1 (versionCode 82)** — package: `com.yubegreen.luonnotar`.
 
 ## 2.3.7 embedded engine post-connect crash hotfix
 

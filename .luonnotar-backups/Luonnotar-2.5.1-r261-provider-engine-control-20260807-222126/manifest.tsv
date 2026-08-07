@@ -1,0 +1,10 @@
+present	README.md
+present	README_zh.md
+present	app/build.gradle.kts
+present	app/src/main/java/com/yubegreen/luonnotar/privileged/embedded/EmbeddedGuardianProtocol.kt
+absent	app/src/main/java/com/yubegreen/luonnotar/service/AdbRuntimeCallerPolicy.kt
+present	app/src/main/java/com/yubegreen/luonnotar/service/AdbRuntimeConfigProvider.kt
+present	app/src/test/java/com/yubegreen/luonnotar/privileged/embedded/EmbeddedGuardianProtocolTest.kt
+absent	app/src/test/java/com/yubegreen/luonnotar/service/AdbRuntimeCallerPolicyTest.kt
+absent	docs/changelog-2.5.1-r261.md
+present	tools/adb-embedded-engine-control.sh

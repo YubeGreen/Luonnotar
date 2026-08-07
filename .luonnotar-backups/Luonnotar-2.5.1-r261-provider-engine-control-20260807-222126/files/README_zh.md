@@ -1,16 +1,17 @@
 # 努昂诺塔（Luonnotar）
 
-## 2.5.1 r261 Provider-first 引擎控制 + 热切换
+## 2.5.1 r260 引擎热切换 + 厂商持续回冻防守
 
-- 保留 r260 的已认证 loopback hot handoff，以及 r259 的持续厂商回冻防守。
-- 真机 OriginOS 测试发现：显式 ADB manifest broadcast 可能只返回 `result=0` 而 Receiver 根本不执行，因此电脑侧引擎控制主入口改为现有同步 `adb_runtime_config` ContentProvider。
-- Provider 新增 shell-only `engine_status` / `engine_restart`，同时保留 `android.permission.DUMP` 与调用 UID 白名单两层限制。
-- `engine_status` 直接读取当前 UID 2000 引擎真实 PID/revision、handoff 能力、配对状态与版本是否收敛，不再相信 APK 版本推断引擎版本。
-- `engine_restart` 不清除持久化 Kadb 身份：r260+ 直接 hot handoff；更旧或不可达引擎回退到既有本地 ADB 启动链。只有 adbd 明确拒绝授权时才重新配对。
-- 旧 broadcast Receiver 保留兼容，但仓库 host 工具改为 Provider-first。
-- 内置引擎修订号：**261**；状态 schema：**20**。
+- 保留 r259 的单一防守 episode、GMS main/persistent 原子组与 12 秒真实解冻稳定门槛。
+- 修复覆盖安装后 UID 2000 `app_process` 仍运行旧 APK/旧引擎的问题：r260+ 通过已认证的本地 token 通道进行 hot handoff。
+- 接班引擎等待旧 PID + `/proc` start-time 精确实例退出后，复用同一 loopback 端口与 token 加载当前安装 APK。
+- 第一次从 r259/更早版本升级时，先用旧协议安全停止旧引擎，再复用持久化 Kadb 身份启动新引擎；仅 adbd 明确拒绝授权时才要求重新配对。
+- 新增 `android.permission.DUMP` 保护的 ADB-only 状态/重启入口，可从电脑直接读取真实 engine revision 或请求受控重启。
+- 仓库附带 `tools/adb-embedded-engine-control.sh --serial <设备> status|restart`，避免手敲完整 broadcast。
+- `MY_PACKAGE_REPLACED` 不再假定 shell 引擎已经死亡，而会自动走上述热切换/复用 ADB 路径。
+- 内置引擎修订号：**260**；状态 schema：**20**。
 
-> 当前本地版本：**2.5.1（versionCode 83）**，包名：`com.yubegreen.luonnotar`。
+> 当前本地版本：**2.5.1（versionCode 82）**，包名：`com.yubegreen.luonnotar`。
 
 ## 2.3.7 引擎连接后崩溃热修复
 

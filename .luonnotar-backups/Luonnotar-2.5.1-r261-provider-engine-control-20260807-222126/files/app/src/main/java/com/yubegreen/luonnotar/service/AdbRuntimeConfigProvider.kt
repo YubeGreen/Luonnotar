@@ -11,21 +11,16 @@ import android.os.SystemClock
 import com.yubegreen.luonnotar.BuildConfig
 import com.yubegreen.luonnotar.experiment.ExperimentSessionOperationResult
 import com.yubegreen.luonnotar.experiment.ExperimentSessionRecorder
-import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianClient
-import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianManager
-import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianProtocol
-import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianStore
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
-import org.json.JSONObject
 
 /**
  * Synchronous shell-only runtime configuration bridge.
  *
- * Some OEM builds can discard or short-circuit explicit adb broadcasts aimed
- * at an app process. A ContentProvider call is synchronous and does not depend
- * on the broadcast queue, so adb can query and mutate keeper/runtime state even
- * while the device remains locked.
+ * Xiaomi/HyperOS may discard explicit broadcasts addressed to a cached
+ * process. A ContentProvider call is synchronous and does not depend on the
+ * broadcast queue, so adb can query and mutate the keeper configuration while
+ * the device remains locked.
  *
  * The manifest protects this provider with android.permission.DUMP. The UID
  * check below is defense in depth and only permits this app, root, system, or
@@ -60,8 +55,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             )
         return when (method) {
             METHOD_STATUS -> status(appContext)
-            METHOD_ENGINE_STATUS -> engineStatus(appContext)
-            METHOD_ENGINE_RESTART -> engineRestart(appContext)
             METHOD_SET -> setRuntimeConfig(appContext, extras ?: Bundle.EMPTY)
             METHOD_PROBE -> probeNow(appContext, extras ?: Bundle.EMPTY)
             METHOD_EXPERIMENT_START -> experimentStart(
@@ -761,164 +754,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             -1L
         }
 
-    /**
-     * Shell engine lifecycle status over the synchronous provider transport.
-     *
-     * Keep `ok=true` when the query itself succeeds even if the engine is down;
-     * callers need to distinguish a healthy control plane from an unhealthy
-     * engine. `engineReachable` / `revisionCurrent` carry the runtime state.
-     */
-    private fun engineStatus(context: android.content.Context): Bundle {
-        val probe = probeEngine(context)
-        return engineResultBundle(
-            ok = true,
-            reason = "",
-            values = probe.asValues()
-        )
-    }
-
-    /**
-     * Dispatch a controlled restart while preserving the persisted Kadb host
-     * identity. The restart itself is asynchronous: r260+ engines hot-handoff
-     * over loopback, while older/unreachable engines use the existing ADB
-     * fallback. A second `engine_status` call verifies convergence.
-     */
-    private fun engineRestart(context: android.content.Context): Bundle {
-        val before = probeEngine(context)
-        if (!before.featureEnabled) {
-            return engineResultBundle(
-                ok = false,
-                reason = "feature_disabled",
-                values = before.asValues() + mapOf("dispatched" to false)
-            )
-        }
-        val dispatch = runCatching {
-            EmbeddedGuardianManager.restartEngine(context, "adb_provider_restart")
-        }
-        if (dispatch.isFailure) {
-            val error = dispatch.exceptionOrNull()
-            LogManager.event(
-                context,
-                "adb_provider_engine_restart_failed",
-                mapOf(
-                    "oldPid" to before.pid,
-                    "oldRevision" to before.actualRevision,
-                    "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-                    "error" to error.toString()
-                )
-            )
-            return engineResultBundle(
-                ok = false,
-                reason = "restart_dispatch_failed",
-                values = before.asValues() + mapOf(
-                    "dispatched" to false,
-                    "error" to error.toString().take(400)
-                )
-            )
-        }
-        LogManager.event(
-            context,
-            "adb_provider_engine_restart_requested",
-            mapOf(
-                "oldPid" to before.pid,
-                "oldRevision" to before.actualRevision,
-                "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-                "generation" to before.generation
-            )
-        )
-        return engineResultBundle(
-            ok = true,
-            reason = "",
-            values = before.asValues() + mapOf(
-                "dispatched" to true,
-                "restartSource" to "adb_provider_restart"
-            )
-        )
-    }
-
-    private fun probeEngine(context: android.content.Context): EngineRuntimeProbe {
-        val snapshot = EmbeddedGuardianStore.snapshot(context)
-        val identity = EmbeddedGuardianStore.identity(context)
-        if (identity == null) {
-            return EngineRuntimeProbe(
-                featureEnabled = snapshot.featureEnabled,
-                paired = snapshot.paired,
-                storeConnected = snapshot.liveConnected,
-                generation = snapshot.generation,
-                engineReachable = false,
-                engineReason = "identity_missing"
-            )
-        }
-        val rawPing = runCatching {
-            EmbeddedGuardianClient(
-                identity.port,
-                identity.token,
-                connectTimeoutMs = 800,
-                readTimeoutMs = 1_200
-            ).ping()
-        }.getOrElse {
-            return EngineRuntimeProbe(
-                featureEnabled = snapshot.featureEnabled,
-                paired = snapshot.paired,
-                storeConnected = snapshot.liveConnected,
-                generation = snapshot.generation,
-                engineReachable = false,
-                engineReason = "engine_unreachable"
-            )
-        }
-        val ping = runCatching { JSONObject(rawPing) }.getOrNull()
-            ?: return EngineRuntimeProbe(
-                featureEnabled = snapshot.featureEnabled,
-                paired = snapshot.paired,
-                storeConnected = snapshot.liveConnected,
-                generation = snapshot.generation,
-                engineReachable = false,
-                engineReason = "invalid_ping_json"
-            )
-        val trusted =
-            ping.optString("engine") == "LuonnotarEmbeddedGuardian" &&
-                ping.optInt("uid", -1) == Process.SHELL_UID
-        if (!trusted) {
-            return EngineRuntimeProbe(
-                featureEnabled = snapshot.featureEnabled,
-                paired = snapshot.paired,
-                storeConnected = snapshot.liveConnected,
-                generation = snapshot.generation,
-                engineReachable = false,
-                engineReason = "unexpected_engine_identity"
-            )
-        }
-        return EngineRuntimeProbe(
-            featureEnabled = snapshot.featureEnabled,
-            paired = snapshot.paired,
-            storeConnected = snapshot.liveConnected,
-            generation = snapshot.generation,
-            engineReachable = true,
-            actualRevision = ping.optInt("engineRevision", -1),
-            pid = ping.optInt("pid", -1),
-            handoffSupported = ping.optBoolean("handoffSupported", false),
-            engineReason = ""
-        )
-    }
-
-    private fun engineResultBundle(
-        ok: Boolean,
-        reason: String,
-        values: Map<String, Any>
-    ): Bundle {
-        val bundle = resultBundle(ok, reason, values)
-        values.forEach { (key, value) ->
-            when (value) {
-                is Boolean -> bundle.putBoolean(key, value)
-                is Int -> bundle.putInt(key, value)
-                is Long -> bundle.putLong(key, value)
-                is String -> bundle.putString(key, value)
-                else -> bundle.putString(key, value.toString())
-            }
-        }
-        return bundle
-    }
-
     private fun resultBundle(
         ok: Boolean,
         reason: String,
@@ -938,13 +773,13 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         }
     }
 
-    private fun callerAllowed(): Boolean = AdbRuntimeCallerPolicy.isAllowed(
-        callerUid = Binder.getCallingUid(),
-        appUid = Process.myUid(),
-        rootUid = Process.ROOT_UID,
-        systemUid = Process.SYSTEM_UID,
-        shellUid = Process.SHELL_UID
-    )
+    private fun callerAllowed(): Boolean {
+        val uid = Binder.getCallingUid()
+        return uid == Process.myUid() ||
+            uid == Process.ROOT_UID ||
+            uid == Process.SYSTEM_UID ||
+            uid == Process.SHELL_UID
+    }
 
     override fun query(
         uri: Uri,
@@ -969,40 +804,9 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         selectionArgs: Array<out String>?
     ): Int = 0
 
-    private data class EngineRuntimeProbe(
-        val featureEnabled: Boolean,
-        val paired: Boolean,
-        val storeConnected: Boolean,
-        val generation: Long,
-        val engineReachable: Boolean,
-        val actualRevision: Int = -1,
-        val pid: Int = -1,
-        val handoffSupported: Boolean = false,
-        val engineReason: String = ""
-    ) {
-        fun asValues(): Map<String, Any> = linkedMapOf(
-            "transport" to "content_provider",
-            "featureEnabled" to featureEnabled,
-            "paired" to paired,
-            "storeConnected" to storeConnected,
-            "engineReachable" to engineReachable,
-            "actualRevision" to actualRevision,
-            "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-            "revisionCurrent" to (
-                engineReachable && actualRevision == EmbeddedGuardianProtocol.ENGINE_REVISION
-            ),
-            "pid" to pid,
-            "handoffSupported" to handoffSupported,
-            "generation" to generation,
-            "engineReason" to engineReason
-        )
-    }
-
     companion object {
         const val AUTHORITY_SUFFIX = ".adb_runtime_config"
         const val METHOD_STATUS = "status"
-        const val METHOD_ENGINE_STATUS = "engine_status"
-        const val METHOD_ENGINE_RESTART = "engine_restart"
         const val METHOD_SET = "set"
         const val METHOD_PROBE = "probe"
         const val METHOD_EXPERIMENT_START = "experiment_start"
