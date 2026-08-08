@@ -363,7 +363,7 @@ internal object EmbeddedSelfUpdateInstaller {
             .getMethod("getPackageInstaller")
             .invoke(packageManagerBinder)
             ?: error("IPackageManager.getPackageInstaller returned null")
-        val userId = UserHandle.getUserHandleForUid(Process.myUid()).identifier
+        val userId = UserHandle.getUserHandleForUid(Process.myUid()).getIdentifier()
         val installer = constructPackageInstaller(packageInstallerBinder, userId)
         val services = FrameworkServices(
             packageManagerBinder = packageManagerBinder,
