@@ -58,6 +58,9 @@ internal object EmbeddedSelfUpdateInstaller {
     private val permissionApprovalRetryScheduleMs = longArrayOf(
         10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
     )
+    private val committedIdleProbeScheduleMs = longArrayOf(
+        20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L, 2_500L, 4_000L, 7_000L, 12_000L
+    )
 
     private val activeSessionId = AtomicInteger(-1)
     private val activeInstaller = AtomicReference<PackageInstaller?>(null)
@@ -198,41 +201,40 @@ internal object EmbeddedSelfUpdateInstaller {
             // Keep write and commit as separate openSession() phases, like the package shell
             // command. r272-r276 readback was diagnostic-only and is intentionally no longer a
             // fail-closed prerequisite for commit in this experiment.
-            installer.openSession(sessionId).use { session ->
-                log("self_update_session_reopened_for_commit", "session=$sessionId writer=parcel_fd")
-                val final = commitAndAwait(services, session, sessionId)
-                val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
-                val result = final.copy(
-                    sessionId = sessionId,
-                    versionCode = newVersion,
-                    apkSize = staged.length(),
-                    durationMs = duration,
-                    sourceSha256 = sourceSha256,
-                    sourceMagic = sourceMagic,
-                    sessionReadbackStage = "skipped_fd_writer"
-                )
-                if (result.ok) {
-                    val installedAfter = runCatching { installedInfo(services) }.getOrNull()
-                    val installedAfterVersion = installedAfter?.let(::versionCodeOf) ?: -1L
-                    if (installedAfterVersion >= newVersion) {
-                        log(
-                            "self_update_install_success",
-                            "session=$sessionId versionCode=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
-                        )
-                    } else {
-                        log(
-                            "self_update_install_success_unverified",
-                            "session=$sessionId candidateVersion=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
-                        )
-                    }
+            val commitSession = installer.openSession(sessionId)
+            log("self_update_session_reopened_for_commit", "session=$sessionId writer=parcel_fd")
+            val final = commitAndAwait(services, commitSession, sessionId)
+            val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
+            val result = final.copy(
+                sessionId = sessionId,
+                versionCode = newVersion,
+                apkSize = staged.length(),
+                durationMs = duration,
+                sourceSha256 = sourceSha256,
+                sourceMagic = sourceMagic,
+                sessionReadbackStage = "skipped_fd_writer"
+            )
+            if (result.ok) {
+                val installedAfter = runCatching { installedInfo(services) }.getOrNull()
+                val installedAfterVersion = installedAfter?.let(::versionCodeOf) ?: -1L
+                if (installedAfterVersion >= newVersion) {
+                    log(
+                        "self_update_install_success",
+                        "session=$sessionId versionCode=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
+                    )
                 } else {
                     log(
-                        "self_update_install_failure",
-                        "session=$sessionId code=${result.code} durationMs=$duration message=${result.message.take(240)}"
+                        "self_update_install_success_unverified",
+                        "session=$sessionId candidateVersion=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
                     )
                 }
-                return result
+            } else {
+                log(
+                    "self_update_install_failure",
+                    "session=$sessionId code=${result.code} durationMs=$duration message=${result.message.take(240)}"
+                )
             }
+            return result
         } catch (error: Throwable) {
             if (sessionId >= 0 && installer != null) {
                 runCatching { installer.abandonSession(sessionId) }
@@ -483,9 +485,11 @@ internal object EmbeddedSelfUpdateInstaller {
         val approvalAccepted = AtomicBoolean(false)
         val approvalCallInFlight = AtomicBoolean(false)
         val approvalRetriesScheduled = AtomicBoolean(false)
+        val committedIdleProbesScheduled = AtomicBoolean(false)
         val committedAt = SystemClock.elapsedRealtime()
         val finished = AtomicBoolean(false)
         val pendingSeen = AtomicBoolean(false)
+        val commitHandleClosed = AtomicBoolean(false)
         val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
             Thread(runnable, "luonnotar-self-update-approval").apply { isDaemon = true }
         }.apply {
@@ -516,6 +520,47 @@ internal object EmbeddedSelfUpdateInstaller {
                             approvalCallInFlight,
                             committedAt,
                             source = "pending_retry"
+                        )
+                    }
+                }, delayMs, TimeUnit.MILLISECONDS)
+            }
+        }
+
+        fun scheduleCommittedIdleFallback() {
+            if (!committedIdleProbesScheduled.compareAndSet(false, true)) return
+            committedIdleProbeScheduleMs.forEach { delayMs ->
+                approvalExecutor.schedule({
+                    if (finished.get() || approvalAccepted.get()) return@schedule
+                    val info = runCatching { services.installer.getSessionInfo(sessionId) }.getOrNull()
+                    if (info == null) {
+                        log(
+                            "self_update_permission_commit_gate_probe",
+                            "session=$sessionId delayMs=$delayMs state=missing"
+                        )
+                        return@schedule
+                    }
+                    val committed = info.isCommitted
+                    val active = info.isActive
+                    val preapprovalRequested = if (Build.VERSION.SDK_INT >= 34) {
+                        info.isPreApprovalRequested
+                    } else {
+                        false
+                    }
+                    log(
+                        "self_update_permission_commit_gate_probe",
+                        "session=$sessionId delayMs=$delayMs committed=$committed active=$active " +
+                            "preapproval=$preapprovalRequested pendingSeen=${pendingSeen.get()}"
+                    )
+                    if (committed && !active && !preapprovalRequested) {
+                        approvePermission(
+                            services,
+                            sessionId,
+                            approvalAttempt,
+                            approvalElapsed,
+                            approvalAccepted,
+                            approvalCallInFlight,
+                            committedAt,
+                            source = "committed_idle_fallback"
                         )
                     }
                 }, delayMs, TimeUnit.MILLISECONDS)
@@ -556,14 +601,25 @@ internal object EmbeddedSelfUpdateInstaller {
         val statusReceiver = intentSenderForBinder(resultBinder)
 
         try {
-            log("self_update_commit", "session=$sessionId callback=binder_native permission_gate=pending_callback_only")
+            log(
+                "self_update_commit",
+                "session=$sessionId callback=binder_native permission_gate=pending_or_committed_idle"
+            )
             session.commit(statusReceiver)
+            session.close()
+            commitHandleClosed.set(true)
+            log("self_update_commit_handle_closed", "session=$sessionId")
 
-            // Never call setPermissionsResult() speculatively. A successful call while the session
-            // is not yet committed is interpreted as a preapproval request; this installer never
-            // requested preapproval and therefore has no preapproval IntentSender. Only the
-            // STATUS_PENDING_USER_ACTION callback may open the approval gate. If that first Binder
-            // call fails, bounded retries are allowed only after the pending callback was observed.
+            // Primary path: approve only after the framework explicitly reports
+            // STATUS_PENDING_USER_ACTION. Fallback path: some builds do not deliver that
+            // intermediate callback to this binder-native receiver. In that case, poll
+            // SessionInfo and approve only after system_server itself reports BOTH committed=true
+            // and active=false. AOSP drops the commit-held active reference exactly when
+            // handleInstall() has sent the pending-user-action intent and returned to wait for the
+            // user's answer. The client Session handle is closed immediately above so it cannot
+            // keep isActive=true artificially. This avoids the preapproval race (committed=false)
+            // and avoids injecting a second install pass while the initial pass is active.
+            scheduleCommittedIdleFallback()
 
             if (!latch.await(FINAL_RESULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 runCatching { services.installer.abandonSession(sessionId) }
@@ -584,6 +640,9 @@ internal object EmbeddedSelfUpdateInstaller {
                 permissionApprovalElapsed = approvalElapsed.get()
             )
         } finally {
+            if (!commitHandleClosed.get()) {
+                runCatching { session.close() }
+            }
             approvalExecutor.shutdownNow()
         }
     }

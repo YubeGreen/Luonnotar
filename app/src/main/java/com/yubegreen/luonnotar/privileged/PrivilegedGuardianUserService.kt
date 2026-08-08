@@ -8228,7 +8228,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 42
+        private const val STATUS_SCHEMA = 43
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
