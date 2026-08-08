@@ -58,7 +58,9 @@ internal object EmbeddedSelfUpdateInstaller {
     private const val IINTENT_SENDER_SEND_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION
     private const val INSTALL_REPLACE_EXISTING_FLAG = 0x00000002
     private const val DIAGNOSTIC_TRACE_NAME = "last-self-update-callback-trace.jsonl"
+    private const val PROVISIONAL_PERMISSION_ABORT_FINALIZE_MS = 5_000L
     private val diagnosticTraceLock = Any()
+    private val provisionalReconcileScheduleMs = longArrayOf(250L, 500L, 1_000L, 2_000L, 3_000L, 5_000L)
     private val permissionApprovalRetryScheduleMs = longArrayOf(
         10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
     )
@@ -212,7 +214,7 @@ internal object EmbeddedSelfUpdateInstaller {
             // fail-closed prerequisite for commit in this experiment.
             val commitSession = installer.openSession(sessionId)
             log("self_update_session_reopened_for_commit", "session=$sessionId writer=parcel_fd")
-            val final = commitAndAwait(services, commitSession, sessionId)
+            val final = commitAndAwait(services, commitSession, sessionId, newVersion)
             val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
             val result = final.copy(
                 sessionId = sessionId,
@@ -485,7 +487,8 @@ internal object EmbeddedSelfUpdateInstaller {
     private fun commitAndAwait(
         services: FrameworkServices,
         session: PackageInstaller.Session,
-        sessionId: Int
+        sessionId: Int,
+        candidateVersionCode: Long
     ): Result {
         val latch = CountDownLatch(1)
         val finalStatus = AtomicInteger(Int.MIN_VALUE)
@@ -501,6 +504,10 @@ internal object EmbeddedSelfUpdateInstaller {
         val pendingSeen = AtomicBoolean(false)
         val commitHandleClosed = AtomicBoolean(false)
         val callbackSequence = AtomicInteger(0)
+        val provisionalFailureStatus = AtomicInteger(Int.MIN_VALUE)
+        val provisionalFailureMessage = AtomicReference("")
+        val provisionalFailureSeen = AtomicBoolean(false)
+        val provisionalReconcileScheduled = AtomicBoolean(false)
         val callbackTraceFile = "$STAGING_ROOT/$DIAGNOSTIC_TRACE_NAME"
         resetDiagnosticTrace(sessionId, committedAt)
         val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
@@ -525,6 +532,55 @@ internal object EmbeddedSelfUpdateInstaller {
                 finalStatus.set(status)
                 finalMessage.set(message)
                 latch.countDown()
+            }
+        }
+
+        fun scheduleProvisionalFailureReconciliation(status: Int, message: String) {
+            if (!provisionalFailureSeen.compareAndSet(false, true)) return
+            provisionalFailureStatus.set(status)
+            provisionalFailureMessage.set(message)
+            appendDiagnosticTrace(
+                sessionId,
+                committedAt,
+                "provisional_failure_deferred",
+                "status" to status,
+                "statusName" to mapStatus(status),
+                "message" to message.take(300),
+                "candidateVersionCode" to candidateVersionCode
+            )
+            if (!provisionalReconcileScheduled.compareAndSet(false, true)) return
+            provisionalReconcileScheduleMs.forEach { delayMs ->
+                approvalExecutor.schedule({
+                    if (finished.get()) return@schedule
+                    val installedVersion = runCatching {
+                        installedInfo(services)?.let(::versionCodeOf) ?: -1L
+                    }.getOrDefault(-1L)
+                    appendDiagnosticTrace(
+                        sessionId,
+                        committedAt,
+                        "provisional_reconcile_probe",
+                        "delayMs" to delayMs,
+                        "candidateVersionCode" to candidateVersionCode,
+                        "installedVersionCode" to installedVersion,
+                        "callbackCount" to callbackSequence.get()
+                    )
+                    if (installedVersion >= candidateVersionCode) {
+                        finish(
+                            PackageInstaller.STATUS_SUCCESS,
+                            "INSTALL_SUCCEEDED: installed version verified after provisional permission-abort callback"
+                        )
+                    } else if (delayMs >= PROVISIONAL_PERMISSION_ABORT_FINALIZE_MS && !finished.get()) {
+                        appendDiagnosticTrace(
+                            sessionId,
+                            committedAt,
+                            "provisional_failure_finalizing",
+                            "status" to provisionalFailureStatus.get(),
+                            "statusName" to mapStatus(provisionalFailureStatus.get()),
+                            "message" to provisionalFailureMessage.get().take(300)
+                        )
+                        finish(provisionalFailureStatus.get(), provisionalFailureMessage.get())
+                    }
+                }, delayMs, TimeUnit.MILLISECONDS)
             }
         }
 
@@ -649,6 +705,16 @@ internal object EmbeddedSelfUpdateInstaller {
                     if (!approvalAccepted.get()) {
                         scheduleApprovalRetriesAfterPending()
                     }
+                } else if (
+                    status == PackageInstaller.STATUS_FAILURE_ABORTED &&
+                    approvalAccepted.get() &&
+                    message.contains("User rejected permissions", ignoreCase = true)
+                ) {
+                    // On the tested locked-screen path, PackageInstaller can emit this abort
+                    // callback shortly after shell approval and then emit STATUS_SUCCESS once
+                    // installation actually completes. Treat only this observed contradiction as
+                    // provisional; all other terminal failures remain fail-fast.
+                    scheduleProvisionalFailureReconciliation(status, message)
                 } else {
                     finish(status, message)
                 }
