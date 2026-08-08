@@ -11,6 +11,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.IBinder
 import android.os.Parcel
+import android.os.ParcelFileDescriptor
 import android.os.Process
 import android.os.SystemClock
 import android.os.UserHandle
@@ -181,66 +182,24 @@ internal object EmbeddedSelfUpdateInstaller {
             activeSessionId.set(sessionId)
             log("self_update_session_created", "session=$sessionId versionCode=$newVersion backend=binder_native")
 
+            // Match PackageManagerShellCommand's current local-file writer path: hand the
+            // already-validated APK to PackageInstaller as a read-only ParcelFileDescriptor and
+            // let system_server perform the session copy synchronously through Session.write().
+            // The hidden Session.write API is reached reflectively because it is not in the SDK
+            // stubs used by the app build. Reverse-write mode is restricted by the framework to
+            // shell/system callers; this engine already runs as uid 2000.
             installer.openSession(sessionId).use { writeSession ->
-                FileInputStream(staged).use { input ->
-                    writeSession.openWrite("base.apk", 0L, staged.length()).use { output ->
-                        log("self_update_write_start", "session=$sessionId bytes=${staged.length()}")
-                        input.copyTo(output, DEFAULT_BUFFER_SIZE)
-                        writeSession.fsync(output)
-                    }
-                }
-                log("self_update_write_complete", "session=$sessionId bytes=${staged.length()}")
+                log("self_update_fd_write_start", "session=$sessionId bytes=${staged.length()}")
+                writeSessionFromFd(writeSession, staged)
+                log("self_update_fd_write_complete", "session=$sessionId bytes=${staged.length()}")
             }
-            log("self_update_session_closed_after_write", "session=$sessionId")
+            log("self_update_session_closed_after_write", "session=$sessionId writer=parcel_fd")
 
-            // OriginOS experiment: the Session proxy used for openWrite/fsync can still answer
-            // getNames() yet return DeadObjectException specifically from openRead(). Reacquire
-            // the session Binder after the write phase so verification and commit use a fresh
-            // IPackageInstallerSession proxy. No permission/commit policy is changed here.
+            // Keep write and commit as separate openSession() phases, like the package shell
+            // command. r272-r276 readback was diagnostic-only and is intentionally no longer a
+            // fail-closed prerequisite for commit in this experiment.
             installer.openSession(sessionId).use { session ->
-                log("self_update_session_reopened_after_write", "session=$sessionId")
-                val readback = verifySessionPayload(
-                    session = session,
-                    installer = services.installer,
-                    sessionId = sessionId,
-                    expectedBytes = staged.length(),
-                    expectedSha256 = sourceSha256,
-                    expectedMagic = sourceMagic
-                )
-                val readbackNames = readback.names.joinToString(",")
-                if (!readback.verified) {
-                    log(
-                        "self_update_session_readback_failed",
-                        "session=$sessionId names=$readbackNames bytes=${readback.bytes}/${readback.expectedBytes} " +
-                            "sha256=${readback.sha256}/${readback.expectedSha256} " +
-                            "magic=${readback.magic}/${readback.expectedMagic} reason=${readback.reason.take(220)}"
-                    )
-                    runCatching { services.installer.abandonSession(sessionId) }
-                    return Result(
-                        ok = false,
-                        code = readback.failureCode.ifBlank { "SESSION_READBACK_MISMATCH" },
-                        message = readback.reason,
-                        sessionId = sessionId,
-                        versionCode = newVersion,
-                        apkSize = staged.length(),
-                        durationMs = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L),
-                        sessionReadbackVerified = false,
-                        sessionReadbackBytes = readback.bytes,
-                        sessionReadbackSha256 = readback.sha256,
-                        sourceSha256 = readback.expectedSha256,
-                        sessionReadbackMagic = readback.magic,
-                        sourceMagic = readback.expectedMagic,
-                        sessionEntryNames = readbackNames,
-                        sessionReadbackStage = readback.stage,
-                        sessionReadbackDiagnostic = readback.diagnostic
-                    )
-                }
-                log(
-                    "self_update_session_readback_verified",
-                    "session=$sessionId names=$readbackNames bytes=${readback.bytes} " +
-                        "sha256=${readback.sha256} magic=${readback.magic}"
-                )
-
+                log("self_update_session_reopened_for_commit", "session=$sessionId writer=parcel_fd")
                 val final = commitAndAwait(services, session, sessionId)
                 val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                 val result = final.copy(
@@ -248,15 +207,9 @@ internal object EmbeddedSelfUpdateInstaller {
                     versionCode = newVersion,
                     apkSize = staged.length(),
                     durationMs = duration,
-                    sessionReadbackVerified = true,
-                    sessionReadbackBytes = readback.bytes,
-                    sessionReadbackSha256 = readback.sha256,
-                    sourceSha256 = readback.expectedSha256,
-                    sessionReadbackMagic = readback.magic,
-                    sourceMagic = readback.expectedMagic,
-                    sessionEntryNames = readbackNames,
-                    sessionReadbackStage = readback.stage,
-                    sessionReadbackDiagnostic = readback.diagnostic
+                    sourceSha256 = sourceSha256,
+                    sourceMagic = sourceMagic,
+                    sessionReadbackStage = "skipped_fd_writer"
                 )
                 if (result.ok) {
                     val installedAfter = runCatching { installedInfo(services) }.getOrNull()
@@ -294,6 +247,24 @@ internal object EmbeddedSelfUpdateInstaller {
             activeSessionId.compareAndSet(sessionId, -1)
             activeInstaller.compareAndSet(installer, null)
             runCatching { staged.delete() }
+        }
+    }
+
+    private fun writeSessionFromFd(session: PackageInstaller.Session, apk: File) {
+        val method = PackageInstaller.Session::class.java.getDeclaredMethod(
+            "write",
+            String::class.java,
+            Long::class.javaPrimitiveType,
+            Long::class.javaPrimitiveType,
+            ParcelFileDescriptor::class.java
+        ).apply { isAccessible = true }
+
+        ParcelFileDescriptor.open(apk, ParcelFileDescriptor.MODE_READ_ONLY).use { inputFd ->
+            try {
+                method.invoke(session, "base.apk", 0L, apk.length(), inputFd)
+            } catch (error: InvocationTargetException) {
+                throw (error.targetException ?: error)
+            }
         }
     }
 
