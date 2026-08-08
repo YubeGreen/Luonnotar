@@ -75,6 +75,18 @@ internal object EmbeddedSelfUpdateInstaller {
         val signerDigests: Set<String>
     )
 
+    private data class SessionPayloadReadback(
+        val verified: Boolean,
+        val names: List<String>,
+        val bytes: Long,
+        val sha256: String,
+        val magic: String,
+        val expectedBytes: Long,
+        val expectedSha256: String,
+        val expectedMagic: String,
+        val reason: String
+    )
+
     data class Result(
         val ok: Boolean,
         val code: String,
@@ -84,7 +96,14 @@ internal object EmbeddedSelfUpdateInstaller {
         val apkSize: Long = -1L,
         val durationMs: Long = 0L,
         val permissionApprovalAttempt: Int = 0,
-        val permissionApprovalElapsed: Long = -1L
+        val permissionApprovalElapsed: Long = -1L,
+        val sessionReadbackVerified: Boolean = false,
+        val sessionReadbackBytes: Long = -1L,
+        val sessionReadbackSha256: String = "",
+        val sourceSha256: String = "",
+        val sessionReadbackMagic: String = "",
+        val sourceMagic: String = "",
+        val sessionEntryNames: String = ""
     ) {
         fun toJson(): String = JSONObject()
             .put("ok", ok)
@@ -97,6 +116,13 @@ internal object EmbeddedSelfUpdateInstaller {
             .put("durationMs", durationMs)
             .put("permissionApprovalAttempt", permissionApprovalAttempt)
             .put("permissionApprovalElapsed", permissionApprovalElapsed)
+            .put("sessionReadbackVerified", sessionReadbackVerified)
+            .put("sessionReadbackBytes", sessionReadbackBytes)
+            .put("sessionReadbackSha256", sessionReadbackSha256)
+            .put("sourceSha256", sourceSha256)
+            .put("sessionReadbackMagic", sessionReadbackMagic)
+            .put("sourceMagic", sourceMagic)
+            .put("sessionEntryNames", sessionEntryNames)
             .toString()
     }
 
@@ -128,9 +154,12 @@ internal object EmbeddedSelfUpdateInstaller {
             val validation = validateArchive(archive, installed, staged.length())
             if (validation != null) return failure(validation.first, validation.second, started)
             val newVersion = archive.versionCode
+            val sourceSha256 = sha256File(staged)
+            val sourceMagic = fileMagic(staged)
             log(
                 "self_update_validation_success",
-                "versionCode=$newVersion bytes=${staged.length()} signers=${archive.signerDigests.size}"
+                "versionCode=$newVersion bytes=${staged.length()} signers=${archive.signerDigests.size} " +
+                    "sha256=$sourceSha256 magic=$sourceMagic"
             )
 
             installer = services.installer
@@ -154,13 +183,59 @@ internal object EmbeddedSelfUpdateInstaller {
                     }
                 }
                 log("self_update_write_complete", "session=$sessionId bytes=${staged.length()}")
+
+                val readback = verifySessionPayload(
+                    session = session,
+                    expectedBytes = staged.length(),
+                    expectedSha256 = sourceSha256,
+                    expectedMagic = sourceMagic
+                )
+                val readbackNames = readback.names.joinToString(",")
+                if (!readback.verified) {
+                    log(
+                        "self_update_session_readback_failed",
+                        "session=$sessionId names=$readbackNames bytes=${readback.bytes}/${readback.expectedBytes} " +
+                            "sha256=${readback.sha256}/${readback.expectedSha256} " +
+                            "magic=${readback.magic}/${readback.expectedMagic} reason=${readback.reason.take(220)}"
+                    )
+                    runCatching { services.installer.abandonSession(sessionId) }
+                    return Result(
+                        ok = false,
+                        code = "SESSION_READBACK_MISMATCH",
+                        message = readback.reason,
+                        sessionId = sessionId,
+                        versionCode = newVersion,
+                        apkSize = staged.length(),
+                        durationMs = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L),
+                        sessionReadbackVerified = false,
+                        sessionReadbackBytes = readback.bytes,
+                        sessionReadbackSha256 = readback.sha256,
+                        sourceSha256 = readback.expectedSha256,
+                        sessionReadbackMagic = readback.magic,
+                        sourceMagic = readback.expectedMagic,
+                        sessionEntryNames = readbackNames
+                    )
+                }
+                log(
+                    "self_update_session_readback_verified",
+                    "session=$sessionId names=$readbackNames bytes=${readback.bytes} " +
+                        "sha256=${readback.sha256} magic=${readback.magic}"
+                )
+
                 val final = commitAndAwait(services, session, sessionId)
                 val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                 val result = final.copy(
                     sessionId = sessionId,
                     versionCode = newVersion,
                     apkSize = staged.length(),
-                    durationMs = duration
+                    durationMs = duration,
+                    sessionReadbackVerified = true,
+                    sessionReadbackBytes = readback.bytes,
+                    sessionReadbackSha256 = readback.sha256,
+                    sourceSha256 = readback.expectedSha256,
+                    sessionReadbackMagic = readback.magic,
+                    sourceMagic = readback.expectedMagic,
+                    sessionEntryNames = readbackNames
                 )
                 if (result.ok) {
                     val installedAfter = runCatching { installedInfo(services) }.getOrNull()
@@ -200,6 +275,102 @@ internal object EmbeddedSelfUpdateInstaller {
             runCatching { staged.delete() }
         }
     }
+
+    private fun verifySessionPayload(
+        session: PackageInstaller.Session,
+        expectedBytes: Long,
+        expectedSha256: String,
+        expectedMagic: String
+    ): SessionPayloadReadback {
+        return runCatching {
+            val names = session.names.toList().sorted()
+            if ("base.apk" !in names) {
+                return@runCatching SessionPayloadReadback(
+                    verified = false,
+                    names = names,
+                    bytes = -1L,
+                    sha256 = "",
+                    magic = "",
+                    expectedBytes = expectedBytes,
+                    expectedSha256 = expectedSha256,
+                    expectedMagic = expectedMagic,
+                    reason = "PackageInstaller session does not contain base.apk"
+                )
+            }
+
+            val digest = MessageDigest.getInstance("SHA-256")
+            val firstBytes = ByteArray(4)
+            var firstBytesCount = 0
+            var total = 0L
+            session.openRead("base.apk").use { input ->
+                val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+                while (true) {
+                    val read = input.read(buffer)
+                    if (read < 0) break
+                    if (read == 0) continue
+                    if (firstBytesCount < firstBytes.size) {
+                        val copyCount = minOf(firstBytes.size - firstBytesCount, read)
+                        System.arraycopy(buffer, 0, firstBytes, firstBytesCount, copyCount)
+                        firstBytesCount += copyCount
+                    }
+                    digest.update(buffer, 0, read)
+                    total += read.toLong()
+                }
+            }
+            val sha256 = digest.digest().toHex()
+            val magic = firstBytes.copyOf(firstBytesCount).toHex()
+            val problems = buildList {
+                if (total != expectedBytes) add("byte count mismatch $total != $expectedBytes")
+                if (sha256 != expectedSha256) add("sha256 mismatch")
+                if (magic != expectedMagic) add("file magic mismatch $magic != $expectedMagic")
+            }
+            SessionPayloadReadback(
+                verified = problems.isEmpty(),
+                names = names,
+                bytes = total,
+                sha256 = sha256,
+                magic = magic,
+                expectedBytes = expectedBytes,
+                expectedSha256 = expectedSha256,
+                expectedMagic = expectedMagic,
+                reason = problems.joinToString("; ").ifBlank { "verified" }
+            )
+        }.getOrElse { error ->
+            SessionPayloadReadback(
+                verified = false,
+                names = emptyList(),
+                bytes = -1L,
+                sha256 = "",
+                magic = "",
+                expectedBytes = expectedBytes,
+                expectedSha256 = expectedSha256,
+                expectedMagic = expectedMagic,
+                reason = "session readback failed: ${rootCauseSummary(error)}"
+            )
+        }
+    }
+
+    private fun sha256File(file: File): String {
+        val digest = MessageDigest.getInstance("SHA-256")
+        FileInputStream(file).use { input ->
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            while (true) {
+                val read = input.read(buffer)
+                if (read < 0) break
+                if (read == 0) continue
+                digest.update(buffer, 0, read)
+            }
+        }
+        return digest.digest().toHex()
+    }
+
+    private fun fileMagic(file: File): String {
+        val bytes = ByteArray(4)
+        val count = FileInputStream(file).use { input -> input.read(bytes) }.coerceAtLeast(0)
+        return bytes.copyOf(count).toHex()
+    }
+
+    private fun ByteArray.toHex(): String = joinToString("") { "%02x".format(it) }
 
     fun abandonActiveSession() {
         val id = activeSessionId.getAndSet(-1)
