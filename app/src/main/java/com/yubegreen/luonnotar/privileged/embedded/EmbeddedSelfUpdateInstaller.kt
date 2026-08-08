@@ -181,16 +181,24 @@ internal object EmbeddedSelfUpdateInstaller {
             activeSessionId.set(sessionId)
             log("self_update_session_created", "session=$sessionId versionCode=$newVersion backend=binder_native")
 
-            installer.openSession(sessionId).use { session ->
+            installer.openSession(sessionId).use { writeSession ->
                 FileInputStream(staged).use { input ->
-                    session.openWrite("base.apk", 0L, staged.length()).use { output ->
+                    writeSession.openWrite("base.apk", 0L, staged.length()).use { output ->
                         log("self_update_write_start", "session=$sessionId bytes=${staged.length()}")
                         input.copyTo(output, DEFAULT_BUFFER_SIZE)
-                        session.fsync(output)
+                        writeSession.fsync(output)
                     }
                 }
                 log("self_update_write_complete", "session=$sessionId bytes=${staged.length()}")
+            }
+            log("self_update_session_closed_after_write", "session=$sessionId")
 
+            // OriginOS experiment: the Session proxy used for openWrite/fsync can still answer
+            // getNames() yet return DeadObjectException specifically from openRead(). Reacquire
+            // the session Binder after the write phase so verification and commit use a fresh
+            // IPackageInstallerSession proxy. No permission/commit policy is changed here.
+            installer.openSession(sessionId).use { session ->
+                log("self_update_session_reopened_after_write", "session=$sessionId")
                 val readback = verifySessionPayload(
                     session = session,
                     installer = services.installer,
