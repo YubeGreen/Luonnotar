@@ -222,11 +222,12 @@ object RecoveryCampaignPolicy {
             GMS_VIVO_VERIFIED_OUTAGE_DEADLINE_MS
         }
 
-    fun isGmsVerifiedOutageDeadlineReached(
+    fun shouldBypassGmsAdaptiveCooldown(
         vendorFamily: BackgroundPolicyVendorFamily,
         strongEvidence: Boolean,
         nowElapsed: Long,
         transportMissingSinceElapsed: Long,
+        lastBypassedMissingEpisodeElapsed: Long,
         postSuccessProtectionActive: Boolean
     ): Boolean {
         if (vendorFamily != BackgroundPolicyVendorFamily.VIVO || !strongEvidence) return false
@@ -234,33 +235,9 @@ object RecoveryCampaignPolicy {
         if (transportMissingSinceElapsed <= 0L || transportMissingSinceElapsed > nowElapsed) {
             return false
         }
+        if (lastBypassedMissingEpisodeElapsed == transportMissingSinceElapsed) return false
         return nowElapsed - transportMissingSinceElapsed >=
             gmsVerifiedOutageDeadlineMs(postSuccessProtectionActive)
-    }
-
-    fun shouldBypassGmsAdaptiveCooldown(
-        vendorFamily: BackgroundPolicyVendorFamily,
-        strongEvidence: Boolean,
-        nowElapsed: Long,
-        transportMissingSinceElapsed: Long,
-        currentPidGenerationKey: String,
-        lastBypassedMissingEpisodeElapsed: Long,
-        lastBypassedPidGenerationKey: String,
-        postSuccessProtectionActive: Boolean
-    ): Boolean {
-        if (currentPidGenerationKey.isBlank()) return false
-        if (!isGmsVerifiedOutageDeadlineReached(
-                vendorFamily = vendorFamily,
-                strongEvidence = strongEvidence,
-                nowElapsed = nowElapsed,
-                transportMissingSinceElapsed = transportMissingSinceElapsed,
-                postSuccessProtectionActive = postSuccessProtectionActive
-            )
-        ) {
-            return false
-        }
-        return lastBypassedMissingEpisodeElapsed != transportMissingSinceElapsed ||
-            lastBypassedPidGenerationKey != currentPidGenerationKey
     }
 
     fun shouldUseRecentVivoFastFreezerEvidence(

@@ -146,8 +146,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var vendorBridgeDefenseEscalationCount = 0L
     private var vendorBridgeDefensePidChangeCount = 0L
     private var vendorBridgeDefenseExpiredCount = 0L
-    private var vendorBridgeDefenseCircuitOpenCount = 0L
-    private var vendorBridgeDefenseStableTransportMissingCount = 0L
     private var vendorBridgeDefenseLastSequence = 0L
     private var vendorBridgeDefenseLastPhase = "never"
     private var vendorBridgeDefenseLastElapsedMs = 0L
@@ -240,7 +238,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsRecentFreezerEvidenceLatchedMissingEpisodeElapsed = 0L
     private var gmsVerifiedOutageDeadlineFuture: ScheduledFuture<*>? = null
     private var gmsVerifiedOutageDeadlineEpisodeElapsed = 0L
-    private var gmsVerifiedOutageDeadlineGenerationKey = ""
     private var gmsVerifiedOutageDeadlineRecheckAttempt = 0
     private var gmsVerifiedOutageDeadlineRecheckCount = 0L
     private var gmsVerifiedOutageDeadlineRecheckExhaustedCount = 0L
@@ -291,7 +288,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var lastGmsRecoveryCompletedElapsed = 0L
     private var gmsConsecutiveCampaignFailures = 0
     private var gmsCooldownBypassMissingEpisodeElapsed = 0L
-    private var gmsCooldownBypassPidGenerationKey = ""
     private var gmsCooldownBypassCount = 0L
     private var gmsPostSuccessProtectionUntilElapsed = 0L
     private var gmsRecoveryAttemptCount = 0L
@@ -1410,13 +1406,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         "pid_changed" -> vendorBridgeDefensePidChangeCount += 1
                         "stable" -> vendorBridgeDefenseStableCount += 1
                         "expired" -> vendorBridgeDefenseExpiredCount += 1
-                        "generation_circuit_open" -> vendorBridgeDefenseCircuitOpenCount += 1
-                        "stable_transport_missing" ->
-                            vendorBridgeDefenseStableTransportMissingCount += 1
                     }
                     when (record.phase) {
-                        "stable", "expired", "generation_circuit_open",
-                        "stable_transport_missing" -> {
+                        "stable", "expired" -> {
                             if (vendorBridgeDefenseOwnershipSequence == record.sequence) {
                                 clearVendorDefenseRecoveryOwnershipLocked(record.phase)
                             }
@@ -4612,12 +4604,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         if (!running || !vendorBridgeOwnsGmsCommandsLocked()) return@synchronized
                         if (
                             sequence != vendorBridgeDefenseLastSequence ||
-                            vendorBridgeDefenseLastPhase !in setOf(
-                                "escalating",
-                                "expired",
-                                "generation_circuit_open",
-                                "stable_transport_missing"
-                            )
+                            vendorBridgeDefenseLastPhase !in setOf("escalating", "expired")
                         ) {
                             eventLocked(
                                 "vendor_bridge_lock_escalation_stale",
@@ -5211,31 +5198,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
         )
 
-    private fun gmsPidGenerationKeyLocked(
-        processes: List<GuardianProcess> = listGmsProcessesLocked()
-    ): String {
-        val mainPid = processes.firstOrNull { it.name == GMS_PACKAGE }?.pid ?: 0
-        val persistentPid = processes.firstOrNull {
-            it.name == "$GMS_PACKAGE.persistent"
-        }?.pid ?: 0
-        if (mainPid <= 0 || persistentPid <= 0) return ""
-        return "$mainPid:$persistentPid"
-    }
-
-    private fun gmsCooldownBypassConsumedForGenerationLocked(
-        generationKey: String
-    ): Boolean =
-        generationKey.isNotBlank() &&
-            gmsCooldownBypassMissingEpisodeElapsed == gmsTransportMissingSinceElapsed &&
-            gmsCooldownBypassPidGenerationKey == generationKey
-
     private fun cancelGmsVerifiedOutageDeadlineRecheckLocked(reason: String) {
         val hadFuture = gmsVerifiedOutageDeadlineFuture != null
         val episode = gmsVerifiedOutageDeadlineEpisodeElapsed
         gmsVerifiedOutageDeadlineFuture?.cancel(false)
         gmsVerifiedOutageDeadlineFuture = null
         gmsVerifiedOutageDeadlineEpisodeElapsed = 0L
-        gmsVerifiedOutageDeadlineGenerationKey = ""
         gmsVerifiedOutageDeadlineRecheckAttempt = 0
         if (hadFuture && episode > 0L) {
             eventLocked(
@@ -5248,7 +5216,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun ensureGmsVerifiedOutageDeadlineRecheckLocked(
         nowElapsed: Long = SystemClock.elapsedRealtime()
     ) {
-        val generationKey = gmsPidGenerationKeyLocked()
         if (
             !running ||
             gmsRecoveryInProgress ||
@@ -5258,15 +5225,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             !lastGmsTransportProbe.observable ||
             lastGmsTransportProbe.healthy ||
             gmsTransportMissingSinceElapsed <= 0L ||
-            generationKey.isBlank() ||
-            gmsCooldownBypassConsumedForGenerationLocked(generationKey)
+            gmsCooldownBypassMissingEpisodeElapsed == gmsTransportMissingSinceElapsed
         ) {
             return
         }
         val episode = gmsTransportMissingSinceElapsed
         if (
             gmsVerifiedOutageDeadlineEpisodeElapsed == episode &&
-            gmsVerifiedOutageDeadlineGenerationKey == generationKey &&
             gmsVerifiedOutageDeadlineRecheckAttempt >=
                 RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_MAX_ATTEMPTS
         ) {
@@ -5274,21 +5239,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         if (
             gmsVerifiedOutageDeadlineFuture != null &&
-            gmsVerifiedOutageDeadlineEpisodeElapsed == episode &&
-            gmsVerifiedOutageDeadlineGenerationKey == generationKey
+            gmsVerifiedOutageDeadlineEpisodeElapsed == episode
         ) {
             return
         }
-        if (
-            gmsVerifiedOutageDeadlineEpisodeElapsed != episode ||
-            gmsVerifiedOutageDeadlineGenerationKey != generationKey
-        ) {
+        if (gmsVerifiedOutageDeadlineEpisodeElapsed != episode) {
             gmsVerifiedOutageDeadlineRecheckAttempt = 0
         }
         val targetElapsed = episode + gmsVerifiedOutageDeadlineLocked(nowElapsed)
         scheduleGmsVerifiedOutageDeadlineRecheckLocked(
             episode = episode,
-            generationKey = generationKey,
             targetElapsed = targetElapsed,
             attempt = gmsVerifiedOutageDeadlineRecheckAttempt
         )
@@ -5296,20 +5256,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun scheduleGmsVerifiedOutageDeadlineRecheckLocked(
         episode: Long,
-        generationKey: String,
         targetElapsed: Long,
         attempt: Int
     ) {
         gmsVerifiedOutageDeadlineFuture?.cancel(false)
         gmsVerifiedOutageDeadlineEpisodeElapsed = episode
-        gmsVerifiedOutageDeadlineGenerationKey = generationKey
         gmsVerifiedOutageDeadlineRecheckAttempt = attempt
         val now = SystemClock.elapsedRealtime()
         val delayMs = (targetElapsed - now).coerceAtLeast(0L)
         gmsVerifiedOutageDeadlineFuture = executor.schedule(
             {
                 synchronized(lock) {
-                    runGmsVerifiedOutageDeadlineRecheckLocked(episode, generationKey, attempt)
+                    runGmsVerifiedOutageDeadlineRecheckLocked(episode, attempt)
                 }
             },
             delayMs,
@@ -5318,8 +5276,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (attempt == 0) {
             eventLocked(
                 "gms_verified_outage_deadline_recheck_scheduled",
-                "missingSince=$episode generation=$generationKey " +
-                    "targetElapsed=$targetElapsed delayMs=$delayMs " +
+                "missingSince=$episode targetElapsed=$targetElapsed delayMs=$delayMs " +
                     "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)}"
             )
         }
@@ -5327,27 +5284,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
     private fun runGmsVerifiedOutageDeadlineRecheckLocked(
         episode: Long,
-        generationKey: String,
         attempt: Int
     ) {
         if (
             gmsVerifiedOutageDeadlineEpisodeElapsed != episode ||
-            gmsVerifiedOutageDeadlineGenerationKey != generationKey ||
             gmsTransportMissingSinceElapsed != episode ||
-            gmsPidGenerationKeyLocked() != generationKey ||
             gmsRecoveryInProgress ||
             gmsRecoveryCampaign != null ||
             gmsDeferredForceStopContinuation != null ||
             !running
         ) {
-            cancelGmsVerifiedOutageDeadlineRecheckLocked("stale_generation_or_recovery_active")
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("stale_or_recovery_active")
             return
         }
         gmsVerifiedOutageDeadlineFuture = null
         val now = SystemClock.elapsedRealtime()
-        val processes = listGmsProcessesLocked()
         val probe = probeGmsTransportLocked()
-        val persistentRunning = processes.any { process ->
+        val persistentRunning = listGmsProcessesLocked().any { process ->
             process.name == "$GMS_PACKAGE.persistent"
         }
         applyGmsTransportProbeLocked(
@@ -5359,13 +5312,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         gmsVerifiedOutageDeadlineRecheckCount += 1
         if (
             gmsTransportMissingSinceElapsed != episode ||
-            gmsPidGenerationKeyLocked(processes) != generationKey ||
             !probe.observable ||
             probe.healthy
         ) {
-            cancelGmsVerifiedOutageDeadlineRecheckLocked(
-                "transport_recovered_generation_changed_or_unobservable"
-            )
+            cancelGmsVerifiedOutageDeadlineRecheckLocked("transport_recovered_or_unobservable")
             return
         }
 
@@ -5382,15 +5332,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsVerifiedOutageDeadlineFuture = null
             eventLocked(
                 "gms_verified_outage_deadline_recheck_exhausted",
-                "missingSince=$episode generation=$generationKey attempts=$nextAttempt " +
-                    "missing=$gmsTransportConsecutiveMissing " +
+                "missingSince=$episode attempts=$nextAttempt missing=$gmsTransportConsecutiveMissing " +
                     "ports=${lastGmsTransportProbe.establishedPorts.sorted()}"
             )
             return
         }
         scheduleGmsVerifiedOutageDeadlineRecheckLocked(
             episode = episode,
-            generationKey = generationKey,
             targetElapsed = SystemClock.elapsedRealtime() +
                 RecoveryCampaignPolicy.GMS_VIVO_VERIFIED_OUTAGE_RECHECK_INTERVAL_MS,
             attempt = nextAttempt
@@ -5728,16 +5676,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun gmsCooldownBypassEligibleLocked(
         nowElapsed: Long,
         vendorFamily: BackgroundPolicyVendorFamily,
-        strongEvidence: Boolean,
-        pidGenerationKey: String
+        strongEvidence: Boolean
     ): Boolean = RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
         vendorFamily = vendorFamily,
         strongEvidence = strongEvidence,
         nowElapsed = nowElapsed,
         transportMissingSinceElapsed = gmsTransportMissingSinceElapsed,
-        currentPidGenerationKey = pidGenerationKey,
         lastBypassedMissingEpisodeElapsed = gmsCooldownBypassMissingEpisodeElapsed,
-        lastBypassedPidGenerationKey = gmsCooldownBypassPidGenerationKey,
         postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
     )
 
@@ -5848,20 +5793,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         } else {
             0L
         }
-        val currentPidGenerationKey = gmsPidGenerationKeyLocked(gmsProcesses)
-        val verifiedOutageDeadlineReached =
-            RecoveryCampaignPolicy.isGmsVerifiedOutageDeadlineReached(
-                vendorFamily = vendorFamily,
-                strongEvidence = strongEvidence,
-                nowElapsed = now,
-                transportMissingSinceElapsed = gmsTransportMissingSinceElapsed,
-                postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(now)
-            )
-        val cooldownBypassEligible = gmsCooldownBypassEligibleLocked(
+        val verifiedOutageDeadlineReached = gmsCooldownBypassEligibleLocked(
             nowElapsed = now,
             vendorFamily = vendorFamily,
-            strongEvidence = strongEvidence,
-            pidGenerationKey = currentPidGenerationKey
+            strongEvidence = strongEvidence
         )
         val vendorDefenseOwnsRecovery = vendorDefenseOwnsGmsRecoveryLocked(now)
         val vendorDefenseOwnerDeadlineOverride =
@@ -5898,7 +5833,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             manual = manual,
             strongEvidence = strongEvidence,
             consecutiveFailureCount = gmsConsecutiveCampaignFailures,
-            verifiedOutageDeadlineReached = cooldownBypassEligible
+            verifiedOutageDeadlineReached = verifiedOutageDeadlineReached
         )
         if (!campaignDecision.allowed) {
             eventLocked(
@@ -5921,12 +5856,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val deadlineRescue = campaignDecision.reason == "verified_outage_deadline_rescue"
         if (deadlineRescue) {
             gmsCooldownBypassMissingEpisodeElapsed = gmsTransportMissingSinceElapsed
-            gmsCooldownBypassPidGenerationKey = currentPidGenerationKey
             gmsCooldownBypassCount += 1
             eventLocked(
                 "gms_recovery_cooldown_bypassed_verified_outage",
-                "missingSince=${gmsTransportMissingSinceElapsed} " +
-                    "pidGeneration=$currentPidGenerationKey outageAgeMs=$outageAgeMs " +
+                "missingSince=${gmsTransportMissingSinceElapsed} outageAgeMs=$outageAgeMs " +
                     "deadlineMs=${gmsVerifiedOutageDeadlineLocked(now)} " +
                     "consecutiveFailures=$gmsConsecutiveCampaignFailures"
             )
@@ -7099,7 +7032,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsFreezeEvents.clear()
             gmsConsecutiveCampaignFailures = 0
             gmsCooldownBypassMissingEpisodeElapsed = 0L
-            gmsCooldownBypassPidGenerationKey = ""
             gmsPostSuccessProtectionUntilElapsed =
                 now + RecoveryCampaignPolicy.GMS_VIVO_POST_SUCCESS_PROTECTION_MS
             eventLocked(
@@ -7674,11 +7606,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("defenseEscalationCount", vendorBridgeDefenseEscalationCount)
             .put("defensePidChangeCount", vendorBridgeDefensePidChangeCount)
             .put("defenseExpiredCount", vendorBridgeDefenseExpiredCount)
-            .put("defenseCircuitOpenCount", vendorBridgeDefenseCircuitOpenCount)
-            .put(
-                "defenseStableTransportMissingCount",
-                vendorBridgeDefenseStableTransportMissingCount
-            )
             .put("defenseLastSequence", vendorBridgeDefenseLastSequence)
             .put("defenseLastPhase", vendorBridgeDefenseLastPhase)
             .put("defenseLastElapsedMs", vendorBridgeDefenseLastElapsedMs)
@@ -7689,10 +7616,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("defenseStableRequiredMs", GmsVendorDefensePolicy.STABLE_REQUIRED_MILLISECONDS)
             .put("defenseStableHoldMs", GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS)
             .put("defensePulseRequiredMs", GmsVendorDefensePolicy.PULSE_REQUIRED_MILLISECONDS)
-            .put(
-                "defenseGenerationNoThawFailureLimit",
-                GmsVendorDefensePolicy.GENERATION_NO_THAW_FAILURE_LIMIT
-            )
             .put("defenseRecoveryOwnerActive", vendorDefenseOwnsGmsRecoveryLocked())
             .put("defenseRecoveryOwnerSequence", vendorBridgeDefenseOwnershipSequence)
             .put("defenseRecoveryOwnerPhase", vendorBridgeDefenseOwnershipPhase)
@@ -7941,7 +7864,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsConsecutiveCampaignFailures", gmsConsecutiveCampaignFailures)
         .put("gmsCooldownBypassCount", gmsCooldownBypassCount)
         .put("gmsCooldownBypassMissingEpisodeElapsed", gmsCooldownBypassMissingEpisodeElapsed)
-        .put("gmsCooldownBypassPidGenerationKey", gmsCooldownBypassPidGenerationKey)
         .put("gmsPostSuccessProtectionUntilElapsed", gmsPostSuccessProtectionUntilElapsed)
         .put(
             "gmsNextAutomaticRetryIntervalMs",
@@ -8306,7 +8228,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 52
+        private const val STATUS_SCHEMA = 51
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

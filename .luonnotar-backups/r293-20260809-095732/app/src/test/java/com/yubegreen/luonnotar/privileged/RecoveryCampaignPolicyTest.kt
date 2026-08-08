@@ -306,16 +306,14 @@ class RecoveryCampaignPolicyTest {
     }
 
     @Test
-    fun vivoVerifiedOutageDeadlineRearmsForNewPidGenerationButNotSameGeneration() {
+    fun vivoVerifiedOutageDeadlineIsOncePerMissingEpisodeAndFasterAfterSuccess() {
         assertFalse(
             RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
                 vendorFamily = BackgroundPolicyVendorFamily.VIVO,
                 strongEvidence = true,
                 nowElapsed = 129_999L,
                 transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "41:42",
                 lastBypassedMissingEpisodeElapsed = 0L,
-                lastBypassedPidGenerationKey = "",
                 postSuccessProtectionActive = false
             )
         )
@@ -325,9 +323,7 @@ class RecoveryCampaignPolicyTest {
                 strongEvidence = true,
                 nowElapsed = 130_000L,
                 transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "41:42",
                 lastBypassedMissingEpisodeElapsed = 0L,
-                lastBypassedPidGenerationKey = "",
                 postSuccessProtectionActive = false
             )
         )
@@ -337,30 +333,7 @@ class RecoveryCampaignPolicyTest {
                 strongEvidence = true,
                 nowElapsed = 180_000L,
                 transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "41:42",
                 lastBypassedMissingEpisodeElapsed = 100_000L,
-                lastBypassedPidGenerationKey = "41:42",
-                postSuccessProtectionActive = false
-            )
-        )
-        assertTrue(
-            RecoveryCampaignPolicy.shouldBypassGmsAdaptiveCooldown(
-                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
-                strongEvidence = true,
-                nowElapsed = 180_000L,
-                transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "51:52",
-                lastBypassedMissingEpisodeElapsed = 100_000L,
-                lastBypassedPidGenerationKey = "41:42",
-                postSuccessProtectionActive = false
-            )
-        )
-        assertTrue(
-            RecoveryCampaignPolicy.isGmsVerifiedOutageDeadlineReached(
-                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
-                strongEvidence = true,
-                nowElapsed = 180_000L,
-                transportMissingSinceElapsed = 100_000L,
                 postSuccessProtectionActive = false
             )
         )
@@ -370,9 +343,7 @@ class RecoveryCampaignPolicyTest {
                 strongEvidence = true,
                 nowElapsed = 115_000L,
                 transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "61:62",
                 lastBypassedMissingEpisodeElapsed = 0L,
-                lastBypassedPidGenerationKey = "",
                 postSuccessProtectionActive = true
             )
         )
@@ -382,9 +353,7 @@ class RecoveryCampaignPolicyTest {
                 strongEvidence = true,
                 nowElapsed = 200_000L,
                 transportMissingSinceElapsed = 100_000L,
-                currentPidGenerationKey = "71:72",
                 lastBypassedMissingEpisodeElapsed = 0L,
-                lastBypassedPidGenerationKey = "",
                 postSuccessProtectionActive = false
             )
         )

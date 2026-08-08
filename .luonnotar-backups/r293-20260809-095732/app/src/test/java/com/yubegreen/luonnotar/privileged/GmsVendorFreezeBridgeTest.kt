@@ -16,7 +16,6 @@ class GmsVendorFreezeBridgeTest {
         assertEquals(120_000L, GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS)
         assertEquals(12, GmsVendorDefensePolicy.MAX_EPISODE_COMMANDS)
         assertEquals(4, GmsVendorDefensePolicy.MAX_EDGE_COMMANDS)
-        assertEquals(2, GmsVendorDefensePolicy.GENERATION_NO_THAW_FAILURE_LIMIT)
         assertEquals(12, GmsVendorDefensePolicy.MCS_REBUILD_MAX_BROADCASTS)
         assertEquals(200L, GmsVendorDefensePolicy.MCS_REBUILD_MIN_BROADCAST_INTERVAL_CENTISECONDS)
         assertEquals(300L, GmsVendorDefensePolicy.MCS_REBUILD_GUARD_CENTISECONDS)
@@ -30,7 +29,7 @@ class GmsVendorFreezeBridgeTest {
     fun parsesReadyHeartbeatDefenseRecoveryAndLockRecords() {
         val ready = GmsVendorFreezeBridgeProtocol.parse(
             "__LUONNOTAR_VENDOR_BRIDGE_READY__\ttimeout=1\tsticky=1" +
-                "\tstrategy=generation_circuit_transport_verified_v3\tshellPid=77" +
+                "\tstrategy=atomic_group_edge_reconnect_v2\tshellPid=77" +
                 "\tparentStartTicks=1001\tshellStartTicks=1002" +
                 "\theartbeatPath=/data/local/tmp/hb\townerPath=/data/local/tmp/owner"
         ) as GmsVendorFreezeBridgeRecord.Ready
@@ -208,12 +207,6 @@ class GmsVendorFreezeBridgeTest {
         assertTrue(script.contains("aux_due_cs"))
         assertTrue(script.contains("strategy=${GmsVendorDefensePolicy.STRATEGY}"))
         assertTrue(script.contains("start_gms_defense"))
-        assertTrue(script.contains("sync_gms_generation_state"))
-        assertTrue(script.contains("open_gms_generation_circuit"))
-        assertTrue(script.contains("generation_circuit_open"))
-        assertTrue(script.contains("gms_generation_no_thaw_failure_limit=2"))
-        assertTrue(script.contains("stable_transport_missing"))
-        assertTrue(script.contains("probe_mcs_transport"))
         assertTrue(script.contains("tick_gms_defense"))
         assertTrue(script.contains("pulse_ready"))
         assertTrue(script.contains("defense_stable_group"))

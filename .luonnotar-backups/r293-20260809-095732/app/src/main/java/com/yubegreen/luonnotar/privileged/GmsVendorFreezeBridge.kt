@@ -267,7 +267,7 @@ internal data class GmsVendorDefenseReconnectPlan(
 )
 
 internal object GmsVendorDefensePolicy {
-    const val STRATEGY = "generation_circuit_transport_verified_v3"
+    const val STRATEGY = "atomic_group_edge_reconnect_v2"
     const val PULSE_REQUIRED_CENTISECONDS = 1_200L
     const val STABLE_REQUIRED_CENTISECONDS = 1_200L
     const val NO_THAW_ESCALATION_CENTISECONDS = 3_000L
@@ -281,10 +281,6 @@ internal object GmsVendorDefensePolicy {
     // release phases), and the whole PID generation may never spend more than 12.
     const val MAX_EPISODE_COMMANDS = 12
     const val MAX_EDGE_COMMANDS = 4
-    // r293: if the same physical GMS PID generation completes two defense
-    // episodes without a single observed thaw, stop issuing equivalent
-    // release commands. The higher-level guardian then owns escalation.
-    const val GENERATION_NO_THAW_FAILURE_LIMIT = 2
 
     // r269: a physical thaw cannot preserve an MCS socket that OriginOS has
     // already removed. Rebuild transport at the freeze edge instead of waiting
@@ -447,12 +443,6 @@ gms_defense_sticky_rc=125
 gms_defense_adopt_observed=0
 gms_defense_last_main_pid=0
 gms_defense_last_persistent_pid=0
-gms_generation_main_pid=0
-gms_generation_persistent_pid=0
-gms_generation_no_thaw_failures=0
-gms_generation_circuit_open=0
-gms_generation_circuit_reported=0
-gms_generation_no_thaw_failure_limit=${GmsVendorDefensePolicy.GENERATION_NO_THAW_FAILURE_LIMIT}
 gms_defense_pulse_required_cs=${GmsVendorDefensePolicy.PULSE_REQUIRED_CENTISECONDS}
 gms_defense_stable_required_cs=${GmsVendorDefensePolicy.STABLE_REQUIRED_CENTISECONDS}
 gms_defense_stable_hold_cs=${GmsVendorDefensePolicy.STABLE_HOLD_CENTISECONDS}
@@ -1135,38 +1125,6 @@ recover_single() {
     RECOVERY_VERIFIED="${'$'}_verified"
 }
 
-sync_gms_generation_state() {
-    [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}persistent_pid" -gt 0 ] || return 0
-    if [ "${'$'}main_pid" -eq "${'$'}gms_generation_main_pid" ] && \
-       [ "${'$'}persistent_pid" -eq "${'$'}gms_generation_persistent_pid" ]; then
-        return 0
-    fi
-    _old_generation="${'$'}gms_generation_main_pid:${'$'}gms_generation_persistent_pid"
-    _new_generation="${'$'}main_pid:${'$'}persistent_pid"
-    gms_generation_main_pid="${'$'}main_pid"
-    gms_generation_persistent_pid="${'$'}persistent_pid"
-    gms_generation_no_thaw_failures=0
-    gms_generation_circuit_open=0
-    gms_generation_circuit_reported=0
-    printf '__LUONNOTAR_VENDOR_BRIDGE_DIAG__\ttype=gms_generation_rearmed\tdetail=old_%s_new_%s\n' \
-        "${'$'}_old_generation" "${'$'}_new_generation"
-}
-
-open_gms_generation_circuit() {
-    _circuit_reason="${'$'}1"
-    [ "${'$'}gms_generation_circuit_open" -eq 0 ] || return 0
-    gms_generation_circuit_open=1
-    gms_generation_circuit_reported=1
-    emit_gms_defense generation_circuit_open \
-        "reason=${'$'}_circuit_reason,generation=${'$'}gms_generation_main_pid:${'$'}gms_generation_persistent_pid,noThawFailures=${'$'}gms_generation_no_thaw_failures,limit=${'$'}gms_generation_no_thaw_failure_limit,lastMode=${'$'}gms_defense_last_mode"
-    _circuit_primary_pid="${'$'}main_pid"; [ "${'$'}_circuit_primary_pid" -gt 0 ] || _circuit_primary_pid="${'$'}persistent_pid"
-    printf '__LUONNOTAR_VENDOR_BRIDGE_LOCK__\tseq=%s\ttarget=%s\tpid=%s\tfailures=%s\tcooldownCs=0\n' \
-        "${'$'}gms_defense_sequence" "${'$'}main_target" "${'$'}_circuit_primary_pid" "${'$'}gms_generation_no_thaw_failures"
-    gms_defense_active=0
-    gms_defense_stable_since_cs=0
-    gms_defense_hold_until_cs=0
-}
-
 emit_gms_defense() {
     _def_phase="${'$'}1"
     _def_detail="${'$'}2"
@@ -1188,8 +1146,6 @@ emit_gms_defense() {
 
 start_gms_defense() {
     read_uptime_cs
-    sync_gms_generation_state
-    [ "${'$'}gms_generation_circuit_open" -eq 0 ] || return 75
     gms_defense_active=1
     gms_defense_sequence="${'$'}sequence"
     gms_defense_started_cs="${'$'}NOW_CS"
@@ -1519,9 +1475,6 @@ maybe_rebuild_mcs_after_thaw() {
 
 complete_gms_thaw_edge() {
     _thaw_reason="${'$'}1"
-    gms_generation_no_thaw_failures=0
-    gms_generation_circuit_open=0
-    gms_generation_circuit_reported=0
     note_post_force_shield_thaw
     if [ "${'$'}gms_freeze_edge_started_cs" -gt 0 ]; then
         maybe_rebuild_mcs_after_thaw "${'$'}_thaw_reason"
@@ -1608,29 +1561,15 @@ defense_release_gms_group() {
 
 finish_gms_defense_stable() {
     read_uptime_cs
-    probe_mcs_transport
-    if [ "${'$'}MCS_OBSERVABLE" -ne 1 ] || [ "${'$'}MCS_HEALTHY" -ne 1 ]; then
-        emit_gms_defense stable_transport_missing \
-            "ports=${'$'}MCS_PORTS,probeRc=${'$'}MCS_PROBE_RC,stableCs=${'$'}((NOW_CS - gms_defense_stable_since_cs)),lastMode=${'$'}gms_defense_last_mode"
-        _def_primary_pid="${'$'}main_pid"; [ "${'$'}_def_primary_pid" -gt 0 ] || _def_primary_pid="${'$'}persistent_pid"
-        printf '__LUONNOTAR_VENDOR_BRIDGE_LOCK__\tseq=%s\ttarget=%s\tpid=%s\tfailures=%s\tcooldownCs=0\n' \
-            "${'$'}gms_defense_sequence" "${'$'}main_target" "${'$'}_def_primary_pid" "${'$'}gms_defense_attempts"
-        gms_defense_active=0
-        gms_defense_stable_since_cs=0
-        gms_defense_hold_until_cs=${'$'}((NOW_CS + ${GmsVendorDefensePolicy.RETRY_HOLD_CENTISECONDS}))
-        return 0
-    fi
-
     _def_duration=${'$'}((NOW_CS - gms_defense_started_cs))
     _def_primary_pid="${'$'}main_pid"; [ "${'$'}_def_primary_pid" -gt 0 ] || _def_primary_pid="${'$'}persistent_pid"
-    _def_detail="episodeStable:stableCs=${'$'}((NOW_CS - gms_defense_stable_since_cs)),ports=${'$'}MCS_PORTS,refreezes=${'$'}gms_defense_refreezes,attempts=${'$'}gms_defense_attempts,lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
+    _def_detail="episodeStable:stableCs=${'$'}((NOW_CS - gms_defense_stable_since_cs)),refreezes=${'$'}gms_defense_refreezes,attempts=${'$'}gms_defense_attempts,lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
     sanitize_detail "${'$'}_def_detail"; _def_detail="${'$'}SANITIZED_DETAIL"
     emit_gms_defense stable "${'$'}_def_detail"
     printf '__LUONNOTAR_VENDOR_BRIDGE_RECOVERY__\tseq=%s\ttarget=%s\tpid=%s\tpeerPid=%s\tgroup=1\tmode=defense_stable_group\tplainRc=%s\tfreezeRc=%s\treleaseRc=%s\tstickyRc=%s\tverified=1\tadoptObserved=%s\tdurationCs=%s\tconsecutive=%s\tcommands=%s\tdetail=%s\n' \
         "${'$'}gms_defense_sequence" "${'$'}main_target" "${'$'}_def_primary_pid" "${'$'}persistent_pid" \
         "${'$'}gms_defense_plain_rc" "${'$'}gms_defense_freeze_rc" "${'$'}gms_defense_release_rc" "${'$'}gms_defense_sticky_rc" \
         "${'$'}gms_defense_adopt_observed" "${'$'}_def_duration" "${'$'}((gms_defense_refreezes + 1))" "${'$'}gms_defense_commands" "${'$'}_def_detail"
-    gms_generation_no_thaw_failures=0
     gms_defense_active=0
     gms_defense_stable_since_cs=0
 }
@@ -1653,18 +1592,8 @@ escalate_gms_defense() {
 fail_gms_defense() {
     _def_reason="${'$'}1"
     read_uptime_cs
-    if [ "${'$'}gms_defense_last_thawed_cs" -le 0 ]; then
-        gms_generation_no_thaw_failures=${'$'}((gms_generation_no_thaw_failures + 1))
-    else
-        gms_generation_no_thaw_failures=0
-    fi
-    if [ "${'$'}gms_generation_no_thaw_failures" -ge "${'$'}gms_generation_no_thaw_failure_limit" ]; then
-        open_gms_generation_circuit "${'$'}_def_reason"
-        return 0
-    fi
     escalate_gms_defense "${'$'}_def_reason"
-    emit_gms_defense "${'$'}_def_reason" \
-        "lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail,generationNoThawFailures=${'$'}gms_generation_no_thaw_failures"
+    emit_gms_defense "${'$'}_def_reason" "lastMode=${'$'}gms_defense_last_mode,last=${'$'}gms_defense_last_detail"
     gms_defense_active=0
     gms_defense_stable_since_cs=0
     gms_defense_hold_until_cs=${'$'}((NOW_CS + ${GmsVendorDefensePolicy.RETRY_HOLD_CENTISECONDS}))
@@ -1795,15 +1724,6 @@ inspect_gms_group() {
     [ -n "${'$'}main_target" ] || { main_state="disabled"; persistent_state="disabled"; return; }
     refresh_slot main "${'$'}main_target"
     refresh_slot persistent "${'$'}persistent_target"
-    sync_gms_generation_state
-    if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ] && \
-       [ "${'$'}gms_generation_circuit_open" -eq 1 ]; then
-        gms_generation_no_thaw_failures=0
-        gms_generation_circuit_open=0
-        gms_generation_circuit_reported=0
-        printf '__LUONNOTAR_VENDOR_BRIDGE_DIAG__\ttype=gms_generation_circuit_rearmed\tdetail=generation_%s:%s_physical_thaw\n' \
-            "${'$'}main_pid" "${'$'}persistent_pid"
-    fi
     if [ "${'$'}main_pid" -le 0 ] || [ "${'$'}persistent_pid" -le 0 ] || \
        [ "${'$'}main_state" = "unknown" ] || [ "${'$'}persistent_state" = "unknown" ]; then
         if [ "${'$'}gms_incomplete_since_cs" -le 0 ]; then gms_incomplete_since_cs="${'$'}NOW_CS"; fi
@@ -1822,10 +1742,6 @@ inspect_gms_group() {
     _any_frozen=0
     [ "${'$'}main_state" = "frozen" ] && _any_frozen=1
     [ "${'$'}persistent_state" = "frozen" ] && _any_frozen=1
-    if [ "${'$'}_any_frozen" -eq 1 ] && [ "${'$'}gms_generation_circuit_open" -eq 1 ]; then
-        gms_last_state="circuit_open"
-        return 0
-    fi
     if [ "${'$'}_any_frozen" -eq 1 ] && [ "${'$'}gms_defense_active" -ne 1 ] && \
        [ "${'$'}NOW_CS" -ge "${'$'}gms_defense_hold_until_cs" ]; then
         sequence=${'$'}((sequence + 1))
@@ -1998,16 +1914,9 @@ while pid_start_matches "${'$'}parent_pid" "${'$'}parent_start_ticks"; do
     refresh_post_force_shield
     inspect_gms_group
     if [ "${'$'}NOW_CS" -ge "${'$'}aux_due_cs" ]; then
-        if [ "${'$'}gms_defense_active" -eq 1 ]; then
-            # r293: secondary targets must not spend multi-second adopt/release
-            # commands while the GMS transport owner is inside its bounded
-            # defense episode. Their state is revisited immediately after handoff.
-            aux_due_cs=${'$'}((NOW_CS + 100))
-        else
-            inspect_single whatsapp "${'$'}whatsapp_target"; whatsapp_state="${'$'}CURRENT_STATE"
-            inspect_single signal "${'$'}signal_target"; signal_state="${'$'}CURRENT_STATE"
-            aux_due_cs=${'$'}((NOW_CS + 100))
-        fi
+        inspect_single whatsapp "${'$'}whatsapp_target"; whatsapp_state="${'$'}CURRENT_STATE"
+        inspect_single signal "${'$'}signal_target"; signal_state="${'$'}CURRENT_STATE"
+        aux_due_cs=${'$'}((NOW_CS + 100))
     fi
     if [ "${'$'}NOW_CS" -ge "${'$'}heartbeat_due_cs" ]; then
         printf '__LUONNOTAR_VENDOR_BRIDGE_HEARTBEAT__\tatCs=%s\tmainPid=%s\tmainState=%s\tpersistentPid=%s\tpersistentState=%s\twhatsappPid=%s\twhatsappState=%s\tsignalPid=%s\tsignalState=%s\n' \
