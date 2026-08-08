@@ -73,6 +73,18 @@ internal sealed interface GmsVendorFreezeBridgeRecord {
         val detail: String
     ) : GmsVendorFreezeBridgeRecord
 
+    data class Shield(
+        val phase: String,
+        val generation: Long,
+        val atCentiseconds: Long,
+        val untilCentiseconds: Long,
+        val latencyCentiseconds: Long,
+        val commandCount: Int,
+        val mainPid: Int,
+        val persistentPid: Int,
+        val detail: String
+    ) : GmsVendorFreezeBridgeRecord
+
     data class VendorLock(
         val sequence: Long,
         val target: String,
@@ -91,6 +103,7 @@ internal object GmsVendorFreezeBridgeProtocol {
     private const val FROZEN = "${PREFIX}FROZEN__\t"
     private const val RECOVERY = "${PREFIX}RECOVERY__\t"
     private const val DEFENSE = "${PREFIX}DEFENSE__\t"
+    private const val SHIELD = "${PREFIX}SHIELD__\t"
     private const val LOCK = "${PREFIX}LOCK__\t"
     private const val DIAGNOSTIC = "${PREFIX}DIAG__\t"
 
@@ -163,6 +176,19 @@ internal object GmsVendorFreezeBridgeProtocol {
                 detail = values["detail"].orEmpty()
             )
         }
+        line.startsWith(SHIELD) -> fields(line.removePrefix(SHIELD)).let { values ->
+            GmsVendorFreezeBridgeRecord.Shield(
+                phase = values["phase"].orEmpty().ifBlank { "unknown" },
+                generation = values["generation"].toLongOrZero(),
+                atCentiseconds = values["atCs"].toLongOrZero(),
+                untilCentiseconds = values["untilCs"].toLongOrZero(),
+                latencyCentiseconds = values["latencyCs"].toLongOrZero(),
+                commandCount = values["commands"].toIntOrZero(),
+                mainPid = values["mainPid"].toIntOrZero(),
+                persistentPid = values["persistentPid"].toIntOrZero(),
+                detail = values["detail"].orEmpty()
+            )
+        }
         line.startsWith(LOCK) -> fields(line.removePrefix(LOCK)).let { values ->
             GmsVendorFreezeBridgeRecord.VendorLock(
                 sequence = values["seq"].toLongOrZero(),
@@ -227,6 +253,8 @@ internal object GmsVendorDefensePolicy {
 internal object GmsVendorFreezeBridgeScript {
     const val DEFAULT_BASE_ROOT = "/data/local/tmp"
     const val COMMAND_OWNER_PATH = "/data/local/tmp/luonnotar-freezer-command-owner"
+    const val POST_FORCE_STOP_SHIELD_PATH =
+        "/data/local/tmp/luonnotar-gms-post-force-stop-shield"
     private val SAFE_BASE_ROOT = Regex("^/[A-Za-z0-9_./-]{1,180}${'$'}")
 
     fun heartbeatPath(parentPid: Int, baseRoot: String = DEFAULT_BASE_ROOT): String =
@@ -252,6 +280,7 @@ internal object GmsVendorFreezeBridgeScript {
             .replace("@PARENT@", parentPid.toString())
             .replace("@BASE@", shellQuote("$baseRoot/luonnotar-vendor-freeze-bridge-$parentPid"))
             .replace("@OWNER@", shellQuote(COMMAND_OWNER_PATH))
+            .replace("@SHIELD@", shellQuote(POST_FORCE_STOP_SHIELD_PATH))
             .replace("@STICKY@", if (stickyUnfreeze) "1" else "0")
             .replace("@MAIN@", shellQuote(if (monitorGms) "com.google.android.gms" else ""))
             .replace("@PERSISTENT@", shellQuote(if (monitorGms) "com.google.android.gms.persistent" else ""))
@@ -269,12 +298,21 @@ base="${'$'}base_root-${'$'}shell_pid"
 heartbeat_file="${'$'}base.heartbeat"
 command_owner_file=@OWNER@
 command_owner_lock="${'$'}command_owner_file.lock"
+post_force_shield_file=@SHIELD@
 sticky_enabled=@STICKY@
 has_timeout_command=0
 sequence=0
 recovery_command_count=0
 heartbeat_due_cs=0
 storm_until_cs=0
+aux_due_cs=0
+post_force_shield_check_due_cs=0
+post_force_shield_active=0
+post_force_shield_generation=0
+post_force_shield_until_cs=0
+post_force_shield_freeze_seen=0
+post_force_shield_freeze_detected_cs=0
+post_force_shield_last_until_cs=0
 monitor_pid=""
 heartbeat_pid=""
 parent_start_ticks=""
@@ -1088,6 +1126,96 @@ reset_gms_defense_for_pid_change() {
     emit_gms_defense started "reason=pid_generation,oldMain=${'$'}_old_main,oldPersistent=${'$'}_old_persistent"
 }
 
+emit_post_force_shield() {
+    _shield_phase="${'$'}1"
+    _shield_latency="${'$'}{2:-0}"
+    _shield_detail="${'$'}{3:-}"
+    sanitize_detail "${'$'}_shield_detail"; _shield_detail="${'$'}SANITIZED_DETAIL"
+    printf '__LUONNOTAR_VENDOR_BRIDGE_SHIELD__\tphase=%s\tgeneration=%s\tatCs=%s\tuntilCs=%s\tlatencyCs=%s\tcommands=%s\tmainPid=%s\tpersistentPid=%s\tdetail=%s\n' \
+        "${'$'}_shield_phase" "${'$'}post_force_shield_generation" "${'$'}NOW_CS" "${'$'}post_force_shield_until_cs" \
+        "${'$'}_shield_latency" "${'$'}gms_defense_commands" "${'$'}main_pid" "${'$'}persistent_pid" "${'$'}_shield_detail"
+}
+
+refresh_post_force_shield() {
+    read_uptime_cs
+    if [ "${'$'}NOW_CS" -lt "${'$'}post_force_shield_check_due_cs" ]; then
+        # Do not expire from the cached deadline here. A first-healthy extension
+        # can land inside this 100 ms marker-poll interval; reading the marker on
+        # the next poll avoids a false expiry immediately before the refresh.
+        return 0
+    fi
+    post_force_shield_check_due_cs=${'$'}((NOW_CS + 10))
+
+    _shield_parent=0; _shield_shell=0; _shield_parent_start=0; _shield_shell_start=0; _shield_generation=0; _shield_until=0
+    if [ -r "${'$'}post_force_shield_file" ]; then
+        while IFS='=' read -r _key _value; do
+            case "${'$'}_key" in
+                parentPid) _shield_parent="${'$'}_value" ;;
+                shellPid) _shield_shell="${'$'}_value" ;;
+                parentStartTicks) _shield_parent_start="${'$'}_value" ;;
+                shellStartTicks) _shield_shell_start="${'$'}_value" ;;
+                generation) _shield_generation="${'$'}_value" ;;
+                untilCs) _shield_until="${'$'}_value" ;;
+            esac
+        done < "${'$'}post_force_shield_file"
+    fi
+    case "${'$'}_shield_parent:${'$'}_shield_shell:${'$'}_shield_parent_start:${'$'}_shield_shell_start:${'$'}_shield_generation:${'$'}_shield_until" in
+        *[!0-9:]*|0:*|*:0:*|*:*:0:*|*:*:*:0:*|*:*:*:*:0:*|*:*:*:*:*:0) _shield_valid=0 ;;
+        *) _shield_valid=1 ;;
+    esac
+    if [ "${'$'}_shield_valid" -eq 1 ] && \
+       [ "${'$'}_shield_parent" -eq "${'$'}parent_pid" ] && \
+       [ "${'$'}_shield_shell" -eq "${'$'}shell_pid" ] && \
+       [ "${'$'}_shield_parent_start" = "${'$'}parent_start_ticks" ] && \
+       [ "${'$'}_shield_shell_start" = "${'$'}shell_start_ticks" ] && \
+       [ "${'$'}NOW_CS" -lt "${'$'}_shield_until" ]; then
+        _shield_was_active="${'$'}post_force_shield_active"
+        _shield_old_generation="${'$'}post_force_shield_generation"
+        _shield_old_until="${'$'}post_force_shield_until_cs"
+        post_force_shield_active=1
+        post_force_shield_generation="${'$'}_shield_generation"
+        post_force_shield_until_cs="${'$'}_shield_until"
+        if [ "${'$'}_shield_was_active" -ne 1 ] || [ "${'$'}_shield_old_generation" -ne "${'$'}post_force_shield_generation" ]; then
+            post_force_shield_freeze_seen=0
+            post_force_shield_freeze_detected_cs=0
+            # A verified force-stop creates a new GMS process generation. Do not
+            # inherit a retry hold from the pre-reset generation; command budgets
+            # still reset only through the normal PID-generation defense path.
+            gms_defense_hold_until_cs=0
+            emit_post_force_shield started 0 "marker_accepted,new_generation_hold_cleared"
+        elif [ "${'$'}post_force_shield_until_cs" -gt "${'$'}_shield_old_until" ]; then
+            emit_post_force_shield refreshed 0 "deadline_extended"
+        fi
+        post_force_shield_last_until_cs="${'$'}post_force_shield_until_cs"
+        return 0
+    fi
+
+    if [ "${'$'}post_force_shield_active" -eq 1 ]; then
+        post_force_shield_active=0
+        post_force_shield_freeze_seen=0
+        post_force_shield_freeze_detected_cs=0
+        emit_post_force_shield expired 0 "marker_invalid_or_expired"
+    fi
+}
+
+note_post_force_shield_freeze() {
+    [ "${'$'}post_force_shield_active" -eq 1 ] || return 0
+    [ "${'$'}post_force_shield_freeze_seen" -eq 0 ] || return 0
+    post_force_shield_freeze_seen=1
+    post_force_shield_freeze_detected_cs="${'$'}NOW_CS"
+    emit_post_force_shield frozen 0 "physical_freeze_detected"
+}
+
+note_post_force_shield_thaw() {
+    [ "${'$'}post_force_shield_active" -eq 1 ] || return 0
+    [ "${'$'}post_force_shield_freeze_seen" -eq 1 ] || return 0
+    _shield_latency=${'$'}((NOW_CS - post_force_shield_freeze_detected_cs))
+    [ "${'$'}_shield_latency" -ge 0 ] || _shield_latency=0
+    emit_post_force_shield thawed "${'$'}_shield_latency" "both_gms_cgroups_thawed"
+    post_force_shield_freeze_seen=0
+    post_force_shield_freeze_detected_cs=0
+}
+
 defense_release_gms_group() {
     _def_consecutive="${'$'}1"
     recovery_command_count=0
@@ -1204,6 +1332,7 @@ tick_gms_defense() {
 
     if [ "${'$'}_def_any_frozen" -eq 1 ]; then
         storm_until_cs=${'$'}((NOW_CS + 1000))
+        note_post_force_shield_freeze
         if [ "${'$'}gms_defense_stable_since_cs" -gt 0 ]; then
             gms_defense_refreezes=${'$'}((gms_defense_refreezes + 1))
             gms_defense_stable_since_cs=0
@@ -1217,6 +1346,7 @@ tick_gms_defense() {
             defense_release_gms_group "${'$'}((gms_defense_refreezes + 1))" || true
             read_uptime_cs
             if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
+                note_post_force_shield_thaw
                 gms_defense_stable_since_cs="${'$'}NOW_CS"
                 gms_defense_last_thawed_cs="${'$'}NOW_CS"
                 # Re-arm only after an observed physical thaw. A subsequent
@@ -1245,6 +1375,7 @@ tick_gms_defense() {
     fi
 
     if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
+        note_post_force_shield_thaw
         gms_defense_action_armed=1
         if [ "${'$'}gms_defense_stable_since_cs" -le 0 ]; then
             gms_defense_stable_since_cs="${'$'}NOW_CS"
@@ -1461,15 +1592,25 @@ printf '__LUONNOTAR_VENDOR_BRIDGE_READY__\ttimeout=%s\tsticky=%s\tstrategy=${Gms
 while pid_start_matches "${'$'}parent_pid" "${'$'}parent_start_ticks"; do
     require_command_owner
     read_uptime_cs
+    refresh_post_force_shield
     inspect_gms_group
-    inspect_single whatsapp "${'$'}whatsapp_target"; whatsapp_state="${'$'}CURRENT_STATE"
-    inspect_single signal "${'$'}signal_target"; signal_state="${'$'}CURRENT_STATE"
+    if [ "${'$'}NOW_CS" -ge "${'$'}aux_due_cs" ]; then
+        inspect_single whatsapp "${'$'}whatsapp_target"; whatsapp_state="${'$'}CURRENT_STATE"
+        inspect_single signal "${'$'}signal_target"; signal_state="${'$'}CURRENT_STATE"
+        aux_due_cs=${'$'}((NOW_CS + 100))
+    fi
     if [ "${'$'}NOW_CS" -ge "${'$'}heartbeat_due_cs" ]; then
         printf '__LUONNOTAR_VENDOR_BRIDGE_HEARTBEAT__\tatCs=%s\tmainPid=%s\tmainState=%s\tpersistentPid=%s\tpersistentState=%s\twhatsappPid=%s\twhatsappState=%s\tsignalPid=%s\tsignalState=%s\n' \
             "${'$'}NOW_CS" "${'$'}main_pid" "${'$'}main_state" "${'$'}persistent_pid" "${'$'}persistent_state" "${'$'}whatsapp_pid" "${'$'}whatsapp_state" "${'$'}signal_pid" "${'$'}signal_state"
         heartbeat_due_cs=${'$'}((NOW_CS + 500))
     fi
-    if [ "${'$'}NOW_CS" -lt "${'$'}storm_until_cs" ]; then sleep 0.15; else sleep 1; fi
+    if [ "${'$'}post_force_shield_active" -eq 1 ]; then
+        if [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}persistent_pid" -gt 0 ]; then sleep 0.05; else sleep 0.20; fi
+    elif [ "${'$'}NOW_CS" -lt "${'$'}storm_until_cs" ]; then
+        sleep 0.15
+    else
+        sleep 1
+    fi
 done
 exit 0
     """

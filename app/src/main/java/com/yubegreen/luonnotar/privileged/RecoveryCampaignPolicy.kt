@@ -95,6 +95,18 @@ object RecoveryCampaignPolicy {
     // not create extra reset or force-stop budget; it is reset #2 delayed.
     const val GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_INTERVAL_MS = 5_000L
     const val GMS_VIVO_DEFERRED_FORCE_STOP_VERIFY_MAX_ATTEMPTS = 12
+    // r268: once the deferred gate opens and the continuation obtains fresh
+    // VIVO freezer + persistent missing-MCS authorization, that authorization
+    // is short lived but must not self-destruct merely because our own thaw or
+    // the vendor bridge changes cgroup.freeze before reset #2 executes.
+    const val GMS_VIVO_DEFERRED_FORCE_STOP_AUTHORIZATION_TTL_MS = 10_000L
+    // r268: force-stop is a recovery transition, not immunity. Keep the single
+    // vendor-bridge owner in a short high-frequency cgroup watch window around
+    // the post-force-stop reconnect. The bridge still spends the same 12-command
+    // defense budget; only observation latency changes.
+    const val GMS_VIVO_POST_FORCE_STOP_SHIELD_ARM_MS = 45_000L
+    const val GMS_VIVO_POST_FORCE_STOP_SHIELD_AFTER_HEALTHY_MS = 30_000L
+    const val GMS_VIVO_POST_FORCE_STOP_SHIELD_MAX_MS = 75_000L
     const val GMS_VIVO_POST_SUCCESS_PROTECTION_MS = 120_000L
     const val GMS_VIVO_POST_SUCCESS_OUTAGE_DEADLINE_MS = 15_000L
     const val GMS_HARD_CAMPAIGN_LIMIT_PER_24_HOURS = 48
@@ -328,9 +340,9 @@ object RecoveryCampaignPolicy {
     }
 
     /**
-     * Revalidates the evidence immediately before a deferred destructive reset.
-     * The continuation may cross several ordinary engine cycles, so its original
-     * freezer observation is never trusted indefinitely.
+     * Obtains a fresh authorization when the deferred destructive gate opens.
+     * The long wait itself is never trusted: VIVO must still expose the same
+     * persistent missing-MCS outage plus current freezer evidence at that time.
      */
     fun verifiedVivoDeferredForceStopEvidence(
         vendorFamily: BackgroundPolicyVendorFamily,
@@ -351,6 +363,41 @@ object RecoveryCampaignPolicy {
                     recentFastFreezerEventCount >=
                     GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_MIN_EVENTS
             )
+
+    /**
+     * r268 revalidation for the few milliseconds/seconds between obtaining the
+     * authorization above and consuming reset #2. Freezer state is deliberately
+     * absent from this predicate: thawing is not transport recovery, and r267
+     * proved that sampling cgroup.freeze twice can revoke a valid reset while
+     * port 5228 remains continuously absent.
+     */
+    fun revalidateVivoDeferredForceStopAuthorization(
+        vendorFamily: BackgroundPolicyVendorFamily,
+        nowElapsed: Long,
+        authorizedElapsed: Long,
+        authorizedMissingEpisodeElapsed: Long,
+        currentMissingEpisodeElapsed: Long,
+        transportObservable: Boolean,
+        transportHealthy: Boolean,
+        consecutiveMissing: Int,
+        authorizedPids: Set<Int>,
+        currentPids: Set<Int>
+    ): Boolean {
+        if (vendorFamily != BackgroundPolicyVendorFamily.VIVO) return false
+        if (nowElapsed < 0L || authorizedElapsed <= 0L || authorizedElapsed > nowElapsed) return false
+        if (nowElapsed - authorizedElapsed > GMS_VIVO_DEFERRED_FORCE_STOP_AUTHORIZATION_TTL_MS) {
+            return false
+        }
+        if (
+            authorizedMissingEpisodeElapsed <= 0L ||
+            currentMissingEpisodeElapsed != authorizedMissingEpisodeElapsed
+        ) {
+            return false
+        }
+        if (!transportObservable || transportHealthy || consecutiveMissing < 3) return false
+        if (authorizedPids.isEmpty() || currentPids.isEmpty()) return false
+        return authorizedPids == currentPids
+    }
 
     fun gmsMaxResetsPerCampaign(
         vendorFamily: BackgroundPolicyVendorFamily

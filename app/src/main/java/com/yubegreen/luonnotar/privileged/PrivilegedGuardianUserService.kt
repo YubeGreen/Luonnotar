@@ -6,6 +6,7 @@ import android.os.SystemClock
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.FileOutputStream
 import java.util.ArrayDeque
 import java.util.LinkedHashSet
 import java.util.concurrent.Executors
@@ -245,6 +246,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsDeferredForceStopScheduledCount = 0L
     private var gmsDeferredForceStopStartedCount = 0L
     private var gmsDeferredForceStopCancelledCount = 0L
+    private var gmsPostForceStopShieldGeneration = 0L
+    private var gmsPostForceStopShieldStartedElapsed = 0L
+    private var gmsPostForceStopShieldUntilElapsed = 0L
+    private var gmsPostForceStopShieldHealthyObserved = false
+    private var gmsPostForceStopShieldArmCount = 0L
+    private var gmsPostForceStopShieldRefreshCount = 0L
+    private var gmsPostForceStopShieldSignalCount = 0L
+    private var gmsPostForceStopShieldFreezeCount = 0L
+    private var gmsPostForceStopShieldThawCount = 0L
+    private var gmsPostForceStopShieldExpiredCount = 0L
+    private var gmsPostForceStopShieldLastThawLatencyMs = 0L
+    private var gmsPostForceStopShieldMaxThawLatencyMs = 0L
     private val gmsRecoveryHistory = ArrayDeque<Long>()
     private val gmsForceStopHistory = ArrayDeque<Long>()
     private var gmsRecoveryInProgress = false
@@ -1278,6 +1291,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                             "parentStart=${record.parentStartTimeTicks} shellStart=${record.shellStartTimeTicks} " +
                         "heartbeat=${record.heartbeatPath} targets=${vendorBridgeConfiguredTargets.sorted()}"
                 )
+                val nowElapsed = SystemClock.elapsedRealtime()
+                if (gmsPostForceStopShieldUntilElapsed > nowElapsed) {
+                    writeGmsPostForceStopShieldMarkerLocked(
+                        generation = gmsPostForceStopShieldGeneration,
+                        untilElapsed = gmsPostForceStopShieldUntilElapsed,
+                        reason = "vendor_bridge_rebound"
+                    )
+                }
                 persistStatusLocked(force = true)
             }
             is GmsVendorFreezeBridgeRecord.Heartbeat -> synchronized(lock) {
@@ -1499,6 +1520,69 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                     scheduleVendorDefenseMcsPulse(record.sequence, process)
                 }
             }
+            is GmsVendorFreezeBridgeRecord.Shield -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                val latencyMs = (record.latencyCentiseconds * 10L).coerceAtLeast(0L)
+                val recordUntilElapsed = (record.untilCentiseconds * 10L).coerceAtLeast(0L)
+                when (record.phase) {
+                    "started" -> {
+                        if (record.generation == gmsPostForceStopShieldGeneration) {
+                            gmsPostForceStopShieldUntilElapsed = maxOf(
+                                gmsPostForceStopShieldUntilElapsed,
+                                recordUntilElapsed
+                            )
+                        }
+                    }
+                    "refreshed" -> {
+                        gmsPostForceStopShieldRefreshCount += 1
+                        if (record.generation == gmsPostForceStopShieldGeneration) {
+                            gmsPostForceStopShieldUntilElapsed = maxOf(
+                                gmsPostForceStopShieldUntilElapsed,
+                                recordUntilElapsed
+                            )
+                        }
+                    }
+                    "frozen" -> gmsPostForceStopShieldFreezeCount += 1
+                    "thawed" -> {
+                        gmsPostForceStopShieldThawCount += 1
+                        gmsPostForceStopShieldLastThawLatencyMs = latencyMs
+                        gmsPostForceStopShieldMaxThawLatencyMs = maxOf(
+                            gmsPostForceStopShieldMaxThawLatencyMs,
+                            latencyMs
+                        )
+                    }
+                    "expired" -> {
+                        gmsPostForceStopShieldExpiredCount += 1
+                        if (record.generation == gmsPostForceStopShieldGeneration) {
+                            val nowElapsed = SystemClock.elapsedRealtime()
+                            if (gmsPostForceStopShieldUntilElapsed > nowElapsed) {
+                                // A marker refresh can race the bridge's 100 ms marker poll.
+                                // If the service still owns a later live deadline, re-publish
+                                // it instead of accepting a stale early-expired observation.
+                                writeGmsPostForceStopShieldMarkerLocked(
+                                    generation = gmsPostForceStopShieldGeneration,
+                                    untilElapsed = gmsPostForceStopShieldUntilElapsed,
+                                    reason = "bridge_early_expiry_repair"
+                                )
+                            } else {
+                                gmsPostForceStopShieldUntilElapsed = 0L
+                                gmsPostForceStopShieldHealthyObserved = false
+                                runCatching {
+                                    File(GmsVendorFreezeBridgeScript.POST_FORCE_STOP_SHIELD_PATH).delete()
+                                }
+                            }
+                        }
+                    }
+                }
+                eventLocked(
+                    "vendor_bridge_post_force_stop_shield_${record.phase}",
+                    "generation=${record.generation} atMs=${record.atCentiseconds * 10L} " +
+                        "untilMs=${record.untilCentiseconds * 10L} latencyMs=$latencyMs " +
+                        "commands=${record.commandCount} mainPid=${record.mainPid} " +
+                        "persistentPid=${record.persistentPid} detail=${record.detail.take(240)}"
+                )
+                persistStatusLocked(force = true)
+            }
             is GmsVendorFreezeBridgeRecord.VendorLock -> {
                 val signalElapsed = SystemClock.elapsedRealtime()
                 synchronized(lock) {
@@ -1559,6 +1643,135 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
             scheduleVendorBridgeRestartLocked()
         }
+    }
+
+    private fun writeGmsPostForceStopShieldMarkerLocked(
+        generation: Long,
+        untilElapsed: Long,
+        reason: String
+    ): Boolean {
+        val now = SystemClock.elapsedRealtime()
+        if (
+            generation <= 0L ||
+            untilElapsed <= now ||
+            !vendorBridgeReady ||
+            vendorBridgeShellPid <= 1 ||
+            vendorBridgeParentStartTimeTicks.isBlank() ||
+            vendorBridgeShellStartTimeTicks.isBlank()
+        ) {
+            eventLocked(
+                "gms_post_force_stop_shield_marker_deferred",
+                "generation=$generation untilElapsed=$untilElapsed now=$now " +
+                    "ready=$vendorBridgeReady shellPid=$vendorBridgeShellPid reason=$reason"
+            )
+            return false
+        }
+        return runCatching {
+            val target = File(GmsVendorFreezeBridgeScript.POST_FORCE_STOP_SHIELD_PATH)
+            val temporary = File(
+                target.parentFile,
+                target.name + ".tmp." + Process.myPid()
+            )
+            val untilCs = (untilElapsed / 10L).coerceAtLeast(1L)
+            val payload = buildString {
+                append("parentPid=").append(Process.myPid()).append('\n')
+                append("shellPid=").append(vendorBridgeShellPid).append('\n')
+                append("parentStartTicks=").append(vendorBridgeParentStartTimeTicks).append('\n')
+                append("shellStartTicks=").append(vendorBridgeShellStartTimeTicks).append('\n')
+                append("generation=").append(generation).append('\n')
+                append("untilCs=").append(untilCs).append('\n')
+            }
+            target.parentFile?.mkdirs()
+            FileOutputStream(temporary).use { stream ->
+                stream.write(payload.toByteArray(Charsets.UTF_8))
+                stream.fd.sync()
+            }
+            temporary.setReadable(true, true)
+            if (!temporary.renameTo(target)) {
+                target.delete()
+                check(temporary.renameTo(target)) { "shield marker atomic rename failed" }
+            }
+            target.setReadable(true, true)
+            eventLocked(
+                "gms_post_force_stop_shield_marker_written",
+                "generation=$generation untilElapsed=$untilElapsed untilCs=$untilCs reason=$reason"
+            )
+            true
+        }.getOrElse { error ->
+            errorCount += 1
+            eventLocked(
+                "gms_post_force_stop_shield_marker_failed",
+                "generation=$generation reason=$reason " +
+                    "${error.javaClass.simpleName}:${error.message.orEmpty()}"
+            )
+            false
+        }
+    }
+
+    private fun armGmsPostForceStopShieldLocked(
+        generation: Long,
+        nowElapsed: Long,
+        reason: String
+    ) {
+        val untilElapsed =
+            nowElapsed + RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_ARM_MS
+        gmsPostForceStopShieldGeneration = generation
+        gmsPostForceStopShieldStartedElapsed = nowElapsed
+        gmsPostForceStopShieldUntilElapsed = untilElapsed
+        gmsPostForceStopShieldHealthyObserved = false
+        gmsPostForceStopShieldArmCount += 1
+        val markerWritten = writeGmsPostForceStopShieldMarkerLocked(
+            generation = generation,
+            untilElapsed = untilElapsed,
+            reason = "arm:$reason"
+        )
+        eventLocked(
+            "gms_post_force_stop_shield_armed",
+            "generation=$generation untilElapsed=$untilElapsed durationMs=" +
+                RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_ARM_MS +
+                " markerWritten=$markerWritten reason=$reason"
+        )
+    }
+
+    private fun maybeExtendGmsPostForceStopShieldAfterHealthyLocked(
+        nowElapsed: Long,
+        source: String
+    ) {
+        if (
+            gmsPostForceStopShieldGeneration <= 0L ||
+            gmsPostForceStopShieldUntilElapsed <= nowElapsed ||
+            gmsPostForceStopShieldHealthyObserved
+        ) {
+            return
+        }
+        gmsPostForceStopShieldHealthyObserved = true
+        val previousUntil = gmsPostForceStopShieldUntilElapsed
+        val desiredUntil = minOf(
+            maxOf(
+                previousUntil,
+                nowElapsed +
+                    RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_AFTER_HEALTHY_MS
+            ),
+            gmsPostForceStopShieldStartedElapsed +
+                RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_MAX_MS
+        )
+        gmsPostForceStopShieldUntilElapsed = desiredUntil
+        val markerWritten = if (desiredUntil > previousUntil) {
+            writeGmsPostForceStopShieldMarkerLocked(
+                generation = gmsPostForceStopShieldGeneration,
+                untilElapsed = desiredUntil,
+                reason = "first_healthy:$source"
+            )
+        } else {
+            true
+        }
+        eventLocked(
+            "gms_post_force_stop_shield_first_healthy",
+            "generation=$gmsPostForceStopShieldGeneration source=$source " +
+                "previousUntil=$previousUntil untilElapsed=$desiredUntil " +
+                "remainingMs=${(desiredUntil - nowElapsed).coerceAtLeast(0L)} " +
+                "markerWritten=$markerWritten"
+        )
     }
 
     private fun scheduleVendorBridgeRestartLocked() {
@@ -1704,6 +1917,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             signal.kind == VendorFreezeSignalKind.AOSP_APP_FROZEN
         ) {
             recordGmsFreezeEventLocked(now, signal.rawLine)
+            if (
+                signal.rawLine.contains("fast_freezer", ignoreCase = true) &&
+                gmsPostForceStopShieldUntilElapsed > now
+            ) {
+                gmsPostForceStopShieldSignalCount += 1
+                eventLocked(
+                    "gms_post_force_stop_shield_fast_freezer_signal",
+                    "generation=$gmsPostForceStopShieldGeneration " +
+                        "remainingMs=${(gmsPostForceStopShieldUntilElapsed - now).coerceAtLeast(0L)} " +
+                        "mainPid=$vendorBridgeMainPid persistentPid=$vendorBridgePersistentPid"
+                )
+            }
             if (gmsImportanceFenceActive && gmsImportanceFenceAnyConnected) {
                 gmsImportanceFenceFreezeWhileAnyConnectedCount += 1
                 if (gmsImportanceFenceBothConnected) {
@@ -4798,6 +5023,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         } else if (probe.healthy) {
             cancelGmsVerifiedOutageDeadlineRecheckLocked("transport_healthy")
             cancelGmsDeferredForceStopContinuationLocked("transport_healthy")
+            maybeExtendGmsPostForceStopShieldAfterHealthyLocked(now, source)
             gmsTransportHealthyCount += 1
             lastGmsTransportHealthyElapsed = now
             gmsTransportConsecutiveMissing = 0
@@ -5276,9 +5502,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             nextResetEligibleElapsed = nowElapsed,
             hardResetRequested = true,
             hardResetReason = "deferred_force_stop_gate_continuation",
-            hardResetRequestedElapsed = pending.requestedElapsed,
+            hardResetRequestedElapsed = nowElapsed,
             deferredForceStopContinuation = true,
-            continuationOriginGeneration = pending.originGeneration
+            continuationOriginGeneration = pending.originGeneration,
+            continuationMissingEpisodeElapsed = pending.missingEpisodeElapsed,
+            continuationAuthorizedElapsed = nowElapsed,
+            continuationAuthorizedPids = currentPids,
+            continuationAuthorizationSource = if (frozenNow) {
+                "frozen_now"
+            } else {
+                "recent_fast_freezer"
+            }
         )
         gmsRecoveryCampaign = campaign
         gmsRecoveryInProgress = true
@@ -5291,16 +5525,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "waitedMs=${(nowElapsed - pending.requestedElapsed).coerceAtLeast(0L)} " +
                 "missingAgeMs=${(nowElapsed - pending.missingEpisodeElapsed).coerceAtLeast(0L)} " +
                 "pids=${currentPids.sorted()} frozenNow=$frozenNow " +
-                "recentFastFreezer=$recentFastFreezerCount"
+                "recentFastFreezer=$recentFastFreezerCount " +
+                "authorization=${campaign.continuationAuthorizationSource} " +
+                "authorizationTtlMs=" +
+                RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_AUTHORIZATION_TTL_MS
         )
-        ensureGmsPreconnectionLeaseLocked(
-            campaign = campaign,
-            nowElapsed = nowElapsed,
-            reason = "deferred_force_stop_continuation_started",
-            force = true
-        )
-        scheduleGmsFastThaw(signalElapsed = nowElapsed)
-        probeGmsImportanceFenceLocked(nowElapsed, force = true)
+        // Do not thaw, bind, or request a preconnection lease between the fresh
+        // gate-open authorization and reset #2. r267 proved that those actions
+        // can change cgroup.freeze and then invalidate our own authorization.
         persistStatusLocked(force = true)
         scheduleGmsRecoveryCampaignTicksLocked(generation)
     }
@@ -5624,7 +5856,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val campaign = gmsRecoveryCampaign ?: return
         if (campaign.generation != generation) return
         val now = SystemClock.elapsedRealtime()
-        probeGmsImportanceFenceLocked(now, force = false)
+        if (!campaign.deferredForceStopContinuation) {
+            probeGmsImportanceFenceLocked(now, force = false)
+        }
         val processesBefore = listGmsProcessesLocked()
         val pidsBefore = processesBefore.mapTo(linkedSetOf()) { it.pid }
         if (pidsBefore != campaign.lastObservedPids) {
@@ -5647,7 +5881,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             campaign.stabilizationGraceDeadlineElapsed = 0L
             campaign.stabilizationLeaseRequestedElapsed = 0L
             gmsFastThawAwaitingReconnectSinceElapsed = 0L
-            if (pidsBefore.isNotEmpty()) {
+            if (pidsBefore.isNotEmpty() && !campaign.deferredForceStopContinuation) {
                 ensureGmsPreconnectionLeaseLocked(
                     campaign = campaign,
                     nowElapsed = now,
@@ -5657,12 +5891,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
         }
 
-        ensureGmsPreconnectionLeaseLocked(
-            campaign = campaign,
-            nowElapsed = now,
-            reason = "campaign_refresh",
-            force = false
-        )
+        if (!campaign.deferredForceStopContinuation) {
+            ensureGmsPreconnectionLeaseLocked(
+                campaign = campaign,
+                nowElapsed = now,
+                reason = "campaign_refresh",
+                force = false
+            )
+        }
 
         val frozenBefore = processesBefore.filter { readFreezeState(it.pid).frozen == true }
         val frozenBeforePids = frozenBefore.mapTo(linkedSetOf()) { it.pid }
@@ -5679,12 +5915,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         campaign.frozenPids.clear()
         campaign.frozenPids.addAll(frozenBeforePids)
 
-        processesBefore.forEach { process ->
-            if (readFreezeState(process.pid).frozen == true) {
-                val result = unfreezeLocked(process)
-                if (!result.stdout.contains("not_applicable_secondary_process")) {
-                    actionCount += 1
-                    if (!isUnfreezeAccepted(result)) commandFailureCount += 1
+        if (!campaign.deferredForceStopContinuation) {
+            processesBefore.forEach { process ->
+                if (readFreezeState(process.pid).frozen == true) {
+                    val result = unfreezeLocked(process)
+                    if (!result.stdout.contains("not_applicable_secondary_process")) {
+                        actionCount += 1
+                        if (!isUnfreezeAccepted(result)) commandFailureCount += 1
+                    }
                 }
             }
         }
@@ -5715,37 +5953,49 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         if (campaign.deferredForceStopContinuation) {
             val deferredCurrentPids = processesAfter.mapTo(linkedSetOf()) { it.pid }
-            val recentCutoff = maxOf(
-                gmsTransportMissingSinceElapsed.takeIf { it > 0L } ?: now,
-                now - RecoveryCampaignPolicy.GMS_VIVO_RECENT_FAST_FREEZER_EVIDENCE_WINDOW_MS
-            )
-            val recentFastFreezerCount =
-                gmsVivoFastFreezerEvents.count { it in recentCutoff..now }
-            val deferredEvidenceVerified =
-                RecoveryCampaignPolicy.verifiedVivoDeferredForceStopEvidence(
+            val authorizationValid =
+                RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
                     vendorFamily = currentVendorFamilyLocked(),
+                    nowElapsed = now,
+                    authorizedElapsed = campaign.continuationAuthorizedElapsed,
+                    authorizedMissingEpisodeElapsed =
+                        campaign.continuationMissingEpisodeElapsed,
+                    currentMissingEpisodeElapsed = gmsTransportMissingSinceElapsed,
                     transportObservable = probe.observable,
                     transportHealthy = probe.healthy,
                     consecutiveMissing = gmsTransportConsecutiveMissing,
-                    currentPidsPresent = deferredCurrentPids.isNotEmpty(),
-                    frozenNow = anyFrozen,
-                    recentFastFreezerEventCount = recentFastFreezerCount
+                    authorizedPids = campaign.continuationAuthorizedPids,
+                    currentPids = deferredCurrentPids
                 )
-            if (!deferredEvidenceVerified) {
+            if (!authorizationValid) {
                 campaign.hardResetRequested = false
                 eventLocked(
-                    "gms_recovery_deferred_force_stop_revalidation_cancelled",
+                    "gms_recovery_deferred_force_stop_authorization_cancelled",
                     "generation=$generation originGeneration=${campaign.continuationOriginGeneration} " +
+                        "authorizedAt=${campaign.continuationAuthorizedElapsed} " +
+                        "authorizationAgeMs=" +
+                        (now - campaign.continuationAuthorizedElapsed).coerceAtLeast(0L) +
+                        " authorizedMissing=${campaign.continuationMissingEpisodeElapsed} " +
+                        "currentMissing=$gmsTransportMissingSinceElapsed " +
                         "observable=${probe.observable} healthy=${probe.healthy} " +
-                        "missing=$gmsTransportConsecutiveMissing frozenNow=$anyFrozen " +
-                        "recentFastFreezer=$recentFastFreezerCount pids=${deferredCurrentPids.sorted()}"
+                        "missing=$gmsTransportConsecutiveMissing " +
+                        "authorizedPids=${campaign.continuationAuthorizedPids.sorted()} " +
+                        "currentPids=${deferredCurrentPids.sorted()}"
                 )
                 finishGmsRecoveryCampaignLocked(
                     generation,
-                    "deferred_force_stop_revalidation_cancelled"
+                    "deferred_force_stop_authorization_cancelled"
                 )
                 return
             }
+            eventLocked(
+                "gms_recovery_deferred_force_stop_authorization_revalidated",
+                "generation=$generation originGeneration=${campaign.continuationOriginGeneration} " +
+                    "authorization=${campaign.continuationAuthorizationSource} " +
+                    "ageMs=${(now - campaign.continuationAuthorizedElapsed).coerceAtLeast(0L)} " +
+                    "missing=$gmsTransportConsecutiveMissing ports=${probe.establishedPorts.sorted()} " +
+                    "pids=${deferredCurrentPids.sorted()} frozenNow=$anyFrozen"
+            )
         }
 
         if (!anyFrozen && probe.healthy) {
@@ -6342,12 +6592,24 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 "generation=${campaign.generation} reset=${campaign.resetCount} " +
                     unstopResult.summary()
             )
-        } else {
-            SystemClock.sleep(GMS_POST_UNSTOP_SETTLE_MS)
         }
 
         val transitionVerified =
             forceStopAccepted && remainingOldPids.isEmpty() && unstopResult.success
+        if (transitionVerified && currentVendorFamilyLocked() == BackgroundPolicyVendorFamily.VIVO) {
+            // Arm before the post-unstop settle. The new GMS PIDs may not exist yet;
+            // the bridge handles that with a bounded 200 ms absent-process poll.
+            // Waiting the extra settle interval here would leave an avoidable hole.
+            armGmsPostForceStopShieldLocked(
+                generation = campaign.generation,
+                nowElapsed = SystemClock.elapsedRealtime(),
+                reason = reason
+            )
+        }
+        if (unstopResult.success) {
+            SystemClock.sleep(GMS_POST_UNSTOP_SETTLE_MS)
+        }
+
         eventLocked(
             if (transitionVerified) {
                 "gms_recovery_force_stop_unstop_verified"
@@ -7370,6 +7632,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsDeferredForceStopCancelledCount", gmsDeferredForceStopCancelledCount)
         .put("gmsDeferredForceStopContinuation",
             gmsDeferredForceStopContinuation?.toJson() ?: JSONObject.NULL)
+        .put("gmsPostForceStopShield", JSONObject()
+            .put("generation", gmsPostForceStopShieldGeneration)
+            .put("startedElapsed", gmsPostForceStopShieldStartedElapsed)
+            .put("untilElapsed", gmsPostForceStopShieldUntilElapsed)
+            .put("active", gmsPostForceStopShieldUntilElapsed > SystemClock.elapsedRealtime())
+            .put("healthyObserved", gmsPostForceStopShieldHealthyObserved)
+            .put("armCount", gmsPostForceStopShieldArmCount)
+            .put("refreshCount", gmsPostForceStopShieldRefreshCount)
+            .put("fastFreezerSignalCount", gmsPostForceStopShieldSignalCount)
+            .put("freezeCount", gmsPostForceStopShieldFreezeCount)
+            .put("thawCount", gmsPostForceStopShieldThawCount)
+            .put("expiredCount", gmsPostForceStopShieldExpiredCount)
+            .put("lastThawLatencyMs", gmsPostForceStopShieldLastThawLatencyMs)
+            .put("maxThawLatencyMs", gmsPostForceStopShieldMaxThawLatencyMs)
+            .put("markerPath", GmsVendorFreezeBridgeScript.POST_FORCE_STOP_SHIELD_PATH)
+        )
         .put("gmsRecoveryAttemptCount", gmsRecoveryAttemptCount)
         .put("gmsRecoverySuccessCount", gmsRecoverySuccessCount)
         .put("gmsRecoveryGeneration", gmsRecoveryGeneration)
@@ -7661,6 +7939,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         var deferredForceStopContinuationPending: Boolean = false,
         var deferredForceStopContinuation: Boolean = false,
         var continuationOriginGeneration: Long = 0L,
+        var continuationMissingEpisodeElapsed: Long = 0L,
+        var continuationAuthorizedElapsed: Long = 0L,
+        var continuationAuthorizedPids: Set<Int> = emptySet(),
+        var continuationAuthorizationSource: String = "",
         val commandDetails: MutableList<List<String>> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -7705,6 +7987,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("deferredForceStopContinuationPending", deferredForceStopContinuationPending)
             .put("deferredForceStopContinuation", deferredForceStopContinuation)
             .put("continuationOriginGeneration", continuationOriginGeneration)
+            .put("continuationMissingEpisodeElapsed", continuationMissingEpisodeElapsed)
+            .put("continuationAuthorizedElapsed", continuationAuthorizedElapsed)
+            .put("continuationAuthorizedPids", JSONArray(continuationAuthorizedPids.toList().sorted()))
+            .put("continuationAuthorizationSource", continuationAuthorizationSource)
     }
 
     private data class GuardianProcessState(
@@ -7806,7 +8092,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 26
+        private const val STATUS_SCHEMA = 27
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

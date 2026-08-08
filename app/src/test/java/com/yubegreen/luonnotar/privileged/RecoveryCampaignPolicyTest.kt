@@ -1149,4 +1149,95 @@ class RecoveryCampaignPolicyTest {
     }
 
 
+    @Test
+    fun r268DeferredAuthorizationSurvivesThawButNotTransportPidOrTtlBoundary() {
+        val pids = setOf(101, 102)
+        val authorizedAt = 200_000L
+        val missingSince = 100_000L
+
+        assertEquals(
+            10_000L,
+            RecoveryCampaignPolicy.GMS_VIVO_DEFERRED_FORCE_STOP_AUTHORIZATION_TTL_MS
+        )
+        assertTrue(
+            RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = authorizedAt + 1_000L,
+                authorizedElapsed = authorizedAt,
+                authorizedMissingEpisodeElapsed = missingSince,
+                currentMissingEpisodeElapsed = missingSince,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 98,
+                authorizedPids = pids,
+                currentPids = pids
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = authorizedAt + 1_000L,
+                authorizedElapsed = authorizedAt,
+                authorizedMissingEpisodeElapsed = missingSince,
+                currentMissingEpisodeElapsed = missingSince,
+                transportObservable = true,
+                transportHealthy = true,
+                consecutiveMissing = 98,
+                authorizedPids = pids,
+                currentPids = pids
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = authorizedAt + 1_000L,
+                authorizedElapsed = authorizedAt,
+                authorizedMissingEpisodeElapsed = missingSince,
+                currentMissingEpisodeElapsed = missingSince,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 98,
+                authorizedPids = pids,
+                currentPids = setOf(201, 202)
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = authorizedAt + 10_001L,
+                authorizedElapsed = authorizedAt,
+                authorizedMissingEpisodeElapsed = missingSince,
+                currentMissingEpisodeElapsed = missingSince,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 98,
+                authorizedPids = pids,
+                currentPids = pids
+            )
+        )
+        assertFalse(
+            RecoveryCampaignPolicy.revalidateVivoDeferredForceStopAuthorization(
+                vendorFamily = BackgroundPolicyVendorFamily.VIVO,
+                nowElapsed = authorizedAt + 1_000L,
+                authorizedElapsed = authorizedAt,
+                authorizedMissingEpisodeElapsed = missingSince,
+                currentMissingEpisodeElapsed = missingSince + 1L,
+                transportObservable = true,
+                transportHealthy = false,
+                consecutiveMissing = 98,
+                authorizedPids = pids,
+                currentPids = pids
+            )
+        )
+    }
+
+    @Test
+    fun r268PostForceStopShieldWindowIsShortAndBounded() {
+        assertEquals(45_000L, RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_ARM_MS)
+        assertEquals(30_000L, RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_AFTER_HEALTHY_MS)
+        assertEquals(75_000L, RecoveryCampaignPolicy.GMS_VIVO_POST_FORCE_STOP_SHIELD_MAX_MS)
+        assertEquals(12, GmsVendorDefensePolicy.MAX_EPISODE_COMMANDS)
+        assertEquals(4, GmsVendorDefensePolicy.MAX_EDGE_COMMANDS)
+    }
+
 }

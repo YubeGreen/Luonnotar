@@ -49,6 +49,19 @@ class GmsVendorFreezeBridgeTest {
         assertEquals(44, heartbeat.signalPid)
 
 
+        val shield = GmsVendorFreezeBridgeProtocol.parse(
+            "__LUONNOTAR_VENDOR_BRIDGE_SHIELD__\tphase=thawed" +
+                "\tgeneration=14\tatCs=5000\tuntilCs=8000\tlatencyCs=27" +
+                "\tcommands=4\tmainPid=41\tpersistentPid=42\tdetail=ok"
+        ) as GmsVendorFreezeBridgeRecord.Shield
+        assertEquals("thawed", shield.phase)
+        assertEquals(14L, shield.generation)
+        assertEquals(270L, shield.latencyCentiseconds * 10L)
+        assertEquals(4, shield.commandCount)
+        assertEquals(41, shield.mainPid)
+        assertEquals(42, shield.persistentPid)
+
+
         val defense = GmsVendorFreezeBridgeProtocol.parse(
             "__LUONNOTAR_VENDOR_BRIDGE_DEFENSE__\tseq=8\tphase=refrozen" +
                 "\telapsedCs=525\tstableCs=0\trefreezes=3\tattempts=4" +
@@ -141,8 +154,17 @@ class GmsVendorFreezeBridgeTest {
         assertTrue(script.contains("postStickyState"))
         assertTrue(script.contains("sticky:disabled"))
         assertTrue(script.contains("commands=%s"))
+        assertTrue(script.contains("sleep 0.05"))
+        assertTrue(script.contains("sleep 0.20"))
         assertTrue(script.contains("sleep 0.15"))
         assertTrue(script.contains("sleep 1"))
+        assertTrue(script.contains("luonnotar-gms-post-force-stop-shield"))
+        assertTrue(script.contains("refresh_post_force_shield"))
+        assertFalse(script.contains("deadline_reached"))
+        assertTrue(script.contains("note_post_force_shield_freeze"))
+        assertTrue(script.contains("note_post_force_shield_thaw"))
+        assertTrue(script.contains("__LUONNOTAR_VENDOR_BRIDGE_SHIELD__"))
+        assertTrue(script.contains("aux_due_cs"))
         assertTrue(script.contains("strategy=${GmsVendorDefensePolicy.STRATEGY}"))
         assertTrue(script.contains("start_gms_defense"))
         assertTrue(script.contains("tick_gms_defense"))
