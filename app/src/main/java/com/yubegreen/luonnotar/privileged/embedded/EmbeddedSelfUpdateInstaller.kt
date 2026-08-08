@@ -480,6 +480,8 @@ internal object EmbeddedSelfUpdateInstaller {
         val finalMessage = AtomicReference("")
         val approvalAttempt = AtomicInteger(0)
         val approvalElapsed = AtomicLong(-1L)
+        val approvalAccepted = AtomicBoolean(false)
+        val approvalCallInFlight = AtomicBoolean(false)
         val committedAt = SystemClock.elapsedRealtime()
         val finished = AtomicBoolean(false)
         val pendingSeen = AtomicBoolean(false)
@@ -505,6 +507,8 @@ internal object EmbeddedSelfUpdateInstaller {
                         sessionId,
                         approvalAttempt,
                         approvalElapsed,
+                        approvalAccepted,
+                        approvalCallInFlight,
                         committedAt,
                         source = "pending_callback"
                     )
@@ -531,19 +535,20 @@ internal object EmbeddedSelfUpdateInstaller {
             log("self_update_commit", "session=$sessionId callback=binder_native")
             session.commit(statusReceiver)
 
-            // OriginOS may abort an install before the public pending-user-action
-            // callback reaches us. Reassert acceptance on a short bounded schedule.
-            // A successful early call does not suppress later attempts: some OEM
-            // builds accept the Binder call before the session has entered the
-            // permission state and otherwise turn that first success into a no-op.
+            // The permission Binder call posts another install pass when accepted. Retry only
+            // while the call itself fails; once one invocation succeeds, stop permanently for
+            // this session. Reasserting successful approvals can enqueue duplicate install passes
+            // while verification already owns the staged files.
             permissionApprovalScheduleMs.forEach { delayMs ->
                 approvalExecutor.schedule({
-                    if (!finished.get()) {
+                    if (!finished.get() && !approvalAccepted.get()) {
                         approvePermission(
                             services,
                             sessionId,
                             approvalAttempt,
                             approvalElapsed,
+                            approvalAccepted,
+                            approvalCallInFlight,
                             committedAt,
                             source = if (pendingSeen.get()) "scheduled_after_pending" else "scheduled_race"
                         )
@@ -579,37 +584,40 @@ internal object EmbeddedSelfUpdateInstaller {
         sessionId: Int,
         attemptCounter: AtomicInteger,
         firstAcceptedElapsed: AtomicLong,
+        accepted: AtomicBoolean,
+        callInFlight: AtomicBoolean,
         committedAt: Long,
         source: String
     ) {
-        val attempt = attemptCounter.incrementAndGet()
-        val result = runCatching {
-            val method = Class.forName("android.content.pm.IPackageInstaller")
-                .getMethod(
-                    "setPermissionsResult",
-                    Int::class.javaPrimitiveType,
-                    Boolean::class.javaPrimitiveType
-                )
-            method.invoke(services.packageInstallerBinder, sessionId, true)
-        }
-        if (result.isSuccess) {
-            val elapsed = (SystemClock.elapsedRealtime() - committedAt).coerceAtLeast(0L)
-            if (firstAcceptedElapsed.compareAndSet(-1L, elapsed)) {
+        if (accepted.get() || !callInFlight.compareAndSet(false, true)) return
+        try {
+            if (accepted.get()) return
+            val attempt = attemptCounter.incrementAndGet()
+            val result = runCatching {
+                val method = Class.forName("android.content.pm.IPackageInstaller")
+                    .getMethod(
+                        "setPermissionsResult",
+                        Int::class.javaPrimitiveType,
+                        Boolean::class.javaPrimitiveType
+                    )
+                method.invoke(services.packageInstallerBinder, sessionId, true)
+            }
+            if (result.isSuccess) {
+                val elapsed = (SystemClock.elapsedRealtime() - committedAt).coerceAtLeast(0L)
+                accepted.set(true)
+                firstAcceptedElapsed.compareAndSet(-1L, elapsed)
                 log(
                     "self_update_permission_approval_call_accepted",
-                    "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source"
+                    "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source mode=single_success"
                 )
             } else {
                 log(
-                    "self_update_permission_approval_reasserted",
-                    "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source"
+                    "self_update_permission_retry",
+                    "session=$sessionId attempt=$attempt source=$source error=${rootCauseSummary(result.exceptionOrNull()).take(220)}"
                 )
             }
-        } else {
-            log(
-                "self_update_permission_retry",
-                "session=$sessionId attempt=$attempt source=$source error=${rootCauseSummary(result.exceptionOrNull()).take(220)}"
-            )
+        } finally {
+            callInFlight.set(false)
         }
     }
 
