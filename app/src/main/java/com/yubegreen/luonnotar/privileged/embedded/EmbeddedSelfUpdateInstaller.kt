@@ -1,28 +1,29 @@
 package com.yubegreen.luonnotar.privileged.embedded
 
-import android.app.PendingIntent
-import android.content.BroadcastReceiver
-import android.content.Context
 import android.content.Intent
-import android.content.IntentFilter
+import android.content.IntentSender
 import android.content.pm.PackageInfo
 import android.content.pm.PackageInstaller
 import android.content.pm.PackageManager
+import android.content.pm.Signature
+import android.os.Binder
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.HandlerThread
+import android.os.IBinder
+import android.os.Parcel
 import android.os.Process
 import android.os.SystemClock
+import android.os.UserHandle
 import android.system.Os
 import android.system.OsConstants
 import org.json.JSONObject
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
+import java.lang.reflect.InvocationTargetException
 import java.security.MessageDigest
-import java.util.UUID
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.ScheduledThreadPoolExecutor
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import java.util.concurrent.atomic.AtomicInteger
@@ -30,22 +31,49 @@ import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Minimal shell-UID self-update PoC.
+ * Narrow shell-UID self-update path.
  *
- * Security boundary is intentionally narrow: the engine can only install a
- * newer APK for Luonnotar, signed by the same signer, from a dedicated shell
- * staging directory. It is not a generic APK installer.
+ * r270 deliberately does not manufacture an ActivityThread/Context. The engine
+ * already runs as uid 2000, so it talks to package services through their Binder
+ * interfaces and only uses the public PackageInstaller session wrapper for the
+ * streaming/session surface. The result receiver is a tiny in-process
+ * IIntentSender Binder endpoint; no Activity, PendingIntent or BroadcastReceiver
+ * is required.
+ *
+ * Security boundary remains intentionally narrow: only a newer Luonnotar APK,
+ * with the same signing lineage, from the dedicated staging directory can reach
+ * PackageInstaller. This is not a generic APK installer.
  */
 internal object EmbeddedSelfUpdateInstaller {
     const val TARGET_PACKAGE = EmbeddedSelfUpdatePolicy.TARGET_PACKAGE
     const val STAGING_ROOT = EmbeddedSelfUpdatePolicy.STAGING_ROOT
     const val MAX_APK_BYTES = EmbeddedSelfUpdatePolicy.MAX_APK_BYTES
+
     private const val SHELL_PACKAGE = "com.android.shell"
     private const val SHELL_UID = 2000
     private const val FINAL_RESULT_TIMEOUT_MS = 45_000L
+    private const val IINTENT_SENDER_DESCRIPTOR = "android.content.IIntentSender"
+    private const val IINTENT_SENDER_SEND_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION
+    private val permissionApprovalScheduleMs = longArrayOf(
+        5L, 10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
+    )
+
     private val activeSessionId = AtomicInteger(-1)
     private val activeInstaller = AtomicReference<PackageInstaller?>(null)
-    private val shellContextCache = AtomicReference<Context?>(null)
+    private val frameworkServicesCache = AtomicReference<FrameworkServices?>(null)
+
+    private data class FrameworkServices(
+        val packageManagerBinder: Any,
+        val packageInstallerBinder: Any,
+        val installer: PackageInstaller,
+        val userId: Int
+    )
+
+    private data class CandidateArchive(
+        val packageName: String,
+        val versionCode: Long,
+        val signerDigests: Set<String>
+    )
 
     data class Result(
         val ok: Boolean,
@@ -77,30 +105,35 @@ internal object EmbeddedSelfUpdateInstaller {
         require(Process.myUid() == SHELL_UID || Process.myUid() == 0) {
             "self update requires shell/root uid"
         }
-        log("self_update_request", "path=${safePathForLog(apkPath)}")
-        val context = runCatching { shellContext() }.getOrElse { error ->
+        log("self_update_request", "path=${safePathForLog(apkPath)} backend=binder_native")
+
+        val services = runCatching { frameworkServices() }.getOrElse { error ->
             return failure(
                 "SILENT_UPDATE_UNSUPPORTED",
-                "shell context unavailable: ${error.javaClass.simpleName}: ${error.message.orEmpty()}",
+                "package Binder services unavailable: ${rootCauseSummary(error)}",
                 started
             )
         }
+
         val stagingDir = File(STAGING_ROOT)
         ensureStagingDirectory(stagingDir)
         val staged = snapshotSource(apkPath, stagingDir)
         var sessionId = -1
         var installer: PackageInstaller? = null
         try {
-            log("self_update_validation_start", "staged=${staged.name} bytes=${staged.length()}")
-            val archive = archiveInfo(context.packageManager, staged)
+            log("self_update_validation_start", "staged=${staged.name} bytes=${staged.length()} backend=binder_native")
+            val archive = parseCandidateArchive(staged)
                 ?: return failure("APK_INVALID", "unable to parse staged APK", started)
-            val installed = installedInfo(context.packageManager)
+            val installed = installedInfo(services)
             val validation = validateArchive(archive, installed, staged.length())
             if (validation != null) return failure(validation.first, validation.second, started)
-            val newVersion = versionCodeOf(archive)
-            log("self_update_validation_success", "versionCode=$newVersion bytes=${staged.length()}")
+            val newVersion = archive.versionCode
+            log(
+                "self_update_validation_success",
+                "versionCode=$newVersion bytes=${staged.length()} signers=${archive.signerDigests.size}"
+            )
 
-            installer = context.packageManager.packageInstaller
+            installer = services.installer
             val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
                 setAppPackageName(TARGET_PACKAGE)
                 if (Build.VERSION.SDK_INT >= 31) {
@@ -110,7 +143,7 @@ internal object EmbeddedSelfUpdateInstaller {
             sessionId = installer.createSession(params)
             activeInstaller.set(installer)
             activeSessionId.set(sessionId)
-            log("self_update_session_created", "session=$sessionId versionCode=$newVersion")
+            log("self_update_session_created", "session=$sessionId versionCode=$newVersion backend=binder_native")
 
             installer.openSession(sessionId).use { session ->
                 FileInputStream(staged).use { input ->
@@ -121,7 +154,7 @@ internal object EmbeddedSelfUpdateInstaller {
                     }
                 }
                 log("self_update_write_complete", "session=$sessionId bytes=${staged.length()}")
-                val final = commitAndAwait(context, installer, session, sessionId)
+                val final = commitAndAwait(services, session, sessionId)
                 val duration = (SystemClock.elapsedRealtime() - started).coerceAtLeast(0L)
                 val result = final.copy(
                     sessionId = sessionId,
@@ -130,9 +163,24 @@ internal object EmbeddedSelfUpdateInstaller {
                     durationMs = duration
                 )
                 if (result.ok) {
-                    log("self_update_install_success", "session=$sessionId versionCode=$newVersion durationMs=$duration")
+                    val installedAfter = runCatching { installedInfo(services) }.getOrNull()
+                    val installedAfterVersion = installedAfter?.let(::versionCodeOf) ?: -1L
+                    if (installedAfterVersion >= newVersion) {
+                        log(
+                            "self_update_install_success",
+                            "session=$sessionId versionCode=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
+                        )
+                    } else {
+                        log(
+                            "self_update_install_success_unverified",
+                            "session=$sessionId candidateVersion=$newVersion installedVersion=$installedAfterVersion durationMs=$duration"
+                        )
+                    }
                 } else {
-                    log("self_update_install_failure", "session=$sessionId code=${result.code} durationMs=$duration message=${result.message.take(240)}")
+                    log(
+                        "self_update_install_failure",
+                        "session=$sessionId code=${result.code} durationMs=$duration message=${result.message.take(240)}"
+                    )
                 }
                 return result
             }
@@ -140,11 +188,12 @@ internal object EmbeddedSelfUpdateInstaller {
             if (sessionId >= 0 && installer != null) {
                 runCatching { installer.abandonSession(sessionId) }
             }
-            val code = when (error) {
+            val root = unwrapInvocation(error)
+            val code = when (root) {
                 is SecurityException -> "PERMISSION_APPROVAL_FAILED"
                 else -> "INSTALL_FAILED"
             }
-            return failure(code, "${error.javaClass.simpleName}: ${error.message.orEmpty()}", started, sessionId)
+            return failure(code, rootCauseSummary(error), started, sessionId)
         } finally {
             activeSessionId.compareAndSet(sessionId, -1)
             activeInstaller.compareAndSet(installer, null)
@@ -162,12 +211,10 @@ internal object EmbeddedSelfUpdateInstaller {
     }
 
     private fun commitAndAwait(
-        context: Context,
-        installer: PackageInstaller,
+        services: FrameworkServices,
         session: PackageInstaller.Session,
         sessionId: Int
     ): Result {
-        val action = "$TARGET_PACKAGE.SELF_UPDATE_RESULT.${Process.myPid()}.${UUID.randomUUID()}"
         val latch = CountDownLatch(1)
         val finalStatus = AtomicInteger(Int.MIN_VALUE)
         val finalMessage = AtomicReference("")
@@ -175,64 +222,84 @@ internal object EmbeddedSelfUpdateInstaller {
         val approvalElapsed = AtomicLong(-1L)
         val committedAt = SystemClock.elapsedRealtime()
         val finished = AtomicBoolean(false)
-        val handlerThread = HandlerThread("luonnotar-self-update-result").apply { start() }
-        val handler = Handler(handlerThread.looper)
-        val receiver = object : BroadcastReceiver() {
-            override fun onReceive(receiverContext: Context?, intent: Intent?) {
+        val pendingSeen = AtomicBoolean(false)
+
+        fun finish(status: Int, message: String) {
+            if (finished.compareAndSet(false, true)) {
+                finalStatus.set(status)
+                finalMessage.set(message)
+                latch.countDown()
+            }
+        }
+
+        val resultBinder = ResultIntentSenderBinder(
+            onIntent = { intent ->
                 val status = intent?.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)
                     ?: Int.MIN_VALUE
                 val message = intent?.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE).orEmpty()
                 if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
+                    pendingSeen.set(true)
                     log("self_update_permission_pending", "session=$sessionId message=${message.take(220)}")
-                    approvePermission(installer, sessionId, approvalAttempt, approvalElapsed, committedAt)
-                    return
+                    approvePermission(
+                        services,
+                        sessionId,
+                        approvalAttempt,
+                        approvalElapsed,
+                        committedAt,
+                        source = "pending_callback"
+                    )
+                } else {
+                    finish(status, message)
                 }
-                finalStatus.set(status)
-                finalMessage.set(message)
-                finished.set(true)
-                latch.countDown()
+            },
+            onProtocolFailure = { error ->
+                val message = "result Binder callback failed: ${rootCauseSummary(error)}"
+                log("self_update_result_callback_error", "session=$sessionId message=${message.take(260)}")
+                finish(PackageInstaller.STATUS_FAILURE, message)
             }
+        )
+        val statusReceiver = intentSenderForBinder(resultBinder)
+        val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "luonnotar-self-update-approval").apply { isDaemon = true }
+        }.apply {
+            removeOnCancelPolicy = true
+            executeExistingDelayedTasksAfterShutdownPolicy = false
+            continueExistingPeriodicTasksAfterShutdownPolicy = false
         }
-        val filter = IntentFilter(action)
-        if (Build.VERSION.SDK_INT >= 33) {
-            context.registerReceiver(receiver, filter, null, handler, Context.RECEIVER_EXPORTED)
-        } else {
-            @Suppress("DEPRECATION")
-            context.registerReceiver(receiver, filter, null, handler)
-        }
-        try {
-            val intent = Intent(action).setPackage(SHELL_PACKAGE)
-            val pendingIntent = PendingIntent.getBroadcast(
-                context,
-                sessionId,
-                intent,
-                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_MUTABLE
-            )
-            log("self_update_commit", "session=$sessionId")
-            session.commit(pendingIntent.intentSender)
 
-            // OriginOS can delay the pending-user-action callback. Use a short,
-            // bounded approval schedule; successful approval stops further attempts.
-            val delays = longArrayOf(10L, 20L, 50L, 100L, 200L, 400L)
-            var cumulative = 0L
-            delays.forEach { delay ->
-                cumulative += delay
-                handler.postDelayed({
-                    if (!finished.get() && approvalElapsed.get() < 0L) {
+        try {
+            log("self_update_commit", "session=$sessionId callback=binder_native")
+            session.commit(statusReceiver)
+
+            // OriginOS may abort an install before the public pending-user-action
+            // callback reaches us. Reassert acceptance on a short bounded schedule.
+            // A successful early call does not suppress later attempts: some OEM
+            // builds accept the Binder call before the session has entered the
+            // permission state and otherwise turn that first success into a no-op.
+            permissionApprovalScheduleMs.forEach { delayMs ->
+                approvalExecutor.schedule({
+                    if (!finished.get()) {
                         approvePermission(
-                            installer,
+                            services,
                             sessionId,
                             approvalAttempt,
                             approvalElapsed,
-                            committedAt
+                            committedAt,
+                            source = if (pendingSeen.get()) "scheduled_after_pending" else "scheduled_race"
                         )
                     }
-                }, cumulative)
+                }, delayMs, TimeUnit.MILLISECONDS)
             }
 
             if (!latch.await(FINAL_RESULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
-                runCatching { installer.abandonSession(sessionId) }
-                return Result(false, "TIMEOUT", "PackageInstaller final result timeout")
+                runCatching { services.installer.abandonSession(sessionId) }
+                return Result(
+                    false,
+                    "TIMEOUT",
+                    "PackageInstaller final result timeout",
+                    permissionApprovalAttempt = approvalAttempt.get(),
+                    permissionApprovalElapsed = approvalElapsed.get()
+                )
             }
             val mapped = mapStatus(finalStatus.get())
             return Result(
@@ -243,56 +310,228 @@ internal object EmbeddedSelfUpdateInstaller {
                 permissionApprovalElapsed = approvalElapsed.get()
             )
         } finally {
-            runCatching { context.unregisterReceiver(receiver) }
-            handlerThread.quitSafely()
+            approvalExecutor.shutdownNow()
         }
     }
 
     private fun approvePermission(
-        installer: PackageInstaller,
+        services: FrameworkServices,
         sessionId: Int,
         attemptCounter: AtomicInteger,
-        approvedElapsed: AtomicLong,
-        committedAt: Long
+        firstAcceptedElapsed: AtomicLong,
+        committedAt: Long,
+        source: String
     ) {
-        if (approvedElapsed.get() >= 0L) return
         val attempt = attemptCounter.incrementAndGet()
         val result = runCatching {
-            // Hidden/SystemApi on the public PackageInstaller class. The shell UID
-            // owns INSTALL_PACKAGES on the target OriginOS build.
-            val method = PackageInstaller::class.java.getDeclaredMethod(
-                "setPermissionsResult",
-                Int::class.javaPrimitiveType,
-                Boolean::class.javaPrimitiveType
-            ).apply { isAccessible = true }
-            method.invoke(installer, sessionId, true)
+            val method = Class.forName("android.content.pm.IPackageInstaller")
+                .getMethod(
+                    "setPermissionsResult",
+                    Int::class.javaPrimitiveType,
+                    Boolean::class.javaPrimitiveType
+                )
+            method.invoke(services.packageInstallerBinder, sessionId, true)
         }
         if (result.isSuccess) {
             val elapsed = (SystemClock.elapsedRealtime() - committedAt).coerceAtLeast(0L)
-            if (approvedElapsed.compareAndSet(-1L, elapsed)) {
-                log("self_update_permission_approved", "session=$sessionId attempt=$attempt elapsedMs=$elapsed")
+            if (firstAcceptedElapsed.compareAndSet(-1L, elapsed)) {
+                log(
+                    "self_update_permission_approval_call_accepted",
+                    "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source"
+                )
+            } else {
+                log(
+                    "self_update_permission_approval_reasserted",
+                    "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source"
+                )
             }
         } else {
-            val error = result.exceptionOrNull()
             log(
                 "self_update_permission_retry",
-                "session=$sessionId attempt=$attempt error=${error?.javaClass?.simpleName}:${error?.message.orEmpty().take(180)}"
+                "session=$sessionId attempt=$attempt source=$source error=${rootCauseSummary(result.exceptionOrNull()).take(220)}"
             )
         }
     }
 
-    private fun shellContext(): Context {
-        shellContextCache.get()?.let { return it }
-        val activityThread = Class.forName("android.app.ActivityThread")
-        val systemMain = activityThread.getDeclaredMethod("systemMain").apply {
-            isAccessible = true
-        }.invoke(null)
-        val systemContext = activityThread.getDeclaredMethod("getSystemContext").apply {
-            isAccessible = true
-        }.invoke(systemMain) as Context
-        val shell = systemContext.createPackageContext(SHELL_PACKAGE, Context.CONTEXT_IGNORE_SECURITY)
-        shellContextCache.compareAndSet(null, shell)
-        return shellContextCache.get() ?: shell
+    private fun frameworkServices(): FrameworkServices {
+        frameworkServicesCache.get()?.let { return it }
+        val appGlobals = Class.forName("android.app.AppGlobals")
+        val packageManagerBinder = appGlobals.getMethod("getPackageManager").invoke(null)
+            ?: error("AppGlobals.getPackageManager returned null")
+        val packageManagerInterface = Class.forName("android.content.pm.IPackageManager")
+        val packageInstallerBinder = packageManagerInterface
+            .getMethod("getPackageInstaller")
+            .invoke(packageManagerBinder)
+            ?: error("IPackageManager.getPackageInstaller returned null")
+        val userId = UserHandle.getUserHandleForUid(Process.myUid()).identifier
+        val installer = constructPackageInstaller(packageInstallerBinder, userId)
+        val services = FrameworkServices(
+            packageManagerBinder = packageManagerBinder,
+            packageInstallerBinder = packageInstallerBinder,
+            installer = installer,
+            userId = userId
+        )
+        frameworkServicesCache.compareAndSet(null, services)
+        val resolved = frameworkServicesCache.get() ?: services
+        log(
+            "self_update_binder_services_ready",
+            "uid=${Process.myUid()} userId=${resolved.userId} installerPackage=$SHELL_PACKAGE"
+        )
+        return resolved
+    }
+
+    private fun constructPackageInstaller(packageInstallerBinder: Any, userId: Int): PackageInstaller {
+        val binderInterface = Class.forName("android.content.pm.IPackageInstaller")
+        val constructors = PackageInstaller::class.java.declaredConstructors
+
+        // Android 12+ / current Android 16 shape:
+        // PackageInstaller(IPackageInstaller, String, String attributionTag, int userId)
+        constructors.firstOrNull { constructor ->
+            val types = constructor.parameterTypes
+            types.size == 4 &&
+                types[0] == binderInterface &&
+                types[1] == String::class.java &&
+                types[2] == String::class.java &&
+                types[3] == Int::class.javaPrimitiveType
+        }?.let { constructor ->
+            constructor.isAccessible = true
+            @Suppress("UNCHECKED_CAST")
+            return constructor.newInstance(packageInstallerBinder, SHELL_PACKAGE, null, userId) as PackageInstaller
+        }
+
+        // Older framework fallback that still needs no Context.
+        constructors.firstOrNull { constructor ->
+            val types = constructor.parameterTypes
+            types.size == 3 &&
+                types[0] == binderInterface &&
+                types[1] == String::class.java &&
+                types[2] == Int::class.javaPrimitiveType
+        }?.let { constructor ->
+            constructor.isAccessible = true
+            return constructor.newInstance(packageInstallerBinder, SHELL_PACKAGE, userId) as PackageInstaller
+        }
+
+        error(
+            "no context-free PackageInstaller constructor: " +
+                constructors.joinToString { it.parameterTypes.joinToString(prefix = "(", postfix = ")") { type -> type.name } }
+        )
+    }
+
+    private fun installedInfo(services: FrameworkServices): PackageInfo {
+        val iface = Class.forName("android.content.pm.IPackageManager")
+        val flags = PackageManager.GET_SIGNING_CERTIFICATES
+        val modern = runCatching {
+            iface.getMethod(
+                "getPackageInfo",
+                String::class.java,
+                Long::class.javaPrimitiveType,
+                Int::class.javaPrimitiveType
+            ).invoke(
+                services.packageManagerBinder,
+                TARGET_PACKAGE,
+                flags.toLong(),
+                services.userId
+            ) as? PackageInfo
+        }.getOrNull()
+        if (modern != null) return modern
+
+        @Suppress("DEPRECATION")
+        return iface.getMethod(
+            "getPackageInfo",
+            String::class.java,
+            Int::class.javaPrimitiveType,
+            Int::class.javaPrimitiveType
+        ).invoke(
+            services.packageManagerBinder,
+            TARGET_PACKAGE,
+            legacySigningFlags(),
+            services.userId
+        ) as? PackageInfo ?: error("installed package not found through IPackageManager")
+    }
+
+    private fun parseCandidateArchive(apk: File): CandidateArchive? {
+        val parser = Class.forName("android.content.pm.PackageParser")
+        val flags = packageParserFlag(parser, "PARSE_MUST_BE_APK", 1) or
+            packageParserFlag(parser, "PARSE_COLLECT_CERTIFICATES", 1 shl 5)
+        val lite = parser.getMethod(
+            "parseApkLite",
+            File::class.java,
+            Int::class.javaPrimitiveType
+        ).invoke(null, apk, flags) ?: return null
+
+        val liteClass = lite.javaClass
+        val packageName = liteClass.getField("packageName").get(lite) as? String ?: return null
+        val versionCode = liteClass.getMethod("getLongVersionCode").invoke(lite) as? Long ?: return null
+        val signingDetails = liteClass.getField("signingDetails").get(lite) ?: return null
+        val digests = linkedSetOf<String>()
+        signatureArrayField(signingDetails, "signatures").forEach { digests += digestSignature(it) }
+        signatureArrayField(signingDetails, "pastSigningCertificates").forEach { digests += digestSignature(it) }
+        return CandidateArchive(packageName, versionCode, digests)
+    }
+
+    private fun packageParserFlag(parser: Class<*>, name: String, fallback: Int): Int =
+        runCatching { parser.getField(name).getInt(null) }.getOrDefault(fallback)
+
+    private fun signatureArrayField(signingDetails: Any, fieldName: String): Array<Signature> {
+        val value = runCatching {
+            signingDetails.javaClass.getField(fieldName).get(signingDetails)
+        }.getOrNull() ?: return emptyArray()
+        @Suppress("UNCHECKED_CAST")
+        return value as? Array<Signature> ?: emptyArray()
+    }
+
+    private fun digestSignature(signature: Signature): String =
+        MessageDigest.getInstance("SHA-256")
+            .digest(signature.toByteArray())
+            .joinToString("") { "%02x".format(it) }
+
+    private class ResultIntentSenderBinder(
+        private val onIntent: (Intent?) -> Unit,
+        private val onProtocolFailure: (Throwable) -> Unit
+    ) : Binder() {
+        override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
+            if (code == IBinder.INTERFACE_TRANSACTION) {
+                reply?.writeString(IINTENT_SENDER_DESCRIPTOR)
+                return true
+            }
+            if (code != IINTENT_SENDER_SEND_TRANSACTION) {
+                return super.onTransact(code, data, reply, flags)
+            }
+            return try {
+                data.enforceInterface(IINTENT_SENDER_DESCRIPTOR)
+                data.readInt() // result code
+                val intent = readIntent(data)
+                data.readString() // resolvedType
+                data.readStrongBinder() // whitelistToken
+                data.readStrongBinder() // finishedReceiver
+                data.readString() // requiredPermission
+                readBundle(data) // options
+                onIntent(intent)
+                true
+            } catch (error: Throwable) {
+                onProtocolFailure(error)
+                true
+            }
+        }
+
+        private fun readIntent(parcel: Parcel): Intent? =
+            if (parcel.readInt() != 0) Intent.CREATOR.createFromParcel(parcel) else null
+
+        private fun readBundle(parcel: Parcel): Bundle? =
+            if (parcel.readInt() != 0) Bundle.CREATOR.createFromParcel(parcel) else null
+    }
+
+    private fun intentSenderForBinder(binder: IBinder): IntentSender {
+        val parcel = Parcel.obtain()
+        try {
+            parcel.writeStrongBinder(binder)
+            parcel.setDataPosition(0)
+            return requireNotNull(IntentSender.CREATOR.createFromParcel(parcel)) {
+                "unable to create binder-native IntentSender"
+            }
+        } finally {
+            parcel.recycle()
+        }
     }
 
     private fun ensureStagingDirectory(dir: File) {
@@ -337,28 +576,6 @@ internal object EmbeddedSelfUpdateInstaller {
         }
     }
 
-    private fun archiveInfo(pm: PackageManager, apk: File): PackageInfo? =
-        if (Build.VERSION.SDK_INT >= 33) {
-            pm.getPackageArchiveInfo(
-                apk.absolutePath,
-                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageArchiveInfo(apk.absolutePath, legacySigningFlags())
-        }
-
-    private fun installedInfo(pm: PackageManager): PackageInfo =
-        if (Build.VERSION.SDK_INT >= 33) {
-            pm.getPackageInfo(
-                TARGET_PACKAGE,
-                PackageManager.PackageInfoFlags.of(PackageManager.GET_SIGNING_CERTIFICATES.toLong())
-            )
-        } else {
-            @Suppress("DEPRECATION")
-            pm.getPackageInfo(TARGET_PACKAGE, legacySigningFlags())
-        }
-
     @Suppress("DEPRECATION")
     private fun legacySigningFlags(): Int =
         if (Build.VERSION.SDK_INT >= 28) {
@@ -376,15 +593,15 @@ internal object EmbeddedSelfUpdateInstaller {
         }
 
     private fun validateArchive(
-        archive: PackageInfo,
+        archive: CandidateArchive,
         installed: PackageInfo,
         apkSize: Long
     ): Pair<String, String>? {
         val decision = EmbeddedSelfUpdatePolicy.validate(
             packageName = archive.packageName,
-            candidateVersionCode = versionCodeOf(archive),
+            candidateVersionCode = archive.versionCode,
             installedVersionCode = versionCodeOf(installed),
-            candidateSignerDigests = signerDigests(archive),
+            candidateSignerDigests = archive.signerDigests,
             installedSignerDigests = signerDigests(installed),
             apkSize = apkSize
         )
@@ -403,11 +620,7 @@ internal object EmbeddedSelfUpdateInstaller {
         } else {
             info.signatures ?: emptyArray()
         }
-        return signers.mapTo(linkedSetOf()) { signature ->
-            MessageDigest.getInstance("SHA-256")
-                .digest(signature.toByteArray())
-                .joinToString("") { "%02x".format(it) }
-        }
+        return signers.mapTo(linkedSetOf(), ::digestSignature)
     }
 
     private fun mapStatus(status: Int): String = when (status) {
@@ -421,6 +634,41 @@ internal object EmbeddedSelfUpdateInstaller {
         PackageInstaller.STATUS_FAILURE_INVALID -> "FAILURE_INVALID"
         PackageInstaller.STATUS_FAILURE_STORAGE -> "FAILURE_STORAGE"
         else -> "UNKNOWN"
+    }
+
+    private fun unwrapInvocation(error: Throwable): Throwable {
+        var current = error
+        var depth = 0
+        while (depth++ < 6) {
+            current = when {
+                current is InvocationTargetException && current.targetException != null -> current.targetException
+                current.cause != null && current.cause !== current -> current.cause!!
+                else -> return current
+            }
+        }
+        return current
+    }
+
+    private fun rootCauseSummary(error: Throwable?): String {
+        if (error == null) return "unknown"
+        val chain = ArrayList<String>(4)
+        var current: Throwable? = error
+        var depth = 0
+        while (current != null && depth++ < 4) {
+            val unwrapped = if (current is InvocationTargetException && current.targetException != null) {
+                current.targetException
+            } else {
+                current
+            }
+            val item = buildString {
+                append(unwrapped.javaClass.simpleName.ifBlank { unwrapped.javaClass.name })
+                val message = unwrapped.message.orEmpty().trim()
+                if (message.isNotEmpty()) append(": ").append(message.take(220))
+            }
+            if (chain.lastOrNull() != item) chain += item
+            current = unwrapped.cause?.takeIf { it !== unwrapped }
+        }
+        return chain.joinToString(" <- ").ifBlank { error.javaClass.name }
     }
 
     private fun failure(
