@@ -55,6 +55,7 @@ internal object EmbeddedSelfUpdateInstaller {
     private const val FINAL_RESULT_TIMEOUT_MS = 45_000L
     private const val IINTENT_SENDER_DESCRIPTOR = "android.content.IIntentSender"
     private const val IINTENT_SENDER_SEND_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION
+    private const val INSTALL_REPLACE_EXISTING_FLAG = 0x00000002
     private val permissionApprovalRetryScheduleMs = longArrayOf(
         10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
     )
@@ -176,6 +177,7 @@ internal object EmbeddedSelfUpdateInstaller {
             installer = services.installer
             val params = PackageInstaller.SessionParams(PackageInstaller.SessionParams.MODE_FULL_INSTALL).apply {
                 setAppPackageName(TARGET_PACKAGE)
+                enableReplaceExisting(this)
                 if (Build.VERSION.SDK_INT >= 31) {
                     setRequireUserAction(PackageInstaller.SessionParams.USER_ACTION_NOT_REQUIRED)
                 }
@@ -687,6 +689,21 @@ internal object EmbeddedSelfUpdateInstaller {
         } finally {
             callInFlight.set(false)
         }
+    }
+
+    private fun enableReplaceExisting(params: PackageInstaller.SessionParams) {
+        // MODE_FULL_INSTALL controls APK contents, but replacement policy is a separate install flag.
+        // PackageManagerShellCommand defaults normal `pm install` sessions to replaceExisting=true
+        // and ORs INSTALL_REPLACE_EXISTING into SessionParams.installFlags. Mirror that exact
+        // shell-session policy for this already package/signer/version-validated self-update only.
+        val installFlagsField = PackageInstaller.SessionParams::class.java.getDeclaredField("installFlags")
+        installFlagsField.isAccessible = true
+        val currentFlags = installFlagsField.getInt(params)
+        installFlagsField.setInt(params, currentFlags or INSTALL_REPLACE_EXISTING_FLAG)
+        log(
+            "self_update_replace_existing_enabled",
+            "flag=0x${INSTALL_REPLACE_EXISTING_FLAG.toString(16)} flags=0x${installFlagsField.getInt(params).toString(16)}"
+        )
     }
 
     private fun frameworkServices(): FrameworkServices {
