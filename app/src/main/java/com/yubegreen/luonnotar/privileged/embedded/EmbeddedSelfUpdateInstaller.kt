@@ -55,8 +55,8 @@ internal object EmbeddedSelfUpdateInstaller {
     private const val FINAL_RESULT_TIMEOUT_MS = 45_000L
     private const val IINTENT_SENDER_DESCRIPTOR = "android.content.IIntentSender"
     private const val IINTENT_SENDER_SEND_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION
-    private val permissionApprovalScheduleMs = longArrayOf(
-        5L, 10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
+    private val permissionApprovalRetryScheduleMs = longArrayOf(
+        10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
     )
 
     private val activeSessionId = AtomicInteger(-1)
@@ -482,15 +482,43 @@ internal object EmbeddedSelfUpdateInstaller {
         val approvalElapsed = AtomicLong(-1L)
         val approvalAccepted = AtomicBoolean(false)
         val approvalCallInFlight = AtomicBoolean(false)
+        val approvalRetriesScheduled = AtomicBoolean(false)
         val committedAt = SystemClock.elapsedRealtime()
         val finished = AtomicBoolean(false)
         val pendingSeen = AtomicBoolean(false)
+        val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
+            Thread(runnable, "luonnotar-self-update-approval").apply { isDaemon = true }
+        }.apply {
+            removeOnCancelPolicy = true
+            executeExistingDelayedTasksAfterShutdownPolicy = false
+            continueExistingPeriodicTasksAfterShutdownPolicy = false
+        }
 
         fun finish(status: Int, message: String) {
             if (finished.compareAndSet(false, true)) {
                 finalStatus.set(status)
                 finalMessage.set(message)
                 latch.countDown()
+            }
+        }
+
+        fun scheduleApprovalRetriesAfterPending() {
+            if (!approvalRetriesScheduled.compareAndSet(false, true)) return
+            permissionApprovalRetryScheduleMs.forEach { delayMs ->
+                approvalExecutor.schedule({
+                    if (!finished.get() && pendingSeen.get() && !approvalAccepted.get()) {
+                        approvePermission(
+                            services,
+                            sessionId,
+                            approvalAttempt,
+                            approvalElapsed,
+                            approvalAccepted,
+                            approvalCallInFlight,
+                            committedAt,
+                            source = "pending_retry"
+                        )
+                    }
+                }, delayMs, TimeUnit.MILLISECONDS)
             }
         }
 
@@ -512,6 +540,9 @@ internal object EmbeddedSelfUpdateInstaller {
                         committedAt,
                         source = "pending_callback"
                     )
+                    if (!approvalAccepted.get()) {
+                        scheduleApprovalRetriesAfterPending()
+                    }
                 } else {
                     finish(status, message)
                 }
@@ -523,38 +554,16 @@ internal object EmbeddedSelfUpdateInstaller {
             }
         )
         val statusReceiver = intentSenderForBinder(resultBinder)
-        val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
-            Thread(runnable, "luonnotar-self-update-approval").apply { isDaemon = true }
-        }.apply {
-            removeOnCancelPolicy = true
-            executeExistingDelayedTasksAfterShutdownPolicy = false
-            continueExistingPeriodicTasksAfterShutdownPolicy = false
-        }
 
         try {
-            log("self_update_commit", "session=$sessionId callback=binder_native")
+            log("self_update_commit", "session=$sessionId callback=binder_native permission_gate=pending_callback_only")
             session.commit(statusReceiver)
 
-            // The permission Binder call posts another install pass when accepted. Retry only
-            // while the call itself fails; once one invocation succeeds, stop permanently for
-            // this session. Reasserting successful approvals can enqueue duplicate install passes
-            // while verification already owns the staged files.
-            permissionApprovalScheduleMs.forEach { delayMs ->
-                approvalExecutor.schedule({
-                    if (!finished.get() && !approvalAccepted.get()) {
-                        approvePermission(
-                            services,
-                            sessionId,
-                            approvalAttempt,
-                            approvalElapsed,
-                            approvalAccepted,
-                            approvalCallInFlight,
-                            committedAt,
-                            source = if (pendingSeen.get()) "scheduled_after_pending" else "scheduled_race"
-                        )
-                    }
-                }, delayMs, TimeUnit.MILLISECONDS)
-            }
+            // Never call setPermissionsResult() speculatively. A successful call while the session
+            // is not yet committed is interpreted as a preapproval request; this installer never
+            // requested preapproval and therefore has no preapproval IntentSender. Only the
+            // STATUS_PENDING_USER_ACTION callback may open the approval gate. If that first Binder
+            // call fails, bounded retries are allowed only after the pending callback was observed.
 
             if (!latch.await(FINAL_RESULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 runCatching { services.installer.abandonSession(sessionId) }
