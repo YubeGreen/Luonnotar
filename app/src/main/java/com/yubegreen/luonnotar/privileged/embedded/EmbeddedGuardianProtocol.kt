@@ -6,7 +6,7 @@ import java.io.IOException
 
 internal object EmbeddedGuardianProtocol {
     const val SCHEMA = 1
-    const val ENGINE_REVISION = 276
+    const val ENGINE_REVISION = 277
     const val MIN_HANDOFF_ENGINE_REVISION = 260
     const val HOST = "127.0.0.1"
     const val MAX_LINE_CHARS = 512 * 1024
