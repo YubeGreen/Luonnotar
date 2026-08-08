@@ -57,6 +57,8 @@ internal object EmbeddedSelfUpdateInstaller {
     private const val IINTENT_SENDER_DESCRIPTOR = "android.content.IIntentSender"
     private const val IINTENT_SENDER_SEND_TRANSACTION = IBinder.FIRST_CALL_TRANSACTION
     private const val INSTALL_REPLACE_EXISTING_FLAG = 0x00000002
+    private const val DIAGNOSTIC_TRACE_NAME = "last-self-update-callback-trace.jsonl"
+    private val diagnosticTraceLock = Any()
     private val permissionApprovalRetryScheduleMs = longArrayOf(
         10L, 20L, 40L, 80L, 160L, 320L, 640L, 1_000L, 1_500L
     )
@@ -114,7 +116,9 @@ internal object EmbeddedSelfUpdateInstaller {
         val sourceMagic: String = "",
         val sessionEntryNames: String = "",
         val sessionReadbackStage: String = "",
-        val sessionReadbackDiagnostic: String = ""
+        val sessionReadbackDiagnostic: String = "",
+        val callbackCount: Int = 0,
+        val callbackTraceFile: String = ""
     ) {
         fun toJson(): String = JSONObject()
             .put("ok", ok)
@@ -136,6 +140,8 @@ internal object EmbeddedSelfUpdateInstaller {
             .put("sessionEntryNames", sessionEntryNames)
             .put("sessionReadbackStage", sessionReadbackStage)
             .put("sessionReadbackDiagnostic", sessionReadbackDiagnostic.take(800))
+            .put("callbackCount", callbackCount)
+            .put("callbackTraceFile", callbackTraceFile)
             .toString()
     }
 
@@ -494,6 +500,9 @@ internal object EmbeddedSelfUpdateInstaller {
         val finished = AtomicBoolean(false)
         val pendingSeen = AtomicBoolean(false)
         val commitHandleClosed = AtomicBoolean(false)
+        val callbackSequence = AtomicInteger(0)
+        val callbackTraceFile = "$STAGING_ROOT/$DIAGNOSTIC_TRACE_NAME"
+        resetDiagnosticTrace(sessionId, committedAt)
         val approvalExecutor = ScheduledThreadPoolExecutor(1) { runnable ->
             Thread(runnable, "luonnotar-self-update-approval").apply { isDaemon = true }
         }.apply {
@@ -503,7 +512,16 @@ internal object EmbeddedSelfUpdateInstaller {
         }
 
         fun finish(status: Int, message: String) {
-            if (finished.compareAndSet(false, true)) {
+            val accepted = finished.compareAndSet(false, true)
+            appendDiagnosticTrace(
+                sessionId,
+                committedAt,
+                if (accepted) "final_latched" else "final_ignored",
+                "status" to status,
+                "statusName" to mapStatus(status),
+                "message" to message.take(300)
+            )
+            if (accepted) {
                 finalStatus.set(status)
                 finalMessage.set(message)
                 latch.countDown()
@@ -559,6 +577,17 @@ internal object EmbeddedSelfUpdateInstaller {
                         "session=$sessionId delayMs=$delayMs committed=$committed active=$active " +
                             "preapproval=$preapprovalRequested pendingSeen=${pendingSeen.get()}"
                     )
+                    appendDiagnosticTrace(
+                        sessionId,
+                        committedAt,
+                        "commit_gate_probe",
+                        "delayMs" to delayMs,
+                        "committed" to committed,
+                        "active" to active,
+                        "preapprovalRequested" to preapprovalRequested,
+                        "pendingSeen" to pendingSeen.get(),
+                        "approvalAccepted" to approvalAccepted.get()
+                    )
                     if (committed && !active && !preapprovalRequested) {
                         approvePermission(
                             services,
@@ -576,10 +605,34 @@ internal object EmbeddedSelfUpdateInstaller {
         }
 
         val resultBinder = ResultIntentSenderBinder(
-            onIntent = { intent ->
+            onIntent = { sendCode, intent ->
                 val status = intent?.getIntExtra(PackageInstaller.EXTRA_STATUS, Int.MIN_VALUE)
                     ?: Int.MIN_VALUE
                 val message = intent?.getStringExtra(PackageInstaller.EXTRA_STATUS_MESSAGE).orEmpty()
+                val callbackIndex = callbackSequence.incrementAndGet()
+                val callbackPackage = intent?.getStringExtra(PackageInstaller.EXTRA_PACKAGE_NAME).orEmpty()
+                val callbackSession = intent?.getIntExtra(PackageInstaller.EXTRA_SESSION_ID, -1) ?: -1
+                val extraKeys = runCatching {
+                    intent?.extras?.keySet()?.toList()?.sorted()?.joinToString(",").orEmpty()
+                }.getOrDefault("extras_unreadable")
+                appendDiagnosticTrace(
+                    sessionId,
+                    committedAt,
+                    "callback",
+                    "sequence" to callbackIndex,
+                    "sendCode" to sendCode,
+                    "status" to status,
+                    "statusName" to mapStatus(status),
+                    "message" to message.take(300),
+                    "packageName" to callbackPackage,
+                    "callbackSessionId" to callbackSession,
+                    "action" to intent?.action.orEmpty(),
+                    "flags" to (intent?.flags ?: 0),
+                    "hasUserActionIntent" to (intent?.hasExtra(Intent.EXTRA_INTENT) == true),
+                    "extraKeys" to extraKeys,
+                    "pendingSeenBefore" to pendingSeen.get(),
+                    "approvalAcceptedBefore" to approvalAccepted.get()
+                )
                 if (status == PackageInstaller.STATUS_PENDING_USER_ACTION) {
                     pendingSeen.set(true)
                     log("self_update_permission_pending", "session=$sessionId message=${message.take(220)}")
@@ -602,6 +655,12 @@ internal object EmbeddedSelfUpdateInstaller {
             },
             onProtocolFailure = { error ->
                 val message = "result Binder callback failed: ${rootCauseSummary(error)}"
+                appendDiagnosticTrace(
+                    sessionId,
+                    committedAt,
+                    "callback_protocol_failure",
+                    "message" to message.take(300)
+                )
                 log("self_update_result_callback_error", "session=$sessionId message=${message.take(260)}")
                 finish(PackageInstaller.STATUS_FAILURE, message)
             }
@@ -613,9 +672,18 @@ internal object EmbeddedSelfUpdateInstaller {
                 "self_update_commit",
                 "session=$sessionId callback=binder_native permission_gate=pending_or_committed_idle"
             )
+            appendDiagnosticTrace(
+                sessionId,
+                committedAt,
+                "commit_begin",
+                "callbackBackend" to "binder_native",
+                "permissionGate" to "pending_or_committed_idle"
+            )
             session.commit(statusReceiver)
+            appendDiagnosticTrace(sessionId, committedAt, "commit_returned")
             session.close()
             commitHandleClosed.set(true)
+            appendDiagnosticTrace(sessionId, committedAt, "commit_handle_closed")
             log("self_update_commit_handle_closed", "session=$sessionId")
 
             // Primary path: approve only after the framework explicitly reports
@@ -631,21 +699,34 @@ internal object EmbeddedSelfUpdateInstaller {
 
             if (!latch.await(FINAL_RESULT_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
                 runCatching { services.installer.abandonSession(sessionId) }
+                appendDiagnosticTrace(sessionId, committedAt, "final_timeout")
                 return Result(
                     false,
                     "TIMEOUT",
                     "PackageInstaller final result timeout",
                     permissionApprovalAttempt = approvalAttempt.get(),
-                    permissionApprovalElapsed = approvalElapsed.get()
+                    permissionApprovalElapsed = approvalElapsed.get(),
+                    callbackCount = callbackSequence.get(),
+                    callbackTraceFile = callbackTraceFile
                 )
             }
             val mapped = mapStatus(finalStatus.get())
+            appendDiagnosticTrace(
+                sessionId,
+                committedAt,
+                "result_return",
+                "status" to finalStatus.get(),
+                "statusName" to mapped,
+                "callbackCount" to callbackSequence.get()
+            )
             return Result(
                 ok = finalStatus.get() == PackageInstaller.STATUS_SUCCESS,
                 code = mapped,
                 message = finalMessage.get(),
                 permissionApprovalAttempt = approvalAttempt.get(),
-                permissionApprovalElapsed = approvalElapsed.get()
+                permissionApprovalElapsed = approvalElapsed.get(),
+                callbackCount = callbackSequence.get(),
+                callbackTraceFile = callbackTraceFile
             )
         } finally {
             if (!commitHandleClosed.get()) {
@@ -686,10 +767,27 @@ internal object EmbeddedSelfUpdateInstaller {
                     "self_update_permission_approval_call_accepted",
                     "session=$sessionId attempt=$attempt elapsedMs=$elapsed source=$source mode=single_success"
                 )
+                appendDiagnosticTrace(
+                    sessionId,
+                    committedAt,
+                    "permission_approval_accepted",
+                    "attempt" to attempt,
+                    "elapsedMs" to elapsed,
+                    "source" to source
+                )
             } else {
+                val errorSummary = rootCauseSummary(result.exceptionOrNull()).take(220)
+                appendDiagnosticTrace(
+                    sessionId,
+                    committedAt,
+                    "permission_approval_failed",
+                    "attempt" to attempt,
+                    "source" to source,
+                    "error" to errorSummary
+                )
                 log(
                     "self_update_permission_retry",
-                    "session=$sessionId attempt=$attempt source=$source error=${rootCauseSummary(result.exceptionOrNull()).take(220)}"
+                    "session=$sessionId attempt=$attempt source=$source error=$errorSummary"
                 )
             }
         } finally {
@@ -845,7 +943,7 @@ internal object EmbeddedSelfUpdateInstaller {
             .joinToString("") { "%02x".format(it) }
 
     private class ResultIntentSenderBinder(
-        private val onIntent: (Intent?) -> Unit,
+        private val onIntent: (Int, Intent?) -> Unit,
         private val onProtocolFailure: (Throwable) -> Unit
     ) : Binder() {
         override fun onTransact(code: Int, data: Parcel, reply: Parcel?, flags: Int): Boolean {
@@ -858,14 +956,14 @@ internal object EmbeddedSelfUpdateInstaller {
             }
             return try {
                 data.enforceInterface(IINTENT_SENDER_DESCRIPTOR)
-                data.readInt() // result code
+                val sendCode = data.readInt()
                 val intent = readIntent(data)
                 data.readString() // resolvedType
                 data.readStrongBinder() // whitelistToken
                 data.readStrongBinder() // finishedReceiver
                 data.readString() // requiredPermission
                 readBundle(data) // options
-                onIntent(intent)
+                onIntent(sendCode, intent)
                 true
             } catch (error: Throwable) {
                 onProtocolFailure(error)
@@ -878,6 +976,56 @@ internal object EmbeddedSelfUpdateInstaller {
 
         private fun readBundle(parcel: Parcel): Bundle? =
             if (parcel.readInt() != 0) Bundle.CREATOR.createFromParcel(parcel) else null
+    }
+
+    private fun resetDiagnosticTrace(sessionId: Int, committedAt: Long) {
+        synchronized(diagnosticTraceLock) {
+            runCatching {
+                val trace = File(STAGING_ROOT, DIAGNOSTIC_TRACE_NAME)
+                FileOutputStream(trace, false).use { output ->
+                    val line = JSONObject()
+                        .put("event", "trace_start")
+                        .put("sessionId", sessionId)
+                        .put("elapsedMs", (SystemClock.elapsedRealtime() - committedAt).coerceAtLeast(0L))
+                        .put("engineRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
+                        .toString() + "\n"
+                    output.write(line.toByteArray(Charsets.UTF_8))
+                }
+            }.onFailure { error ->
+                log(
+                    "self_update_diagnostic_trace_error",
+                    "session=$sessionId event=trace_start error=${rootCauseSummary(error).take(220)}"
+                )
+            }
+        }
+    }
+
+    private fun appendDiagnosticTrace(
+        sessionId: Int,
+        committedAt: Long,
+        event: String,
+        vararg fields: Pair<String, Any?>
+    ) {
+        synchronized(diagnosticTraceLock) {
+            runCatching {
+                val record = JSONObject()
+                    .put("event", event)
+                    .put("sessionId", sessionId)
+                    .put("elapsedMs", (SystemClock.elapsedRealtime() - committedAt).coerceAtLeast(0L))
+                    .put("engineRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
+                fields.forEach { (key, value) ->
+                    record.put(key, value ?: JSONObject.NULL)
+                }
+                FileOutputStream(File(STAGING_ROOT, DIAGNOSTIC_TRACE_NAME), true).use { output ->
+                    output.write((record.toString() + "\n").toByteArray(Charsets.UTF_8))
+                }
+            }.onFailure { error ->
+                log(
+                    "self_update_diagnostic_trace_error",
+                    "session=$sessionId event=$event error=${rootCauseSummary(error).take(220)}"
+                )
+            }
+        }
     }
 
     private fun intentSenderForBinder(binder: IBinder): IntentSender {
@@ -924,7 +1072,6 @@ internal object EmbeddedSelfUpdateInstaller {
             FileInputStream(fd).use { input ->
                 FileOutputStream(staged).use { output ->
                     input.copyTo(output, DEFAULT_BUFFER_SIZE)
-                    output.fd.sync()
                 }
             }
             require(staged.length() == size) { "snapshot size mismatch" }

@@ -948,7 +948,9 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             "apkSize" to response.optLong("apkSize", -1L),
             "durationMs" to response.optLong("durationMs", -1L),
             "permissionApprovalAttempt" to response.optInt("permissionApprovalAttempt", 0),
-            "permissionApprovalElapsed" to response.optLong("permissionApprovalElapsed", -1L)
+            "permissionApprovalElapsed" to response.optLong("permissionApprovalElapsed", -1L),
+            "callbackCount" to response.optInt("callbackCount", 0),
+            "callbackTraceFile" to response.optString("callbackTraceFile", "")
         )
         return engineResultBundle(ok = true, reason = "", values = values)
     }
