@@ -541,7 +541,11 @@ internal object EmbeddedSelfUpdateInstaller {
                         )
                         return@schedule
                     }
-                    val committed = info.isCommitted
+                    val committed = if (Build.VERSION.SDK_INT >= 29) {
+                        info.isCommitted
+                    } else {
+                        false
+                    }
                     val active = info.isActive
                     val preapprovalRequested = if (Build.VERSION.SDK_INT >= 34) {
                         info.isPreApprovalRequested
