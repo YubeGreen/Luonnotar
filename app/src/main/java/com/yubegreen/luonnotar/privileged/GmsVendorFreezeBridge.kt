@@ -85,6 +85,28 @@ internal sealed interface GmsVendorFreezeBridgeRecord {
         val detail: String
     ) : GmsVendorFreezeBridgeRecord
 
+    /**
+     * r269: transport reconstruction is separate from cgroup thaw. OriginOS can
+     * tear down MCS before a framework unfreeze command can complete, so every
+     * verified thaw edge may immediately queue one bounded GCM reconnect and
+     * watch dedicated MCS ports without waiting for the Java campaign cadence.
+     */
+    data class McsRebuild(
+        val phase: String,
+        val sequence: Long,
+        val generation: Long,
+        val edge: Int,
+        val atCentiseconds: Long,
+        val startedCentiseconds: Long,
+        val latencyCentiseconds: Long,
+        val broadcastCount: Int,
+        val probeCount: Int,
+        val mainPid: Int,
+        val persistentPid: Int,
+        val ports: Set<Int>,
+        val detail: String
+    ) : GmsVendorFreezeBridgeRecord
+
     data class VendorLock(
         val sequence: Long,
         val target: String,
@@ -104,6 +126,7 @@ internal object GmsVendorFreezeBridgeProtocol {
     private const val RECOVERY = "${PREFIX}RECOVERY__\t"
     private const val DEFENSE = "${PREFIX}DEFENSE__\t"
     private const val SHIELD = "${PREFIX}SHIELD__\t"
+    private const val MCS_REBUILD = "${PREFIX}MCS_REBUILD__\t"
     private const val LOCK = "${PREFIX}LOCK__\t"
     private const val DIAGNOSTIC = "${PREFIX}DIAG__\t"
 
@@ -189,6 +212,26 @@ internal object GmsVendorFreezeBridgeProtocol {
                 detail = values["detail"].orEmpty()
             )
         }
+        line.startsWith(MCS_REBUILD) -> fields(line.removePrefix(MCS_REBUILD)).let { values ->
+            GmsVendorFreezeBridgeRecord.McsRebuild(
+                phase = values["phase"].orEmpty().ifBlank { "unknown" },
+                sequence = values["seq"].toLongOrZero(),
+                generation = values["generation"].toLongOrZero(),
+                edge = values["edge"].toIntOrZero(),
+                atCentiseconds = values["atCs"].toLongOrZero(),
+                startedCentiseconds = values["startedCs"].toLongOrZero(),
+                latencyCentiseconds = values["latencyCs"].toLongOrZero(),
+                broadcastCount = values["broadcasts"].toIntOrZero(),
+                probeCount = values["probes"].toIntOrZero(),
+                mainPid = values["mainPid"].toIntOrZero(),
+                persistentPid = values["persistentPid"].toIntOrZero(),
+                ports = values["ports"].orEmpty()
+                    .split(',')
+                    .mapNotNull(String::toIntOrNull)
+                    .toSet(),
+                detail = values["detail"].orEmpty()
+            )
+        }
         line.startsWith(LOCK) -> fields(line.removePrefix(LOCK)).let { values ->
             GmsVendorFreezeBridgeRecord.VendorLock(
                 sequence = values["seq"].toLongOrZero(),
@@ -224,7 +267,7 @@ internal data class GmsVendorDefenseReconnectPlan(
 )
 
 internal object GmsVendorDefensePolicy {
-    const val STRATEGY = "atomic_group_defense_edge_budget"
+    const val STRATEGY = "atomic_group_edge_reconnect_v2"
     const val PULSE_REQUIRED_CENTISECONDS = 1_200L
     const val STABLE_REQUIRED_CENTISECONDS = 1_200L
     const val NO_THAW_ESCALATION_CENTISECONDS = 3_000L
@@ -238,6 +281,24 @@ internal object GmsVendorDefensePolicy {
     // release phases), and the whole PID generation may never spend more than 12.
     const val MAX_EPISODE_COMMANDS = 12
     const val MAX_EDGE_COMMANDS = 4
+
+    // r269: a physical thaw cannot preserve an MCS socket that OriginOS has
+    // already removed. Rebuild transport at the freeze edge instead of waiting
+    // 12 seconds for the legacy stable-hold pulse. The pulse itself is
+    // non-destructive and independently bounded per defense PID generation.
+    const val MCS_REBUILD_MAX_BROADCASTS = 12
+    const val MCS_REBUILD_MIN_BROADCAST_INTERVAL_CENTISECONDS = 200L
+    const val MCS_REBUILD_GUARD_CENTISECONDS = 300L
+    const val MCS_REBUILD_POLL_CENTISECONDS = 20L
+
+    // r269: the previous fixed 30s post-episode retry hold produced a known
+    // delivery dead zone while VIVO kept both GMS cgroups frozen and MCS was
+    // absent. A verified physical-freeze + missing-MCS edge may override that
+    // hold, but only on a bounded cadence; destructive force-stop budgets are
+    // unchanged.
+    const val OUTAGE_HOLD_OVERRIDE_MIN_INTERVAL_CENTISECONDS = 500L
+    const val OUTAGE_HOLD_OVERRIDE_WINDOW_CENTISECONDS = 6_000L
+    const val OUTAGE_HOLD_OVERRIDE_MAX_PER_WINDOW = 6
 
     const val PULSE_REQUIRED_MILLISECONDS = PULSE_REQUIRED_CENTISECONDS * 10L
     const val STABLE_REQUIRED_MILLISECONDS = STABLE_REQUIRED_CENTISECONDS * 10L
@@ -313,6 +374,28 @@ post_force_shield_until_cs=0
 post_force_shield_freeze_seen=0
 post_force_shield_freeze_detected_cs=0
 post_force_shield_last_until_cs=0
+
+# r269 transport-rebuild state. This is owned by the same bridge shell that
+# owns thaw commands; no second command owner or daemon is introduced.
+gms_freeze_edge_started_cs=0
+gms_freeze_edge_index=0
+gms_mcs_rebuild_started_cs=0
+gms_mcs_rebuild_broadcast_count=0
+gms_mcs_rebuild_probe_count=0
+gms_mcs_rebuild_last_broadcast_cs=0
+gms_mcs_rebuild_last_ports=""
+gms_mcs_rebuild_last_phase="never"
+gms_mcs_rebuild_max_broadcasts=${GmsVendorDefensePolicy.MCS_REBUILD_MAX_BROADCASTS}
+gms_mcs_rebuild_min_broadcast_interval_cs=${GmsVendorDefensePolicy.MCS_REBUILD_MIN_BROADCAST_INTERVAL_CENTISECONDS}
+gms_mcs_rebuild_guard_cs=${GmsVendorDefensePolicy.MCS_REBUILD_GUARD_CENTISECONDS}
+gms_mcs_rebuild_poll_cs=${GmsVendorDefensePolicy.MCS_REBUILD_POLL_CENTISECONDS}
+gms_outage_hold_override_last_cs=0
+gms_outage_hold_override_window_started_cs=0
+gms_outage_hold_override_count=0
+gms_outage_hold_override_min_interval_cs=${GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MIN_INTERVAL_CENTISECONDS}
+gms_outage_hold_override_window_cs=${GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_WINDOW_CENTISECONDS}
+gms_outage_hold_override_max=${GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MAX_PER_WINDOW}
+gcm_reconnect_action="com.google.android.intent.action.GCM_RECONNECT"
 monitor_pid=""
 heartbeat_pid=""
 parent_start_ticks=""
@@ -1080,6 +1163,10 @@ start_gms_defense() {
     gms_defense_refreezes=0
     gms_defense_attempts=0
     gms_defense_commands=0
+    gms_mcs_rebuild_broadcast_count=0
+    gms_mcs_rebuild_probe_count=0
+    gms_mcs_rebuild_last_broadcast_cs=0
+    gms_mcs_rebuild_started_cs=0
     gms_defense_last_mode="starting"
     gms_defense_last_detail="initial_freeze"
     gms_defense_plain_rc=125
@@ -1121,6 +1208,10 @@ reset_gms_defense_for_pid_change() {
     gms_defense_refreezes=0
     gms_defense_attempts=0
     gms_defense_commands=0
+    gms_mcs_rebuild_broadcast_count=0
+    gms_mcs_rebuild_probe_count=0
+    gms_mcs_rebuild_last_broadcast_cs=0
+    gms_mcs_rebuild_started_cs=0
     gms_defense_last_mode="pid_generation"
     gms_defense_last_detail="oldMain=${'$'}_old_main,oldPersistent=${'$'}_old_persistent"
     emit_gms_defense started "reason=pid_generation,oldMain=${'$'}_old_main,oldPersistent=${'$'}_old_persistent"
@@ -1214,6 +1305,201 @@ note_post_force_shield_thaw() {
     emit_post_force_shield thawed "${'$'}_shield_latency" "both_gms_cgroups_thawed"
     post_force_shield_freeze_seen=0
     post_force_shield_freeze_detected_cs=0
+}
+
+emit_mcs_rebuild() {
+    _mcs_phase="${'$'}1"
+    _mcs_latency="${'$'}{2:-0}"
+    _mcs_ports="${'$'}{3:-}"
+    _mcs_detail="${'$'}{4:-}"
+    sanitize_detail "${'$'}_mcs_detail"; _mcs_detail="${'$'}SANITIZED_DETAIL"
+    _mcs_generation=0
+    if [ "${'$'}post_force_shield_active" -eq 1 ]; then
+        _mcs_generation="${'$'}post_force_shield_generation"
+    fi
+    printf '__LUONNOTAR_VENDOR_BRIDGE_MCS_REBUILD__\tphase=%s\tseq=%s\tgeneration=%s\tedge=%s\tatCs=%s\tstartedCs=%s\tlatencyCs=%s\tbroadcasts=%s\tprobes=%s\tmainPid=%s\tpersistentPid=%s\tports=%s\tdetail=%s\n' \
+        "${'$'}_mcs_phase" "${'$'}gms_defense_sequence" "${'$'}_mcs_generation" "${'$'}gms_freeze_edge_index" \
+        "${'$'}NOW_CS" "${'$'}gms_mcs_rebuild_started_cs" "${'$'}_mcs_latency" "${'$'}gms_mcs_rebuild_broadcast_count" \
+        "${'$'}gms_mcs_rebuild_probe_count" "${'$'}main_pid" "${'$'}persistent_pid" "${'$'}_mcs_ports" "${'$'}_mcs_detail"
+    gms_mcs_rebuild_last_phase="${'$'}_mcs_phase"
+    gms_mcs_rebuild_last_ports="${'$'}_mcs_ports"
+}
+
+probe_mcs_transport() {
+    _mcs_probe_file="${'$'}base/mcs-probe.out"
+    : > "${'$'}_mcs_probe_file"
+    run_limited ss -H -tn >"${'$'}_mcs_probe_file" 2>/dev/null
+    MCS_PROBE_RC=${'$'}?
+    MCS_OBSERVABLE=0
+    MCS_HEALTHY=0
+    MCS_PORTS=""
+    [ "${'$'}MCS_PROBE_RC" -eq 0 ] || return 0
+    MCS_OBSERVABLE=1
+    MCS_PORTS=${'$'}(awk '
+        BEGIN { out="" }
+        {
+            state=toupper(${'$'}1)
+            if (state != "ESTAB" && state != "ESTABLISHED") next
+            peer=${'$'}5
+            sub(/^.*:/, "", peer)
+            gsub(/]/, "", peer)
+            if (peer == "5228" || peer == "5229" || peer == "5230") {
+                if (!seen[peer]++) {
+                    if (out != "") out=out ","
+                    out=out peer
+                }
+            }
+        }
+        END { printf "%s", out }
+    ' "${'$'}_mcs_probe_file" 2>/dev/null)
+    [ -n "${'$'}MCS_PORTS" ] && MCS_HEALTHY=1
+    return 0
+}
+
+reserve_mcs_rebuild_broadcast() {
+    read_uptime_cs
+    if [ "${'$'}gms_mcs_rebuild_broadcast_count" -ge "${'$'}gms_mcs_rebuild_max_broadcasts" ]; then
+        return 1
+    fi
+    if [ "${'$'}gms_mcs_rebuild_last_broadcast_cs" -gt 0 ] && \
+       [ ${'$'}((NOW_CS - gms_mcs_rebuild_last_broadcast_cs)) -lt "${'$'}gms_mcs_rebuild_min_broadcast_interval_cs" ]; then
+        return 2
+    fi
+    gms_mcs_rebuild_broadcast_count=${'$'}((gms_mcs_rebuild_broadcast_count + 1))
+    gms_mcs_rebuild_last_broadcast_cs="${'$'}NOW_CS"
+    return 0
+}
+
+run_mcs_rebuild_broadcast() {
+    require_command_owner
+    reserve_mcs_rebuild_broadcast
+    _reserve_rc=${'$'}?
+    # Keep reservation outcomes distinct from ActivityManager exit codes. An
+    # `am broadcast` rc=1 is a command failure, not "budget exhausted"; we still
+    # run the short transport guard because GMS may reconnect independently.
+    if [ "${'$'}_reserve_rc" -eq 1 ]; then
+        return 64
+    elif [ "${'$'}_reserve_rc" -eq 2 ]; then
+        return 65
+    fi
+    read_uptime_cs
+    _broadcast_started_cs="${'$'}NOW_CS"
+    _broadcast_file="${'$'}base/mcs-reconnect.out"
+    : > "${'$'}_broadcast_file"
+    _edge_to_broadcast_latency=${'$'}((NOW_CS - gms_mcs_rebuild_started_cs))
+    [ "${'$'}_edge_to_broadcast_latency" -ge 0 ] || _edge_to_broadcast_latency=0
+    emit_mcs_rebuild broadcast_started "${'$'}_edge_to_broadcast_latency" "${'$'}MCS_PORTS" \
+        "async=1"
+    run_limited am broadcast --async --user 0 --receiver-foreground \
+        -a "${'$'}gcm_reconnect_action" -p "${'$'}main_target" >"${'$'}_broadcast_file" 2>&1
+    MCS_BROADCAST_RC=${'$'}?
+    read_uptime_cs
+    _broadcast_latency=${'$'}((NOW_CS - _broadcast_started_cs))
+    [ "${'$'}_broadcast_latency" -ge 0 ] || _broadcast_latency=0
+    sanitize_detail "${'$'}(cat "${'$'}_broadcast_file" 2>/dev/null || true)"; _broadcast_detail="${'$'}SANITIZED_DETAIL"
+    emit_mcs_rebuild broadcast "${'$'}_broadcast_latency" "${'$'}MCS_PORTS" \
+        "async=1,rc=${'$'}MCS_BROADCAST_RC,result=${'$'}_broadcast_detail"
+    return 0
+}
+
+maybe_rebuild_mcs_after_thaw() {
+    _mcs_reason="${'$'}1"
+    [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}persistent_pid" -gt 0 ] || return 0
+    [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ] || return 0
+    read_uptime_cs
+    if [ "${'$'}gms_freeze_edge_started_cs" -gt 0 ]; then
+        gms_mcs_rebuild_started_cs="${'$'}gms_freeze_edge_started_cs"
+    else
+        gms_mcs_rebuild_started_cs="${'$'}NOW_CS"
+    fi
+    gms_mcs_rebuild_probe_count=0
+    probe_mcs_transport
+    gms_mcs_rebuild_probe_count=${'$'}((gms_mcs_rebuild_probe_count + 1))
+    read_uptime_cs
+    _mcs_latency=${'$'}((NOW_CS - gms_mcs_rebuild_started_cs))
+    [ "${'$'}_mcs_latency" -ge 0 ] || _mcs_latency=0
+    if [ "${'$'}MCS_OBSERVABLE" -eq 1 ] && [ "${'$'}MCS_HEALTHY" -eq 1 ]; then
+        gms_defense_pulse_sent=1
+        emit_mcs_rebuild already_healthy "${'$'}_mcs_latency" "${'$'}MCS_PORTS" "reason=${'$'}_mcs_reason"
+        return 0
+    fi
+    if [ "${'$'}MCS_OBSERVABLE" -ne 1 ]; then
+        emit_mcs_rebuild unobservable "${'$'}_mcs_latency" "" "reason=${'$'}_mcs_reason,probeRc=${'$'}MCS_PROBE_RC"
+        return 0
+    fi
+
+    emit_mcs_rebuild started "${'$'}_mcs_latency" "" "reason=${'$'}_mcs_reason,transport_missing_after_thaw"
+    run_mcs_rebuild_broadcast
+    _broadcast_rc=${'$'}?
+    if [ "${'$'}_broadcast_rc" -eq 64 ]; then
+        emit_mcs_rebuild budget_exhausted "${'$'}_mcs_latency" "" \
+            "reason=${'$'}_mcs_reason,maxBroadcasts=${'$'}gms_mcs_rebuild_max_broadcasts"
+        return 0
+    elif [ "${'$'}_broadcast_rc" -eq 65 ]; then
+        emit_mcs_rebuild rate_limited "${'$'}_mcs_latency" "" \
+            "reason=${'$'}_mcs_reason,minIntervalCs=${'$'}gms_mcs_rebuild_min_broadcast_interval_cs"
+        return 0
+    fi
+
+    read_uptime_cs
+    _mcs_deadline_cs=${'$'}((NOW_CS + gms_mcs_rebuild_guard_cs))
+    while [ "${'$'}NOW_CS" -lt "${'$'}_mcs_deadline_cs" ]; do
+        sleep 0.20
+        read_uptime_cs
+        refresh_slot main "${'$'}main_target"
+        refresh_slot persistent "${'$'}persistent_target"
+        if [ "${'$'}main_state" = "frozen" ] || [ "${'$'}persistent_state" = "frozen" ]; then
+            _mcs_latency=${'$'}((NOW_CS - gms_mcs_rebuild_started_cs))
+            [ "${'$'}_mcs_latency" -ge 0 ] || _mcs_latency=0
+            emit_mcs_rebuild interrupted_refreeze "${'$'}_mcs_latency" "" \
+                "reason=${'$'}_mcs_reason,main=${'$'}main_state,persistent=${'$'}persistent_state"
+            return 0
+        fi
+        probe_mcs_transport
+        gms_mcs_rebuild_probe_count=${'$'}((gms_mcs_rebuild_probe_count + 1))
+        if [ "${'$'}MCS_OBSERVABLE" -eq 1 ] && [ "${'$'}MCS_HEALTHY" -eq 1 ]; then
+            read_uptime_cs
+            _mcs_latency=${'$'}((NOW_CS - gms_mcs_rebuild_started_cs))
+            [ "${'$'}_mcs_latency" -ge 0 ] || _mcs_latency=0
+            gms_defense_pulse_sent=1
+            emit_mcs_rebuild restored "${'$'}_mcs_latency" "${'$'}MCS_PORTS" "reason=${'$'}_mcs_reason"
+            return 0
+        fi
+        read_uptime_cs
+    done
+    _mcs_latency=${'$'}((NOW_CS - gms_mcs_rebuild_started_cs))
+    [ "${'$'}_mcs_latency" -ge 0 ] || _mcs_latency=0
+    emit_mcs_rebuild exhausted "${'$'}_mcs_latency" "${'$'}MCS_PORTS" \
+        "reason=${'$'}_mcs_reason,guardCs=${'$'}gms_mcs_rebuild_guard_cs,broadcastRc=${'$'}{MCS_BROADCAST_RC:-125}"
+}
+
+complete_gms_thaw_edge() {
+    _thaw_reason="${'$'}1"
+    note_post_force_shield_thaw
+    if [ "${'$'}gms_freeze_edge_started_cs" -gt 0 ]; then
+        maybe_rebuild_mcs_after_thaw "${'$'}_thaw_reason"
+        gms_freeze_edge_started_cs=0
+    fi
+}
+
+can_override_defense_hold_for_mcs_outage() {
+    read_uptime_cs
+    [ "${'$'}NOW_CS" -lt "${'$'}gms_defense_hold_until_cs" ] || return 1
+    if [ "${'$'}gms_outage_hold_override_window_started_cs" -le 0 ] || \
+       [ ${'$'}((NOW_CS - gms_outage_hold_override_window_started_cs)) -ge "${'$'}gms_outage_hold_override_window_cs" ]; then
+        gms_outage_hold_override_window_started_cs="${'$'}NOW_CS"
+        gms_outage_hold_override_count=0
+    fi
+    [ "${'$'}gms_outage_hold_override_count" -lt "${'$'}gms_outage_hold_override_max" ] || return 1
+    if [ "${'$'}gms_outage_hold_override_last_cs" -gt 0 ] && \
+       [ ${'$'}((NOW_CS - gms_outage_hold_override_last_cs)) -lt "${'$'}gms_outage_hold_override_min_interval_cs" ]; then
+        return 1
+    fi
+    probe_mcs_transport
+    [ "${'$'}MCS_OBSERVABLE" -eq 1 ] && [ "${'$'}MCS_HEALTHY" -eq 0 ] || return 1
+    gms_outage_hold_override_count=${'$'}((gms_outage_hold_override_count + 1))
+    gms_outage_hold_override_last_cs="${'$'}NOW_CS"
+    return 0
 }
 
 defense_release_gms_group() {
@@ -1318,7 +1604,19 @@ tick_gms_defense() {
     read_uptime_cs
     if [ "${'$'}gms_defense_active" -ne 1 ]; then
         [ "${'$'}_def_any_frozen" -eq 1 ] || return 0
-        [ "${'$'}NOW_CS" -ge "${'$'}gms_defense_hold_until_cs" ] || return 0
+        if [ "${'$'}NOW_CS" -lt "${'$'}gms_defense_hold_until_cs" ]; then
+            if can_override_defense_hold_for_mcs_outage; then
+                _hold_remaining=${'$'}((gms_defense_hold_until_cs - NOW_CS))
+                [ "${'$'}_hold_remaining" -ge 0 ] || _hold_remaining=0
+                gms_defense_hold_until_cs=0
+                read_uptime_cs
+                gms_mcs_rebuild_started_cs="${'$'}NOW_CS"
+                emit_mcs_rebuild hold_override 0 "${'$'}MCS_PORTS" \
+                    "remainingCs=${'$'}_hold_remaining,windowCount=${'$'}gms_outage_hold_override_count"
+            else
+                return 0
+            fi
+        fi
         start_gms_defense
     fi
     if [ "${'$'}main_pid" -gt 0 ] && [ "${'$'}persistent_pid" -gt 0 ]; then
@@ -1343,10 +1641,30 @@ tick_gms_defense() {
         fi
         if [ "${'$'}gms_defense_action_armed" -eq 1 ]; then
             gms_defense_action_armed=0
+            gms_freeze_edge_index=${'$'}((gms_freeze_edge_index + 1))
+            gms_freeze_edge_started_cs="${'$'}NOW_CS"
+            gms_mcs_rebuild_started_cs="${'$'}NOW_CS"
+            emit_mcs_rebuild edge_detected 0 "" \
+                "main=${'$'}main_state,persistent=${'$'}persistent_state,shield=${'$'}post_force_shield_active"
+            emit_mcs_rebuild release_started 0 "" \
+                "main=${'$'}main_state,persistent=${'$'}persistent_state"
+            if [ "${'$'}post_force_shield_active" -eq 1 ]; then
+                emit_post_force_shield release_started 0 \
+                    "edge=${'$'}gms_freeze_edge_index,main=${'$'}main_state,persistent=${'$'}persistent_state"
+            fi
             defense_release_gms_group "${'$'}((gms_defense_refreezes + 1))" || true
             read_uptime_cs
+            _release_latency=${'$'}((NOW_CS - gms_freeze_edge_started_cs))
+            [ "${'$'}_release_latency" -ge 0 ] || _release_latency=0
+            emit_mcs_rebuild release_commands_done "${'$'}_release_latency" "" \
+                "main=${'$'}main_state,persistent=${'$'}persistent_state,mode=${'$'}gms_defense_last_mode"
+            if [ "${'$'}post_force_shield_active" -eq 1 ]; then
+                emit_post_force_shield release_commands_done "${'$'}_release_latency" \
+                    "edge=${'$'}gms_freeze_edge_index,main=${'$'}main_state,persistent=${'$'}persistent_state"
+            fi
             if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
-                note_post_force_shield_thaw
+                complete_gms_thaw_edge "defense_release"
+                read_uptime_cs
                 gms_defense_stable_since_cs="${'$'}NOW_CS"
                 gms_defense_last_thawed_cs="${'$'}NOW_CS"
                 # Re-arm only after an observed physical thaw. A subsequent
@@ -1375,7 +1693,8 @@ tick_gms_defense() {
     fi
 
     if [ "${'$'}main_state" = "thawed" ] && [ "${'$'}persistent_state" = "thawed" ]; then
-        note_post_force_shield_thaw
+        complete_gms_thaw_edge "observed_thawed"
+        read_uptime_cs
         gms_defense_action_armed=1
         if [ "${'$'}gms_defense_stable_since_cs" -le 0 ]; then
             gms_defense_stable_since_cs="${'$'}NOW_CS"

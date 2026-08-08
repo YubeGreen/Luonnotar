@@ -258,6 +258,26 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsPostForceStopShieldExpiredCount = 0L
     private var gmsPostForceStopShieldLastThawLatencyMs = 0L
     private var gmsPostForceStopShieldMaxThawLatencyMs = 0L
+    // r269: the bridge now treats thaw and MCS reconstruction as separate
+    // operations. These counters expose the fast edge-local reconnect path so
+    // real-device tests can distinguish "process thawed" from "5228 rebuilt".
+    private var gmsBridgeMcsRebuildStartedCount = 0L
+    private var gmsBridgeMcsRebuildBroadcastCount = 0L
+    private var gmsBridgeMcsRebuildRestoredCount = 0L
+    private var gmsBridgeMcsRebuildAlreadyHealthyCount = 0L
+    private var gmsBridgeMcsRebuildUnobservableCount = 0L
+    private var gmsBridgeMcsRebuildExhaustedCount = 0L
+    private var gmsBridgeMcsRebuildInterruptedRefreezeCount = 0L
+    private var gmsBridgeMcsRebuildRateLimitedCount = 0L
+    private var gmsBridgeMcsRebuildBudgetExhaustedCount = 0L
+    private var gmsBridgeMcsRebuildHoldOverrideCount = 0L
+    private var gmsBridgeMcsRebuildLastSequence = 0L
+    private var gmsBridgeMcsRebuildLastGeneration = 0L
+    private var gmsBridgeMcsRebuildLastEdge = 0
+    private var gmsBridgeMcsRebuildLastPhase = "never"
+    private var gmsBridgeMcsRebuildLastLatencyMs = 0L
+    private var gmsBridgeMcsRebuildMaxRestoreLatencyMs = 0L
+    private var gmsBridgeMcsRebuildLastPorts: Set<Int> = emptySet()
     private val gmsRecoveryHistory = ArrayDeque<Long>()
     private val gmsForceStopHistory = ArrayDeque<Long>()
     private var gmsRecoveryInProgress = false
@@ -1580,6 +1600,75 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         "untilMs=${record.untilCentiseconds * 10L} latencyMs=$latencyMs " +
                         "commands=${record.commandCount} mainPid=${record.mainPid} " +
                         "persistentPid=${record.persistentPid} detail=${record.detail.take(240)}"
+                )
+                persistStatusLocked(force = true)
+            }
+            is GmsVendorFreezeBridgeRecord.McsRebuild -> synchronized(lock) {
+                if (vendorBridgeProcess !== process) return@synchronized
+                val nowElapsed = SystemClock.elapsedRealtime()
+                val latencyMs = (record.latencyCentiseconds * 10L).coerceAtLeast(0L)
+                gmsBridgeMcsRebuildLastSequence = record.sequence
+                gmsBridgeMcsRebuildLastGeneration = record.generation
+                gmsBridgeMcsRebuildLastEdge = record.edge
+                gmsBridgeMcsRebuildLastPhase = record.phase
+                gmsBridgeMcsRebuildLastLatencyMs = latencyMs
+                gmsBridgeMcsRebuildLastPorts = record.ports
+                when (record.phase) {
+                    "started" -> gmsBridgeMcsRebuildStartedCount += 1
+                    "broadcast" -> {
+                        gmsBridgeMcsRebuildBroadcastCount += 1
+                        actionCount += 1
+                    }
+                    "restored" -> {
+                        gmsBridgeMcsRebuildRestoredCount += 1
+                        gmsBridgeMcsRebuildMaxRestoreLatencyMs = maxOf(
+                            gmsBridgeMcsRebuildMaxRestoreLatencyMs,
+                            latencyMs
+                        )
+                        if (record.ports.isNotEmpty()) {
+                            applyGmsTransportProbeLocked(
+                                probe = GmsTransportProbe(
+                                    observable = true,
+                                    establishedPorts = record.ports,
+                                    detail = "bridgeSeq=${record.sequence} edge=${record.edge} " +
+                                        "latencyMs=$latencyMs"
+                                ),
+                                now = nowElapsed,
+                                persistentRunning = record.persistentPid > 0,
+                                source = "vendor_bridge_mcs_rebuild"
+                            )
+                        }
+                    }
+                    "already_healthy" -> {
+                        gmsBridgeMcsRebuildAlreadyHealthyCount += 1
+                        if (record.ports.isNotEmpty()) {
+                            applyGmsTransportProbeLocked(
+                                probe = GmsTransportProbe(
+                                    observable = true,
+                                    establishedPorts = record.ports,
+                                    detail = "bridgeSeq=${record.sequence} edge=${record.edge} alreadyHealthy=1"
+                                ),
+                                now = nowElapsed,
+                                persistentRunning = record.persistentPid > 0,
+                                source = "vendor_bridge_mcs_rebuild"
+                            )
+                        }
+                    }
+                    "unobservable" -> gmsBridgeMcsRebuildUnobservableCount += 1
+                    "exhausted" -> gmsBridgeMcsRebuildExhaustedCount += 1
+                    "interrupted_refreeze" -> gmsBridgeMcsRebuildInterruptedRefreezeCount += 1
+                    "rate_limited" -> gmsBridgeMcsRebuildRateLimitedCount += 1
+                    "budget_exhausted" -> gmsBridgeMcsRebuildBudgetExhaustedCount += 1
+                    "hold_override" -> gmsBridgeMcsRebuildHoldOverrideCount += 1
+                }
+                eventLocked(
+                    "vendor_bridge_mcs_rebuild_${record.phase}",
+                    "seq=${record.sequence} generation=${record.generation} edge=${record.edge} " +
+                        "atMs=${record.atCentiseconds * 10L} " +
+                        "startedMs=${record.startedCentiseconds * 10L} latencyMs=$latencyMs " +
+                        "broadcasts=${record.broadcastCount} probes=${record.probeCount} " +
+                        "mainPid=${record.mainPid} persistentPid=${record.persistentPid} " +
+                        "ports=${record.ports.sorted()} detail=${record.detail.take(300)}"
                 )
                 persistStatusLocked(force = true)
             }
@@ -6470,6 +6559,21 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 details = details,
                 reason = destructiveReason
             )
+            if (campaign.deferredForceStopContinuation) {
+                // The gate-time authorization guarded the destructive action and
+                // has now been consumed. Do not revalidate it on a later healthy
+                // successor tick and mislabel the completed action as cancelled.
+                campaign.deferredForceStopContinuation = false
+                eventLocked(
+                    "gms_recovery_deferred_force_stop_authorization_consumed",
+                    "generation=${campaign.generation} " +
+                        "originGeneration=${campaign.continuationOriginGeneration} " +
+                        "reset=${campaign.resetCount} authorization=" +
+                        campaign.continuationAuthorizationSource +
+                        " authorizedAt=${campaign.continuationAuthorizedElapsed} " +
+                        "remainingOldPids=${remainingOldPids.sorted()}"
+                )
+            }
         } else if (!stopAppSucceeded) {
             details += "am_force_stop:deferred_$forceStopBlockReason"
             eventLocked(
@@ -7648,6 +7752,38 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("maxThawLatencyMs", gmsPostForceStopShieldMaxThawLatencyMs)
             .put("markerPath", GmsVendorFreezeBridgeScript.POST_FORCE_STOP_SHIELD_PATH)
         )
+        .put("gmsBridgeMcsRebuild", JSONObject()
+            .put("strategy", GmsVendorDefensePolicy.STRATEGY)
+            .put("startedCount", gmsBridgeMcsRebuildStartedCount)
+            .put("broadcastCount", gmsBridgeMcsRebuildBroadcastCount)
+            .put("restoredCount", gmsBridgeMcsRebuildRestoredCount)
+            .put("alreadyHealthyCount", gmsBridgeMcsRebuildAlreadyHealthyCount)
+            .put("unobservableCount", gmsBridgeMcsRebuildUnobservableCount)
+            .put("exhaustedCount", gmsBridgeMcsRebuildExhaustedCount)
+            .put("interruptedRefreezeCount", gmsBridgeMcsRebuildInterruptedRefreezeCount)
+            .put("rateLimitedCount", gmsBridgeMcsRebuildRateLimitedCount)
+            .put("budgetExhaustedCount", gmsBridgeMcsRebuildBudgetExhaustedCount)
+            .put("holdOverrideCount", gmsBridgeMcsRebuildHoldOverrideCount)
+            .put("lastSequence", gmsBridgeMcsRebuildLastSequence)
+            .put("lastGeneration", gmsBridgeMcsRebuildLastGeneration)
+            .put("lastEdge", gmsBridgeMcsRebuildLastEdge)
+            .put("lastPhase", gmsBridgeMcsRebuildLastPhase)
+            .put("lastLatencyMs", gmsBridgeMcsRebuildLastLatencyMs)
+            .put("maxRestoreLatencyMs", gmsBridgeMcsRebuildMaxRestoreLatencyMs)
+            .put("lastPorts", JSONArray(gmsBridgeMcsRebuildLastPorts.toList().sorted()))
+            .put("maxBroadcastsPerDefenseGeneration",
+                GmsVendorDefensePolicy.MCS_REBUILD_MAX_BROADCASTS)
+            .put("minBroadcastIntervalMs",
+                GmsVendorDefensePolicy.MCS_REBUILD_MIN_BROADCAST_INTERVAL_CENTISECONDS * 10L)
+            .put("guardMs", GmsVendorDefensePolicy.MCS_REBUILD_GUARD_CENTISECONDS * 10L)
+            .put("pollMs", GmsVendorDefensePolicy.MCS_REBUILD_POLL_CENTISECONDS * 10L)
+            .put("holdOverrideMinIntervalMs",
+                GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MIN_INTERVAL_CENTISECONDS * 10L)
+            .put("holdOverrideWindowMs",
+                GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_WINDOW_CENTISECONDS * 10L)
+            .put("holdOverrideMaxPerWindow",
+                GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MAX_PER_WINDOW)
+        )
         .put("gmsRecoveryAttemptCount", gmsRecoveryAttemptCount)
         .put("gmsRecoverySuccessCount", gmsRecoverySuccessCount)
         .put("gmsRecoveryGeneration", gmsRecoveryGeneration)
@@ -8092,7 +8228,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 27
+        private const val STATUS_SCHEMA = 28
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

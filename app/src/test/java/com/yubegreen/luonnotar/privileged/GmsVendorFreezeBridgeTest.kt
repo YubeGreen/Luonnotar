@@ -16,13 +16,20 @@ class GmsVendorFreezeBridgeTest {
         assertEquals(120_000L, GmsVendorDefensePolicy.STABLE_HOLD_MILLISECONDS)
         assertEquals(12, GmsVendorDefensePolicy.MAX_EPISODE_COMMANDS)
         assertEquals(4, GmsVendorDefensePolicy.MAX_EDGE_COMMANDS)
+        assertEquals(12, GmsVendorDefensePolicy.MCS_REBUILD_MAX_BROADCASTS)
+        assertEquals(200L, GmsVendorDefensePolicy.MCS_REBUILD_MIN_BROADCAST_INTERVAL_CENTISECONDS)
+        assertEquals(300L, GmsVendorDefensePolicy.MCS_REBUILD_GUARD_CENTISECONDS)
+        assertEquals(20L, GmsVendorDefensePolicy.MCS_REBUILD_POLL_CENTISECONDS)
+        assertEquals(500L, GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MIN_INTERVAL_CENTISECONDS)
+        assertEquals(6_000L, GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_WINDOW_CENTISECONDS)
+        assertEquals(6, GmsVendorDefensePolicy.OUTAGE_HOLD_OVERRIDE_MAX_PER_WINDOW)
     }
 
     @Test
     fun parsesReadyHeartbeatDefenseRecoveryAndLockRecords() {
         val ready = GmsVendorFreezeBridgeProtocol.parse(
             "__LUONNOTAR_VENDOR_BRIDGE_READY__\ttimeout=1\tsticky=1" +
-                "\tstrategy=atomic_group_defense_edge_budget\tshellPid=77" +
+                "\tstrategy=atomic_group_edge_reconnect_v2\tshellPid=77" +
                 "\tparentStartTicks=1001\tshellStartTicks=1002" +
                 "\theartbeatPath=/data/local/tmp/hb\townerPath=/data/local/tmp/owner"
         ) as GmsVendorFreezeBridgeRecord.Ready
@@ -61,6 +68,20 @@ class GmsVendorFreezeBridgeTest {
         assertEquals(41, shield.mainPid)
         assertEquals(42, shield.persistentPid)
 
+        val mcsRebuild = GmsVendorFreezeBridgeProtocol.parse(
+            "__LUONNOTAR_VENDOR_BRIDGE_MCS_REBUILD__\tphase=restored" +
+                "\tseq=18\tgeneration=3\tedge=7\tatCs=7000\tstartedCs=6500" +
+                "\tlatencyCs=500\tbroadcasts=2\tprobes=6\tmainPid=51" +
+                "\tpersistentPid=52\tports=5228,5230\tdetail=ok"
+        ) as GmsVendorFreezeBridgeRecord.McsRebuild
+        assertEquals("restored", mcsRebuild.phase)
+        assertEquals(18L, mcsRebuild.sequence)
+        assertEquals(3L, mcsRebuild.generation)
+        assertEquals(7, mcsRebuild.edge)
+        assertEquals(5_000L, mcsRebuild.latencyCentiseconds * 10L)
+        assertEquals(2, mcsRebuild.broadcastCount)
+        assertEquals(6, mcsRebuild.probeCount)
+        assertEquals(setOf(5228, 5230), mcsRebuild.ports)
 
         val defense = GmsVendorFreezeBridgeProtocol.parse(
             "__LUONNOTAR_VENDOR_BRIDGE_DEFENSE__\tseq=8\tphase=refrozen" +
@@ -164,6 +185,25 @@ class GmsVendorFreezeBridgeTest {
         assertTrue(script.contains("note_post_force_shield_freeze"))
         assertTrue(script.contains("note_post_force_shield_thaw"))
         assertTrue(script.contains("__LUONNOTAR_VENDOR_BRIDGE_SHIELD__"))
+        assertTrue(script.contains("release_started"))
+        assertTrue(script.contains("release_commands_done"))
+        assertTrue(script.contains("__LUONNOTAR_VENDOR_BRIDGE_MCS_REBUILD__"))
+        assertTrue(script.contains("probe_mcs_transport"))
+        assertTrue(script.contains("maybe_rebuild_mcs_after_thaw"))
+        assertTrue(script.contains("complete_gms_thaw_edge"))
+        assertTrue(script.contains("emit_mcs_rebuild release_started"))
+        assertTrue(script.contains("emit_mcs_rebuild release_commands_done"))
+        assertTrue(script.contains("emit_mcs_rebuild broadcast_started"))
+        assertTrue(script.contains("com.google.android.intent.action.GCM_RECONNECT"))
+        assertTrue(script.contains("am broadcast --async --user 0 --receiver-foreground"))
+        assertTrue(script.contains("interrupted_refreeze"))
+        assertTrue(script.contains("hold_override"))
+        assertTrue(script.contains("gms_mcs_rebuild_max_broadcasts=12"))
+        assertTrue(script.contains("gms_mcs_rebuild_guard_cs=300"))
+        assertTrue(script.contains("gms_mcs_rebuild_poll_cs=20"))
+        assertTrue(script.contains("gms_outage_hold_override_min_interval_cs=500"))
+        assertTrue(script.contains("gms_outage_hold_override_window_cs=6000"))
+        assertTrue(script.contains("gms_outage_hold_override_max=6"))
         assertTrue(script.contains("aux_due_cs"))
         assertTrue(script.contains("strategy=${GmsVendorDefensePolicy.STRATEGY}"))
         assertTrue(script.contains("start_gms_defense"))
