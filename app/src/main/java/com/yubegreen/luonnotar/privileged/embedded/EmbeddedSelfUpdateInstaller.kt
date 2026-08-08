@@ -1,5 +1,6 @@
 package com.yubegreen.luonnotar.privileged.embedded
 
+import android.annotation.SuppressLint
 import android.content.Intent
 import android.content.IntentSender
 import android.content.pm.PackageInfo
@@ -254,6 +255,7 @@ internal object EmbeddedSelfUpdateInstaller {
         }
     }
 
+    @SuppressLint("SoonBlockedPrivateApi")
     private fun writeSessionFromFd(session: PackageInstaller.Session, apk: File) {
         val method = PackageInstaller.Session::class.java.getDeclaredMethod(
             "write",
