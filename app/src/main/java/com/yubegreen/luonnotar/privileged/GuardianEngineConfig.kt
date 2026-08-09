@@ -35,7 +35,10 @@ data class GuardianEngineConfig(
     val gmsTransportLostMs: Long = 4 * 60_000L,
     val gmsTransportVerifyWaitMs: Long = 60_000L,
     val sshGuardianEnabled: Boolean = true,
-    val sshPort: Int = 8025
+    val sshPort: Int = 8025,
+    val adbTcp5555RecoveryEnabled: Boolean = true,
+    val termuxSshdRecoveryEnabled: Boolean = true,
+    val termuxSshPort: Int = 8022
 ) {
     fun normalized(): GuardianEngineConfig = copy(
         processTargets = processTargets
@@ -64,7 +67,8 @@ data class GuardianEngineConfig(
             gmsTransportMissingAfterBadAuthMs.coerceIn(30_000L, 15 * 60_000L),
         gmsTransportLostMs = gmsTransportLostMs.coerceIn(2 * 60_000L, 30 * 60_000L),
         gmsTransportVerifyWaitMs = gmsTransportVerifyWaitMs.coerceIn(15_000L, 3 * 60_000L),
-        sshPort = sshPort.coerceIn(1024, 65535)
+        sshPort = sshPort.coerceIn(1024, 65535),
+        termuxSshPort = termuxSshPort.coerceIn(1024, 65535)
     )
 
     fun toJson(): String = JSONObject()
@@ -97,10 +101,13 @@ data class GuardianEngineConfig(
         .put("gmsTransportVerifyWaitMs", gmsTransportVerifyWaitMs)
         .put("sshGuardianEnabled", sshGuardianEnabled)
         .put("sshPort", sshPort)
+        .put("adbTcp5555RecoveryEnabled", adbTcp5555RecoveryEnabled)
+        .put("termuxSshdRecoveryEnabled", termuxSshdRecoveryEnabled)
+        .put("termuxSshPort", termuxSshPort)
         .toString()
 
     companion object {
-        const val SCHEMA = 8
+        const val SCHEMA = 9
 
         val DEFAULT_PROCESS_TARGETS = listOf(
             "com.google.android.gms",
@@ -191,7 +198,12 @@ data class GuardianEngineConfig(
                         json.optLong("gmsTransportVerifyWaitMs", 60_000L),
                     sshGuardianEnabled = if (schema < 8) true else
                         json.optBoolean("sshGuardianEnabled", true),
-                    sshPort = if (schema < 8) 8025 else json.optInt("sshPort", 8025)
+                    sshPort = if (schema < 8) 8025 else json.optInt("sshPort", 8025),
+                    adbTcp5555RecoveryEnabled =
+                        if (schema < 9) true else json.optBoolean("adbTcp5555RecoveryEnabled", true),
+                    termuxSshdRecoveryEnabled =
+                        if (schema < 9) true else json.optBoolean("termuxSshdRecoveryEnabled", true),
+                    termuxSshPort = if (schema < 9) 8022 else json.optInt("termuxSshPort", 8022)
                 ).normalized()
             }.getOrElse { GuardianEngineConfig() }
         }

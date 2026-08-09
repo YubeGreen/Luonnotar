@@ -370,6 +370,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var adbTcp5555ProbeCount = 0L
     private var adbTcp5555RecoveryCount = 0L
     private var adbTcp5555ListenerPresent = false
+    private var adbTcp5555WirelessPort = -1
+    private var adbTcp5555WirelessPortSource = "none"
+    private var adbTcp5555WirelessPortLastResolveElapsed = 0L
+    private var adbTcp5555WirelessPortLastResolveResult = "never"
     private var termuxSshdEligible = false
     private var termuxSshdObservedHealthy = false
     private var termuxSshdRunning = false
@@ -4338,7 +4342,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             AdbTcpPortHealthPolicy.listeningOnPort(socketResult.stdout)
         val configured = adbTcp5555ConfiguredLocked()
         adbTcp5555Configured = configured
-        val armed = adbTcp5555ObservedHealthy || configured
+        // v128: recovery intent is configuration, not volatile history. adb usb
+        // kills the shell engine, so "observed healthy" cannot be the only arm
+        // bit or a freshly respawned engine would refuse to restore :5555.
+        val armed = config.adbTcp5555RecoveryEnabled
         val changed = listenerPresent != adbTcp5555ListenerPresent
         adbTcp5555ListenerPresent = listenerPresent
 
@@ -4388,9 +4395,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         adbTcp5555LastRecoveryElapsed = now
         adbTcp5555RecoveryCount += 1
+        val wirelessPort = resolveAdbWirelessPortLocked(now)
+        val extras = buildList {
+            if (wirelessPort != null) {
+                add("--extra")
+                add("$RESCUE_EXTRA_WIRELESS_PORT:i:$wirelessPort")
+                add("--extra")
+                add("$RESCUE_EXTRA_WIRELESS_PORT_SOURCE:s:binder_tx10")
+            }
+        }
         val dispatch = dispatchRescueProviderLocked(
             method = RESCUE_METHOD_ADB_5555,
-            reason = "adb_tcp_5555_listener_missing"
+            reason = "adb_tcp_5555_listener_missing",
+            extras = extras
         )
         eventLocked(
             if (dispatch.success && dispatch.stdout.contains("ok=true")) {
@@ -4414,7 +4431,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         termuxSshdLastProbeElapsed = now
         termuxSshdProbeCount += 1
         termuxSshdEligible =
-            "com.termux" in config.packageTargets && packageInstalled("com.termux")
+            config.termuxSshdRecoveryEnabled &&
+                "com.termux" in config.packageTargets &&
+                packageInstalled("com.termux")
         if (!termuxSshdEligible) {
             termuxSshdRunning = false
             termuxSshdMissingSinceElapsed = 0L
@@ -4422,7 +4441,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         val pidof = runner.run("pidof", "sshd", timeoutMs = TERMUX_SSHD_PROBE_TIMEOUT_MS)
-        val runningNow = pidof.success && TermuxSshdHealthPolicy.processRunning(pidof.stdout)
+        val sockets = runner.run("ss", "-H", "-ltn", timeoutMs = SOCKET_PROBE_TIMEOUT_MS)
+        val processRunning = pidof.success && TermuxSshdHealthPolicy.processRunning(pidof.stdout)
+        val listenerPresent = sockets.success &&
+            TermuxSshdHealthPolicy.listeningOnPort(sockets.stdout, config.termuxSshPort)
+        val runningNow = processRunning && listenerPresent
         val changed = runningNow != termuxSshdRunning
         termuxSshdRunning = runningNow
         if (runningNow) {
@@ -4430,7 +4453,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             termuxSshdLastHealthyElapsed = now
             termuxSshdMissingSinceElapsed = 0L
             if (changed) {
-                eventLocked("termux_sshd_healthy", "pids=${pidof.stdout.trim().take(120)}")
+                eventLocked(
+                    "termux_sshd_healthy",
+                    "port=${config.termuxSshPort} pids=${pidof.stdout.trim().take(120)}"
+                )
             }
             return
         }
@@ -4439,7 +4465,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             termuxSshdMissingSinceElapsed = now
             eventLocked(
                 "termux_sshd_missing",
-                "observedHealthy=$termuxSshdObservedHealthy probe=${pidof.summary()}"
+                "observedHealthy=$termuxSshdObservedHealthy port=${config.termuxSshPort} " +
+                    "pid=${pidof.summary()} socket=${sockets.summary()}"
             )
         }
         if (
@@ -4471,11 +4498,74 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
     }
 
-    private fun dispatchRescueProviderLocked(method: String, reason: String): GuardianCommandResult {
-        val result = runner.run(
+    private fun resolveAdbWirelessPortLocked(now: Long): Int? {
+        adbTcp5555WirelessPortLastResolveElapsed = now
+        val supported = runner.run(
+            "service", "call", "adb",
+            AdbWirelessPortResolver.WIFI_SUPPORTED_TRANSACTION.toString(),
+            timeoutMs = ADB_BINDER_QUERY_TIMEOUT_MS
+        )
+        val wifiSupported = if (supported.success) {
+            AdbWirelessPortResolver.parseBooleanParcel(supported.stdout)
+        } else {
+            null
+        }
+        if (wifiSupported != true) {
+            adbTcp5555WirelessPort = -1
+            adbTcp5555WirelessPortSource = "none"
+            adbTcp5555WirelessPortLastResolveResult =
+                "wifi_supported=${wifiSupported ?: "unknown"} ${supported.summary()}"
+            eventLocked(
+                "adb_wireless_port_unavailable",
+                adbTcp5555WirelessPortLastResolveResult
+            )
+            return null
+        }
+
+        val portResult = runner.run(
+            "service", "call", "adb",
+            AdbWirelessPortResolver.GET_WIRELESS_PORT_TRANSACTION.toString(),
+            timeoutMs = ADB_BINDER_QUERY_TIMEOUT_MS
+        )
+        val port = if (portResult.success) {
+            AdbWirelessPortResolver.parsePortParcel(portResult.stdout)
+        } else {
+            null
+        }
+        if (port == null) {
+            adbTcp5555WirelessPort = -1
+            adbTcp5555WirelessPortSource = "none"
+            adbTcp5555WirelessPortLastResolveResult = portResult.summary()
+            eventLocked(
+                "adb_wireless_port_unavailable",
+                "tx=${AdbWirelessPortResolver.GET_WIRELESS_PORT_TRANSACTION} " +
+                    portResult.summary()
+            )
+            return null
+        }
+
+        adbTcp5555WirelessPort = port
+        adbTcp5555WirelessPortSource = "binder_tx10"
+        adbTcp5555WirelessPortLastResolveResult = "port=$port"
+        eventLocked(
+            "adb_wireless_port_resolved",
+            "source=binder_tx10 port=$port"
+        )
+        return port
+    }
+
+    private fun dispatchRescueProviderLocked(
+        method: String,
+        reason: String,
+        extras: List<String> = emptyList()
+    ): GuardianCommandResult {
+        val command = mutableListOf(
             "content", "call",
             "--uri", RESCUE_PROVIDER_URI,
-            "--method", method,
+            "--method", method
+        ).apply { addAll(extras) }
+        val result = runner.run(
+            command,
             timeoutMs = RESCUE_PROVIDER_TIMEOUT_MS
         )
         actionCount += 1
@@ -8215,7 +8305,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastMcsConnectAttemptElapsed", lastGmsMcsConnectAttemptElapsed)
         )
         .put("adbTcp5555", JSONObject()
-            .put("armed", adbTcp5555ObservedHealthy || adbTcp5555Configured)
+            .put("recoveryEnabled", config.adbTcp5555RecoveryEnabled)
+            .put("armed", config.adbTcp5555RecoveryEnabled)
             .put("configured", adbTcp5555Configured)
             .put("listenerPresent", adbTcp5555ListenerPresent)
             .put("observedHealthy", adbTcp5555ObservedHealthy)
@@ -8225,8 +8316,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastRecoveryElapsed", adbTcp5555LastRecoveryElapsed)
             .put("probeCount", adbTcp5555ProbeCount)
             .put("recoveryCount", adbTcp5555RecoveryCount)
+            .put("wirelessPort", if (adbTcp5555WirelessPort > 0) {
+                adbTcp5555WirelessPort
+            } else {
+                JSONObject.NULL
+            })
+            .put("wirelessPortSource", adbTcp5555WirelessPortSource)
+            .put("wirelessPortLastResolveElapsed", adbTcp5555WirelessPortLastResolveElapsed)
+            .put("wirelessPortLastResolveResult", adbTcp5555WirelessPortLastResolveResult)
         )
         .put("termuxSshd", JSONObject()
+            .put("recoveryEnabled", config.termuxSshdRecoveryEnabled)
+            .put("port", config.termuxSshPort)
             .put("eligible", termuxSshdEligible)
             .put("observedHealthy", termuxSshdObservedHealthy)
             .put("running", termuxSshdRunning)
@@ -8567,7 +8668,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 54
+        private const val STATUS_SCHEMA = 55
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
@@ -8631,11 +8732,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_FROZEN_TRANSPORT_PROBE_INTERVAL_MS = 10_000L
         private const val SOCKET_PROBE_TIMEOUT_MS = 4_000L
         private const val TERMUX_SSHD_PROBE_TIMEOUT_MS = 1_500L
+        private const val ADB_BINDER_QUERY_TIMEOUT_MS = 2_000L
         private const val RESCUE_PROVIDER_TIMEOUT_MS = 3_000L
         private const val RESCUE_PROVIDER_URI =
             "content://com.yubegreen.luonnotar.adb_runtime_config"
         private const val RESCUE_METHOD_ADB_5555 = "rescue_adb_5555"
         private const val RESCUE_METHOD_TERMUX_SSHD = "rescue_termux_sshd"
+        private const val RESCUE_EXTRA_WIRELESS_PORT = "wireless_port"
+        private const val RESCUE_EXTRA_WIRELESS_PORT_SOURCE = "wireless_port_source"
         private const val PACKAGE_KILL_TIMEOUT_MS = 8_000L
         private const val PACKAGE_STOP_APP_TIMEOUT_MS = 8_000L
         private const val PACKAGE_FORCE_STOP_TIMEOUT_MS = 10_000L

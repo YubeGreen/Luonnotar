@@ -115,7 +115,13 @@ class EmbeddedAdbService : Service() {
                     .orEmpty()
                     .ifBlank { "engine_restart" }
             )
-            ACTION_RECOVER_ADB_5555 -> startAdbTcp5555Recovery(generation)
+            ACTION_RECOVER_ADB_5555 -> startAdbTcp5555Recovery(
+                generation = generation,
+                preferredWirelessPort = command.getIntExtra(EXTRA_RECOVERY_WIRELESS_PORT, -1),
+                preferredWirelessPortSource = command
+                    .getStringExtra(EXTRA_RECOVERY_WIRELESS_PORT_SOURCE)
+                    .orEmpty()
+            )
             ACTION_PAIR -> {
                 val code = RemoteInput.getResultsFromIntent(command)
                     ?.getCharSequence(EmbeddedGuardianNotifier.REMOTE_INPUT_KEY)
@@ -178,15 +184,29 @@ class EmbeddedAdbService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
-    private fun startAdbTcp5555Recovery(generation: Long) {
+    private fun startAdbTcp5555Recovery(
+        generation: Long,
+        preferredWirelessPort: Int,
+        preferredWirelessPortSource: String
+    ) {
         if (!isActive(generation)) return
         LogManager.event(
             this,
             "adb_tcp_5555_recovery_started",
-            mapOf("generation" to generation)
+            mapOf(
+                "generation" to generation,
+                "preferredWirelessPort" to preferredWirelessPort,
+                "preferredWirelessPortSource" to preferredWirelessPortSource.take(80)
+            )
         )
         executor.execute {
-            val result = runCatching { recoverAdbTcp5555(generation) }
+            val result = runCatching {
+                recoverAdbTcp5555(
+                    generation = generation,
+                    preferredWirelessPort = preferredWirelessPort,
+                    preferredWirelessPortSource = preferredWirelessPortSource
+                )
+            }
             val recovered = result.getOrDefault(false)
             LogManager.event(
                 this,
@@ -206,23 +226,41 @@ class EmbeddedAdbService : Service() {
      * wireless-debugging endpoint. The request is sent to adbd itself using the
      * existing Kadb identity; shell setprop is intentionally not used.
      */
-    private fun recoverAdbTcp5555(generation: Long): Boolean {
+    private data class AdbRecoveryEndpoint(val port: Int, val source: String)
+
+    private fun recoverAdbTcp5555(
+        generation: Long,
+        preferredWirelessPort: Int,
+        preferredWirelessPortSource: String
+    ): Boolean {
         if (!isActive(generation)) return false
         if (probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)) return true
         val snapshot = EmbeddedGuardianStore.snapshot(this)
         check(snapshot.paired) { "wireless ADB identity is not paired" }
         EmbeddedAdbIdentity.ensure(this)
 
-        val ports = LinkedBlockingQueue<Int>()
+        val ports = LinkedBlockingQueue<AdbRecoveryEndpoint>()
         val seen = linkedSetOf<Int>()
+        preferredWirelessPort
+            .takeIf { it in 1..65535 && it != ADB_TCP_RECOVERY_PORT }
+            ?.let { port ->
+                ports.offer(
+                    AdbRecoveryEndpoint(
+                        port = port,
+                        source = preferredWirelessPortSource.ifBlank { "provider" }
+                    )
+                )
+            }
         snapshot.connectPort
             .takeIf { it in 1..65535 && it != ADB_TCP_RECOVERY_PORT }
-            ?.let(ports::offer)
+            ?.let { port -> ports.offer(AdbRecoveryEndpoint(port, "snapshot")) }
         val localDiscovery = WirelessAdbDiscovery(
             context = this,
             onPairingPort = {},
             onConnectPort = { port ->
-                if (port in 1..65535 && port != ADB_TCP_RECOVERY_PORT) ports.offer(port)
+                if (port in 1..65535 && port != ADB_TCP_RECOVERY_PORT) {
+                    ports.offer(AdbRecoveryEndpoint(port, "mdns"))
+                }
             },
             onError = { error ->
                 LogManager.event(
@@ -238,15 +276,19 @@ class EmbeddedAdbService : Service() {
             while (isActive(generation) && SystemClock.elapsedRealtime() < deadline) {
                 if (probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)) return true
                 val remaining = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
-                val port = ports.poll(remaining.coerceAtMost(1_000L), TimeUnit.MILLISECONDS)
+                val endpoint = ports.poll(remaining.coerceAtMost(1_000L), TimeUnit.MILLISECONDS)
                     ?: continue
-                if (!seen.add(port)) continue
+                if (!seen.add(endpoint.port)) continue
                 LogManager.event(
                     this,
                     "adb_tcp_5555_recovery_endpoint_attempt",
-                    mapOf("generation" to generation, "port" to port)
+                    mapOf(
+                        "generation" to generation,
+                        "port" to endpoint.port,
+                        "source" to endpoint.source.take(80)
+                    )
                 )
-                if (reassertAdbTcp5555Through(port)) return true
+                if (reassertAdbTcp5555Through(endpoint.port, endpoint.source)) return true
             }
         } finally {
             localDiscovery.close()
@@ -254,7 +296,7 @@ class EmbeddedAdbService : Service() {
         return probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)
     }
 
-    private fun reassertAdbTcp5555Through(adbPort: Int): Boolean {
+    private fun reassertAdbTcp5555Through(adbPort: Int, source: String): Boolean {
         if (!probeLocalTcpPort(adbPort)) return false
         var requestError: Throwable? = null
         runCatching {
@@ -275,6 +317,7 @@ class EmbeddedAdbService : Service() {
                     "adb_tcp_5555_recovery_transport_verified",
                     mapOf(
                         "sourcePort" to adbPort,
+                        "source" to source.take(80),
                         "requestError" to (requestError?.toString()?.take(300) ?: "")
                     )
                 )
@@ -864,6 +907,9 @@ class EmbeddedAdbService : Service() {
             "com.yubegreen.luonnotar.action.EMBEDDED_ADB_RECOVER_5555"
         const val EXTRA_GENERATION = "embedded_guardian_generation"
         const val EXTRA_RESTART_SOURCE = "embedded_guardian_restart_source"
+        const val EXTRA_RECOVERY_WIRELESS_PORT = "embedded_adb_recovery_wireless_port"
+        const val EXTRA_RECOVERY_WIRELESS_PORT_SOURCE =
+            "embedded_adb_recovery_wireless_port_source"
         private const val LOCAL_PROPERTY_TIMEOUT_MS = 1_000L
         private const val LOCAL_TCP_PROBE_TIMEOUT_MS = 600
         private const val ADB_TCP_RECOVERY_PORT = 5555

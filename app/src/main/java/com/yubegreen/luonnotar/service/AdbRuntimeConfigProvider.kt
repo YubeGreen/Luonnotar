@@ -71,7 +71,7 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             METHOD_SSH_STATUS -> sshStatus(appContext)
             METHOD_SSH_RECONCILE -> sshReconcile(appContext)
             METHOD_SSH_INSTALL_AUTHORIZED_KEY -> sshInstallAuthorizedKey(appContext, extras ?: Bundle.EMPTY)
-            METHOD_RESCUE_ADB_5555 -> rescueAdb5555(appContext)
+            METHOD_RESCUE_ADB_5555 -> rescueAdb5555(appContext, extras ?: Bundle.EMPTY)
             METHOD_RESCUE_TERMUX_SSHD -> rescueTermuxSshd(appContext)
             METHOD_SET -> setRuntimeConfig(appContext, extras ?: Bundle.EMPTY)
             METHOD_PROBE -> probeNow(appContext, extras ?: Bundle.EMPTY)
@@ -92,8 +92,13 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         }
     }
 
-    private fun rescueAdb5555(context: android.content.Context): Bundle {
+    private fun rescueAdb5555(context: android.content.Context, extras: Bundle): Bundle {
         val snapshot = EmbeddedGuardianStore.snapshot(context)
+        val preferredWirelessPort = extras.getInt(EXTRA_WIRELESS_PORT, -1)
+            .takeIf { it in 1..65535 && it != 5555 } ?: -1
+        val preferredWirelessPortSource = extras.getString(EXTRA_WIRELESS_PORT_SOURCE)
+            .orEmpty()
+            .take(80)
         if (!snapshot.featureEnabled) {
             return resultBundle(false, "feature_disabled", emptyMap())
         }
@@ -103,6 +108,11 @@ class AdbRuntimeConfigProvider : ContentProvider() {
                 Intent(context, EmbeddedAdbService::class.java)
                     .setAction(EmbeddedAdbService.ACTION_RECOVER_ADB_5555)
                     .putExtra(EmbeddedAdbService.EXTRA_GENERATION, snapshot.generation)
+                    .putExtra(EmbeddedAdbService.EXTRA_RECOVERY_WIRELESS_PORT, preferredWirelessPort)
+                    .putExtra(
+                        EmbeddedAdbService.EXTRA_RECOVERY_WIRELESS_PORT_SOURCE,
+                        preferredWirelessPortSource
+                    )
             )
             true
         }.getOrElse { error ->
@@ -118,7 +128,9 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             reason = if (dispatched) "" else "dispatch_failed",
             values = mapOf(
                 "dispatched" to dispatched,
-                "generation" to snapshot.generation
+                "generation" to snapshot.generation,
+                "preferredWirelessPort" to preferredWirelessPort,
+                "preferredWirelessPortSource" to preferredWirelessPortSource
             )
         )
     }
@@ -1378,6 +1390,8 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val METHOD_SSH_INSTALL_AUTHORIZED_KEY = "ssh_install_authorized_key"
         const val METHOD_RESCUE_ADB_5555 = "rescue_adb_5555"
         const val METHOD_RESCUE_TERMUX_SSHD = "rescue_termux_sshd"
+        const val EXTRA_WIRELESS_PORT = "wireless_port"
+        const val EXTRA_WIRELESS_PORT_SOURCE = "wireless_port_source"
         const val METHOD_SET = "set"
         const val METHOD_PROBE = "probe"
         const val METHOD_EXPERIMENT_START = "experiment_start"

@@ -3,15 +3,17 @@ package com.yubegreen.luonnotar.privileged
 /**
  * Health/recovery cadence for the fixed ADB TCP listener used by remote devices.
  *
- * The shell guardian only decides when recovery is warranted. v127 dispatches
- * the actual tcpip:5555 request through the app-side paired Kadb transport, so
+ * The shell guardian decides when recovery is warranted. v128 resolves the live
+ * Wireless ADB port through IAdbManager before dispatching the app-side Kadb transport, so
  * this policy remains side-effect free and independently testable.
  */
 internal object AdbTcpPortHealthPolicy {
     const val PORT = 5555
-    const val PROBE_INTERVAL_MS = 60_000L
-    const val MISSING_GRACE_MS = 90_000L
-    const val RECOVERY_COOLDOWN_MS = 5 * 60_000L
+    // Engine cycles every ~15s. Two consecutive missing probes are enough to
+    // recover, while a one-minute cooldown prevents restart storms.
+    const val PROBE_INTERVAL_MS = 15_000L
+    const val MISSING_GRACE_MS = 15_000L
+    const val RECOVERY_COOLDOWN_MS = 60_000L
 
     fun listeningOnPort(output: String, port: Int = PORT): Boolean =
         output.lineSequence().any { line ->
