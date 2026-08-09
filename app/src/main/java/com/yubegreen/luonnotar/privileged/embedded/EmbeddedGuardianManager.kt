@@ -35,17 +35,7 @@ object EmbeddedGuardianManager {
      */
     fun restartEngine(context: Context, source: String = "explicit_engine_restart") {
         val app = context.applicationContext
-        val snapshot = EmbeddedGuardianStore.snapshot(app)
-        check(snapshot.featureEnabled) { "embedded feature disabled" }
-        check(EmbeddedGuardianStore.prepareEngineRestart(app, snapshot.generation, source)) {
-            "embedded restart generation superseded"
-        }
-        LogManager.event(
-            app,
-            "embedded_engine_restart_requested",
-            EmbeddedGuardianStore.eventFields(snapshot, source) +
-                mapOf("expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION)
-        )
+        val snapshot = prepareEngineRestartRequest(app, source)
         runCatching {
             ContextCompat.startForegroundService(
                 app,
@@ -64,6 +54,84 @@ object EmbeddedGuardianManager {
             )
             throw error
         }
+    }
+
+    /**
+     * Synchronous hot-handoff entry used by the shell-only provider control path.
+     *
+     * A reachable r260+ shell engine already owns the long-lived execution
+     * context needed for a transactional successor launch. Routing that case
+     * through an Android foreground service adds an unnecessary App-process
+     * lifecycle dependency and, on some devices, the service start can be
+     * accepted by ActivityManager without ever reaching onCreate/onStartCommand.
+     * Keep the service path only as the legacy/unreachable-engine fallback.
+     */
+    internal fun restartEngineDirect(
+        context: Context,
+        source: String = "explicit_engine_restart"
+    ): HandoffAttempt {
+        val app = context.applicationContext
+        val snapshot = prepareEngineRestartRequest(app, source)
+        val attempt = performHotHandoff(app, snapshot.generation, source)
+        if (!attempt.success && !requiresAdbRestartFallback(attempt)) {
+            // Transactional handoff failures keep the predecessor alive. Restore
+            // the app-side live state against that endpoint instead of escalating
+            // into a second, potentially destructive ADB restart path.
+            runCatching { configure(app, snapshot.generation) }
+                .onFailure { error ->
+                    LogManager.event(
+                        app,
+                        "embedded_engine_direct_handoff_restore_failed",
+                        EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                            mapOf(
+                                "reason" to attempt.reason,
+                                "error" to error.toString()
+                            )
+                    )
+                }
+        }
+        LogManager.event(
+            app,
+            if (attempt.success) {
+                "embedded_engine_direct_handoff_succeeded"
+            } else {
+                "embedded_engine_direct_handoff_failed"
+            },
+            EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                mapOf(
+                    "reason" to attempt.reason,
+                    "oldRevision" to attempt.oldRevision,
+                    "newRevision" to attempt.newRevision,
+                    "adbFallbackEligible" to requiresAdbRestartFallback(attempt)
+                )
+        )
+        return attempt
+    }
+
+    internal fun requiresAdbRestartFallback(attempt: HandoffAttempt): Boolean =
+        !attempt.success && attempt.reason in setOf(
+            "engine_unreachable",
+            "identity_missing",
+            "old_revision_retired_for_adb_restart",
+            "old_revision_retire_failed"
+        )
+
+    private fun prepareEngineRestartRequest(
+        app: Context,
+        source: String
+    ): EmbeddedGuardianStore.Snapshot {
+        val snapshot = EmbeddedGuardianStore.snapshot(app)
+        check(snapshot.featureEnabled) { "embedded feature disabled" }
+        check(EmbeddedGuardianStore.prepareEngineRestart(app, snapshot.generation, source)) {
+            "embedded restart generation superseded"
+        }
+        LogManager.event(
+            app,
+            "embedded_engine_restart_requested",
+            EmbeddedGuardianStore.eventFields(snapshot, source) +
+                mapOf("expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION)
+        )
+        return snapshot
     }
 
     fun startSetup(context: Context, source: String = "explicit_user_enable") {

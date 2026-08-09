@@ -797,11 +797,17 @@ class AdbRuntimeConfigProvider : ContentProvider() {
                 values = before.asValues() + mapOf("dispatched" to false)
             )
         }
-        val dispatch = runCatching {
-            EmbeddedGuardianManager.restartEngine(context, "adb_provider_restart")
+
+        // The provider itself is already a live control-plane endpoint. For a
+        // reachable handoff-capable shell engine, perform the transaction here
+        // synchronously instead of depending on an Android FGS merely to ask the
+        // shell process to replace itself. This is also the bootstrap path from
+        // older r294 APK mappings into the shell-owned post-install handoff code.
+        val direct = runCatching {
+            EmbeddedGuardianManager.restartEngineDirect(context, "adb_provider_restart")
         }
-        if (dispatch.isFailure) {
-            val error = dispatch.exceptionOrNull()
+        if (direct.isFailure) {
+            val error = direct.exceptionOrNull()
             LogManager.event(
                 context,
                 "adb_provider_engine_restart_failed",
@@ -809,34 +815,140 @@ class AdbRuntimeConfigProvider : ContentProvider() {
                     "oldPid" to before.pid,
                     "oldRevision" to before.actualRevision,
                     "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
+                    "stage" to "direct_handoff_exception",
                     "error" to error.toString()
                 )
             )
             return engineResultBundle(
                 ok = false,
-                reason = "restart_dispatch_failed",
-                values = before.asValues() + mapOf(
+                reason = "restart_handoff_exception",
+                values = probeEngine(context).asValues() + mapOf(
                     "dispatched" to false,
+                    "restartSource" to "adb_provider_restart",
+                    "directHandoffAttempted" to true,
+                    "directHandoffSuccess" to false,
                     "error" to error.toString().take(400)
                 )
             )
         }
+
+        val attempt = direct.getOrThrow()
+        if (attempt.success) {
+            val after = probeEngine(context)
+            LogManager.event(
+                context,
+                "adb_provider_engine_restart_handoff_succeeded",
+                mapOf(
+                    "oldPid" to before.pid,
+                    "oldRevision" to attempt.oldRevision,
+                    "newPid" to after.pid,
+                    "newRevision" to attempt.newRevision,
+                    "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION
+                )
+            )
+            return engineResultBundle(
+                ok = true,
+                reason = "",
+                values = after.asValues() + mapOf(
+                    "dispatched" to true,
+                    "restartSource" to "adb_provider_restart",
+                    "directHandoffAttempted" to true,
+                    "directHandoffSuccess" to true,
+                    "handoffReason" to attempt.reason,
+                    "oldRevision" to (attempt.oldRevision ?: -1),
+                    "newRevision" to (attempt.newRevision ?: -1)
+                )
+            )
+        }
+
+        if (EmbeddedGuardianManager.requiresAdbRestartFallback(attempt)) {
+            val fallback = runCatching {
+                EmbeddedGuardianManager.restartEngine(context, "adb_provider_restart_fallback")
+            }
+            if (fallback.isFailure) {
+                val error = fallback.exceptionOrNull()
+                LogManager.event(
+                    context,
+                    "adb_provider_engine_restart_failed",
+                    mapOf(
+                        "oldPid" to before.pid,
+                        "oldRevision" to attempt.oldRevision,
+                        "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
+                        "stage" to "adb_fallback_dispatch",
+                        "handoffReason" to attempt.reason,
+                        "error" to error.toString()
+                    )
+                )
+                return engineResultBundle(
+                    ok = false,
+                    reason = "restart_fallback_dispatch_failed",
+                    values = probeEngine(context).asValues() + mapOf(
+                        "dispatched" to false,
+                        "restartSource" to "adb_provider_restart",
+                        "directHandoffAttempted" to true,
+                        "directHandoffSuccess" to false,
+                        "handoffReason" to attempt.reason,
+                        "fallbackDispatched" to false,
+                        "error" to error.toString().take(400)
+                    )
+                )
+            }
+            val after = probeEngine(context)
+            LogManager.event(
+                context,
+                "adb_provider_engine_restart_requested",
+                mapOf(
+                    "oldPid" to before.pid,
+                    "oldRevision" to attempt.oldRevision,
+                    "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
+                    "generation" to after.generation,
+                    "directHandoffReason" to attempt.reason,
+                    "fallbackDispatched" to true
+                )
+            )
+            return engineResultBundle(
+                ok = true,
+                reason = "",
+                values = after.asValues() + mapOf(
+                    "dispatched" to true,
+                    "restartSource" to "adb_provider_restart_fallback",
+                    "directHandoffAttempted" to true,
+                    "directHandoffSuccess" to false,
+                    "handoffReason" to attempt.reason,
+                    "fallbackDispatched" to true
+                )
+            )
+        }
+
+        // A handoff-capable predecessor rejected/rolled back the candidate. The
+        // transactional invariant says the predecessor remains the recovery owner;
+        // do not immediately escalate into the old ADB restart path. Surface the
+        // failure synchronously so diagnostics can inspect the intact predecessor.
+        val after = probeEngine(context)
         LogManager.event(
             context,
-            "adb_provider_engine_restart_requested",
+            "adb_provider_engine_restart_handoff_failed",
             mapOf(
                 "oldPid" to before.pid,
-                "oldRevision" to before.actualRevision,
+                "oldRevision" to attempt.oldRevision,
                 "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-                "generation" to before.generation
+                "handoffReason" to attempt.reason,
+                "enginePidAfter" to after.pid,
+                "engineRevisionAfter" to after.actualRevision
             )
         )
         return engineResultBundle(
-            ok = true,
-            reason = "",
-            values = before.asValues() + mapOf(
+            ok = false,
+            reason = "handoff_failed",
+            values = after.asValues() + mapOf(
                 "dispatched" to true,
-                "restartSource" to "adb_provider_restart"
+                "restartSource" to "adb_provider_restart",
+                "directHandoffAttempted" to true,
+                "directHandoffSuccess" to false,
+                "handoffReason" to attempt.reason,
+                "fallbackDispatched" to false,
+                "oldRevision" to (attempt.oldRevision ?: -1),
+                "newRevision" to (attempt.newRevision ?: -1)
             )
         )
     }
