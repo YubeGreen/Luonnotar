@@ -522,7 +522,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             port = candidateConfig.sshPort,
             apkPath = currentEngineApkPath()
         )
-        val ssh = sshGuardian.reconcile(force = false)
+        // A handoff candidate may be loading a newly installed APK that fixes
+        // the very SSH failure which created the persisted recovery backoff.
+        // Never let predecessor backoff prevent the candidate from proving the
+        // new classpath. This is one bounded recovery attempt, still serialized
+        // by ShellSshGuardian's cross-process recovery lock.
+        val ssh = sshGuardian.reconcile(force = true)
         val sshRequired = candidateConfig.sshGuardianEnabled && ssh.provisioned
         val ready = !sshRequired || ssh.healthy
         JSONObject()
