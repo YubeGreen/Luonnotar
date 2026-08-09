@@ -200,8 +200,24 @@ internal class ShellSshGuardian {
             }
         }
         runCommand("/system/bin/chmod", "600", file.absolutePath)
+
+        // Provisioning is a persistence operation, not a synchronous daemon
+        // bootstrap transaction. Returning immediately prevents the provider's
+        // 5-second engine RPC timeout from reporting a false install failure.
+        // The regular 5-second guardian tick performs the actual reconcile.
+        consecutiveFailures = 0
         nextRecoveryWallTimeMillis = 0L
-        return reconcile(force = true)
+        lastReason = "authorized_key_installed"
+        val observed = probe(System.currentTimeMillis(), provisioned = true)
+        val snapshot = observed.copy(
+            state = if (observed.healthy) "healthy" else "degraded",
+            reason = if (observed.healthy) "healthy" else lastReason,
+            consecutiveFailures = 0,
+            nextRecoveryWallTimeMillis = 0L
+        )
+        lastSnapshot = snapshot
+        persist(snapshot)
+        return snapshot
     }
 
     @Synchronized

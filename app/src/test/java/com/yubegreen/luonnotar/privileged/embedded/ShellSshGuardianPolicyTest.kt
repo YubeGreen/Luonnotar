@@ -21,4 +21,9 @@ class ShellSshGuardianPolicyTest {
         assertFalse(ShellSshGuardianPolicy.isAuthorizedKey("echo pwned"))
         assertFalse(ShellSshGuardianPolicy.isAuthorizedKey(""))
     }
+
+    @Test fun fatalBootstrapDiagnosticsHaveIndependentPersistentPath() {
+        assertEquals("last-failure.json", ShellSshPaths.LAST_FAILURE_NAME)
+        assertFalse(ShellSshPaths.LAST_FAILURE_NAME == ShellSshPaths.DAEMON_STATE_NAME)
+    }
 }

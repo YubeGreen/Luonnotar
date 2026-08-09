@@ -140,6 +140,7 @@ dependencies {
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("com.flyfishxu:kadb-android:1.3.0")
     implementation("org.apache.sshd:sshd-core:2.19.0")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.84")
     implementation("org.slf4j:slf4j-nop:2.0.18")
 
     testImplementation("junit:junit:4.13.2")
