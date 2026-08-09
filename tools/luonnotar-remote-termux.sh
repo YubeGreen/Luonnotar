@@ -4,6 +4,7 @@ set -euo pipefail
 IQ_HOST="${LUONNOTAR_IQ_HOST:-100.111.89.64}"
 IQ_USER="${LUONNOTAR_IQ_TERMUX_USER:-u0_a440}"
 IQ_PORT="${LUONNOTAR_IQ_TERMUX_PORT:-8022}"
+IQ_SSH_ALIAS="${LUONNOTAR_IQ_SSH_ALIAS:-iqoo}"
 TERMUX_USER="${LUONNOTAR_TERMUX_USER:-u0_a440}"
 TERMUX_PORT="${LUONNOTAR_TERMUX_PORT:-8022}"
 RESCUE_PORT="${LUONNOTAR_RESCUE_PORT:-8025}"
@@ -11,6 +12,7 @@ RESCUE_KEY="${LUONNOTAR_RESCUE_KEY:-$HOME/.ssh/luonnotar_iqoo_ed25519}"
 WAIT_SECONDS="${LUONNOTAR_TERMUX_WAIT_SECONDS:-75}"
 HOST=""
 TARGET_SEEN=0
+IQ_SELECTED=0
 
 usage() {
   cat <<'EOF_USAGE'
@@ -21,7 +23,7 @@ Usage:
   luoterm USER@HOST[:PORT] [--wait SECONDS]
 
 Device selector logic mirrors luosfud:
-  --iq                iQOO shortcut -> 100.111.89.64 (Termux :8022)
+  --iq                iQOO shortcut -> 100.111.89.64 (Termux :8022; SSH Host alias: iqoo)
   HOST                explicit target device
   HOST:PORT           explicit target and Termux SSH port
   USER@HOST[:PORT]    explicit Termux user, target and optional port
@@ -64,6 +66,7 @@ while [[ $# -gt 0 ]]; do
         exit 2
       }
       TARGET_SEEN=1
+      IQ_SELECTED=1
       HOST="$IQ_HOST"
       TERMUX_USER="$IQ_USER"
       TERMUX_PORT="$IQ_PORT"
@@ -171,4 +174,8 @@ if ! is_open "$TERMUX_PORT"; then
   exit 1
 fi
 
-command ssh -p "$TERMUX_PORT" "$TERMUX_USER@$HOST"
+if (( IQ_SELECTED )); then
+  command ssh -p "$TERMUX_PORT" -l "$TERMUX_USER" "$IQ_SSH_ALIAS"
+else
+  command ssh -p "$TERMUX_PORT" "$TERMUX_USER@$HOST"
+fi
