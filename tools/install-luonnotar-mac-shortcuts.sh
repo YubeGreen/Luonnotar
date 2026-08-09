@@ -27,6 +27,9 @@ export LUONNOTAR_PROJECT_ROOT='{escaped}'
 luoterm() {{
   bash "$LUONNOTAR_PROJECT_ROOT/tools/luonnotar-remote-termux.sh" "$@"
 }}
+luoovn() {{
+  bash "$LUONNOTAR_PROJECT_ROOT/tools/luonnotar-overnight.sh" "$@"
+}}
 {end}
 '''
 
@@ -36,6 +39,6 @@ text = text.rstrip() + "\n\n" + block
 zshrc.write_text(text)
 PY
 
-echo "MAC_SHORTCUT_OK: installed luoterm -> $PROJECT_ROOT/tools/luonnotar-remote-termux.sh"
+echo "MAC_SHORTCUT_OK: installed luoterm + luoovn -> $PROJECT_ROOT/tools"
 echo "Run: source \"$ZSHRC\""
 echo "Then: luoterm --iq   (or: luoterm HOST / USER@HOST:PORT)"
