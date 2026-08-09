@@ -374,6 +374,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var lastDiagnosticStatusWriteElapsed = 0L
     @Volatile private var cachedStatusJson = "{}"
     private var lastBackgroundPolicyReport = BackgroundPolicyReport.empty()
+    private var handoffPreparedConfigJson = ""
+    private var handoffPreparedAtElapsed = 0L
+    private var handoffPreparedSsh: ShellSshGuardian.Snapshot? = null
 
     override fun configureAndStart(configJson: String): String = synchronized(lock) {
         val firstStart = !running
@@ -525,11 +528,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         // A handoff candidate may be loading a newly installed APK that fixes
         // the very SSH failure which created the persisted recovery backoff.
         // Never let predecessor backoff prevent the candidate from proving the
-        // new classpath. This is one bounded recovery attempt, still serialized
-        // by ShellSshGuardian's cross-process recovery lock.
-        val ssh = sshGuardian.reconcile(force = true)
+        // new classpath. When the independently-owned daemon is already healthy,
+        // use the non-persisting handoff fast path so an old r294 predecessor's
+        // 2-second RPC budget cannot be consumed by diagnostic persistence.
+        val ssh = sshGuardian.preflightForHandoff()
         val sshRequired = candidateConfig.sshGuardianEnabled && ssh.provisioned
         val ready = !sshRequired || ssh.healthy
+        if (ready) {
+            handoffPreparedConfigJson = configJson
+            handoffPreparedAtElapsed = SystemClock.elapsedRealtime()
+            handoffPreparedSsh = ssh
+        } else {
+            clearPreparedHandoffLocked()
+        }
         JSONObject()
             .put("ready", ready)
             .put("engineRevision", com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianProtocol.ENGINE_REVISION)
@@ -537,6 +548,60 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("ssh", ssh.toJson())
             .put("configSchema", GuardianEngineConfig.SCHEMA)
             .toString()
+    }
+
+    /**
+     * Lightweight activation used only after a successful transactional
+     * candidate preflight. The old r294 predecessor gives activation only a
+     * 2-second reply window, while the normal first start synchronously probes
+     * multiple `am/cmd ... help` capability surfaces with multi-second
+     * timeouts. Those capability probes are not part of takeover safety.
+     *
+     * We therefore arm the periodic watchdogs and initial cycle immediately,
+     * reuse the fresh SSH proof from prepare, and let the already-scheduled
+     * initial cycle perform capability discovery after promotion.
+     */
+    fun activateHandoffCandidate(configJson: String): String = synchronized(lock) {
+        val prepared = handoffPreparedSsh ?: error("handoff candidate was not prepared")
+        check(handoffPreparedConfigJson == configJson) { "handoff config changed after prepare" }
+        val preparedAge = SystemClock.elapsedRealtime() - handoffPreparedAtElapsed
+        check(preparedAge in 0..HANDOFF_PREPARED_SSH_MAX_AGE_MS) {
+            "handoff SSH preflight expired"
+        }
+
+        val candidateConfig = GuardianEngineConfig.fromJson(configJson)
+        val sshRequired = candidateConfig.sshGuardianEnabled && prepared.provisioned
+        check(!sshRequired || prepared.healthy) { "prepared SSH guardian is not healthy" }
+
+        val firstStart = !running
+        config = candidateConfig
+        running = true
+        if (startedElapsed <= 0L) startedElapsed = SystemClock.elapsedRealtime()
+        sshGuardian.configure(
+            enabled = config.sshGuardianEnabled,
+            port = config.sshPort,
+            apkPath = currentEngineApkPath()
+        )
+        restartSshGuardianScheduleLocked()
+        restartScheduleLocked()
+        if (firstStart) scheduleInitialCycleLocked()
+
+        // Keep candidate activation free of disk diagnostics and shell helper
+        // subprocesses. The initial cycle, scheduled one second from now,
+        // performs capability discovery and the ordinary persisted status path.
+        cachedStatusJson = statusJsonLocked()
+        clearPreparedHandoffLocked()
+        cachedStatusJson
+    }
+
+    fun handoffSshSnapshot(): String = synchronized(lock) {
+        sshGuardian.snapshot().toJson().toString()
+    }
+
+    private fun clearPreparedHandoffLocked() {
+        handoffPreparedConfigJson = ""
+        handoffPreparedAtElapsed = 0L
+        handoffPreparedSsh = null
     }
 
     fun sshStatus(): String = synchronized(lock) {
@@ -8496,6 +8561,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val DELIVERY_PROTECTION_BINDER_PULSE_INTERVAL_MS = 15_000L
         private const val DIAGNOSTIC_STATUS_INTERVAL_MS = 30_000L
         private const val INITIAL_CYCLE_DELAY_MS = 1_000L
+        private const val HANDOFF_PREPARED_SSH_MAX_AGE_MS = 10_000L
         private const val RECOVERY_HISTORY_WINDOW_MS = 24L * 60L * 60L * 1_000L
         private const val MAX_EVENTS = 128
         private const val MAX_EVENT_DETAIL = 500

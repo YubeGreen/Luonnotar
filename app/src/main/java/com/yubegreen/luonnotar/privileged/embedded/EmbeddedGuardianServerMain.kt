@@ -185,8 +185,8 @@ object EmbeddedGuardianServerMain {
                                 "transactional_takeover:${json.optString("reason").take(100)}"
                             ) ?: error("candidate could not acquire primary lock")
                             primaryGuardRef.set(promotedGuard)
-                            val status = JSONObject(engine.configureAndStart(json.optString("config")))
-                            val ssh = JSONObject(engine.sshStatus())
+                            val status = JSONObject(engine.activateHandoffCandidate(json.optString("config")))
+                            val ssh = JSONObject(engine.handoffSshSnapshot())
                             val sshRequired = ssh.optBoolean("enabled", true) && ssh.optBoolean("provisioned", false)
                             check(!sshRequired || ssh.optBoolean("healthy", false)) {
                                 "candidate SSH guardian is not healthy"

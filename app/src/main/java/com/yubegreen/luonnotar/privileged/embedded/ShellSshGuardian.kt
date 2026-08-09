@@ -36,6 +36,41 @@ internal class ShellSshGuardian {
         restorePersistentBackoffIfNeeded()
     }
 
+    /**
+     * Transactional handoff preflight for an already-running rescue daemon.
+     *
+     * Old r294 predecessors use a 2-second RPC read timeout for candidate
+     * prepare/activate. A normal [reconcile] persists its probe result before
+     * returning, and that persistence launches chmod as a child process. On
+     * Android the otherwise healthy probe + synchronous persistence can exceed
+     * the predecessor's legacy budget.
+     *
+     * A live conjunctive probe is still mandatory here; only the redundant
+     * persistence is skipped on the healthy fast path. If SSH is actually
+     * degraded we fall back to the ordinary forced reconcile, preserving the
+     * existing recovery semantics for modern predecessors with the larger
+     * handoff budget.
+     */
+    @Synchronized
+    fun preflightForHandoff(): Snapshot {
+        val now = System.currentTimeMillis()
+        val provisioned = authorizedKeysProvisioned()
+        val initial = probe(now, provisioned)
+        if (initial.healthy) {
+            consecutiveFailures = 0
+            nextRecoveryWallTimeMillis = 0L
+            lastHealthyWallTimeMillis = now
+            lastReason = "healthy_handoff_fast_path"
+            return initial.copy(
+                state = "healthy",
+                reason = lastReason,
+                consecutiveFailures = 0,
+                nextRecoveryWallTimeMillis = 0L
+            ).also { lastSnapshot = it }
+        }
+        return reconcile(force = true)
+    }
+
     @Synchronized
     fun reconcile(force: Boolean = false): Snapshot {
         val now = System.currentTimeMillis()
