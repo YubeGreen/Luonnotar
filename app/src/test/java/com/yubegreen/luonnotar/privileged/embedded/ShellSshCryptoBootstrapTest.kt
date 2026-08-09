@@ -15,11 +15,11 @@ class ShellSshCryptoBootstrapTest {
     @Test
     fun processLocalShimSurvivesMinaEccurveInitializationForAllSshNistAliases() {
         val provider = ShellSshCryptoBootstrap.installAndVerify()
-        assertTrue(provider.startsWith("LuonnotarSSH-EC:"))
-        assertEquals("LuonnotarSSH-EC", Security.getProviders().first {
+        assertTrue(provider.startsWith("BC:"))
+        assertEquals("BC", Security.getProviders().first {
             it.getService("AlgorithmParameters", "EC") != null
         }.name)
-        assertEquals("LuonnotarSSH-EC", Security.getProviders().first {
+        assertEquals("BC", Security.getProviders().first {
             it.getService("KeyPairGenerator", "EC") != null
         }.name)
 

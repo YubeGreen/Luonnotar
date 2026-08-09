@@ -28,12 +28,25 @@ import java.util.Locale;
  * actual EC implementation to Luonnotar's bundled Bouncy Castle instance.
  */
 public final class ShellSshNistEcAlgorithmParametersProvider extends Provider {
-    static final String NAME = "LuonnotarSSH-EC";
-    private static final double VERSION = 1.1d;
+    static final String NAME = "BC";
+    private static final double VERSION = 1.2d;
     private static final Provider BACKEND = new BouncyCastleProvider();
 
     ShellSshNistEcAlgorithmParametersProvider() {
-        super(NAME, VERSION, "Luonnotar SSH NIST EC JCA compatibility shim");
+        super(NAME, VERSION, "Luonnotar bundled Bouncy Castle + SSH NIST EC compatibility shim");
+
+        // Apache MINA's security layer may request the provider named "BC"
+        // explicitly instead of following the generic JCA provider order. Clone
+        // the bundled BC registration surface into this process-local provider,
+        // then override only the two EC services that need SSH-name translation.
+        // BACKEND stays unregistered and is used by the SPI delegates below, so
+        // delegating EC operations cannot recurse back into this shim.
+        for (java.util.Map.Entry<Object, Object> entry : BACKEND.entrySet()) {
+            String key = String.valueOf(entry.getKey());
+            if (!key.startsWith("Provider.id ")) {
+                put(entry.getKey(), entry.getValue());
+            }
+        }
         put("AlgorithmParameters.EC", NistEcAlgorithmParametersSpi.class.getName());
         put("KeyPairGenerator.EC", NistEcKeyPairGeneratorSpi.class.getName());
     }

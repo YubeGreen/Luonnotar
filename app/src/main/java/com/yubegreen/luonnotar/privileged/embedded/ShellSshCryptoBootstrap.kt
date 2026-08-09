@@ -27,16 +27,21 @@ internal object ShellSshCryptoBootstrap {
     )
 
     fun installAndVerify(): String {
+        // Android ships its own provider named BC. Apache MINA can resolve BC
+        // explicitly, so a differently named provider is insufficient even if
+        // AlgorithmParameters.getInstance("EC") probes pass. Replace BC only
+        // inside this isolated SSH daemon JVM with Luonnotar's bundled BC clone
+        // plus the SSH NIST alias translation layer.
         Security.removeProvider(PROVIDER_NAME)
         val provider = ShellSshNistEcAlgorithmParametersProvider()
         check(Security.insertProviderAt(provider, 1) == 1) {
-            "unable to install Luonnotar SSH EC compatibility provider as primary security provider"
+            "unable to install Luonnotar patched BC provider as primary security provider"
         }
 
         val active = Security.getProvider(PROVIDER_NAME)
-            ?: error("Luonnotar SSH EC compatibility provider missing after installation")
+            ?: error("Luonnotar patched BC provider missing after installation")
         check(active === provider) {
-            "unexpected SSH EC provider instance: ${active.javaClass.name}"
+            "unexpected patched BC provider instance: ${active.javaClass.name}"
         }
 
         requiredCurves.forEach { (name, expectedBits) ->
