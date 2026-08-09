@@ -79,6 +79,12 @@ android {
         buildConfig = true
         aidl = true
     }
+
+    packaging {
+        resources {
+            excludes += "META-INF/DEPENDENCIES"
+        }
+    }
 }
 
 android.applicationVariants.all {
