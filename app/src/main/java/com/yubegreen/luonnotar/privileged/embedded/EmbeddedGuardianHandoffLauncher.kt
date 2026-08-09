@@ -70,7 +70,24 @@ internal object EmbeddedGuardianHandoffLauncher {
         require(apkPath.startsWith('/') && apkPath.endsWith(".apk")) { "invalid APK path" }
         val canonical = File(apkPath).canonicalPath
         require(File(canonical).isFile && File(canonical).canRead()) { "APK is not readable" }
+        check(canonical in installedPackagePaths()) {
+            "handoff APK does not match installed package"
+        }
+    }
 
+    /**
+     * Resolve the APK that PackageManager currently exposes for this package.
+     * Prefer base.apk because it contains the app_process entry point; split APKs
+     * are not sufficient CLASSPATH roots for the guardian candidate.
+     */
+    internal fun resolveInstalledPackagePathForTransaction(): String {
+        val installed = installedPackagePaths()
+        return installed.firstOrNull { it.endsWith("/base.apk") }
+            ?: installed.firstOrNull()
+            ?: error("installed package path missing")
+    }
+
+    private fun installedPackagePaths(): List<String> {
         val process = ProcessBuilder("/system/bin/cmd", "package", "path", PACKAGE_NAME)
             .redirectErrorStream(true)
             .start()
@@ -79,14 +96,13 @@ internal object EmbeddedGuardianHandoffLauncher {
             process.destroyForcibly()
             error("package path lookup timed out")
         }
-        val installed = process.inputStream.bufferedReader().useLines { lines ->
-            lines.map(String::trim)
-                .filter { it.startsWith("package:") }
-                .map { File(it.removePrefix("package:")).canonicalPath }
-                .toSet()
-        }
-        check(process.exitValue() == 0 && canonical in installed) {
-            "handoff APK does not match installed package"
-        }
+        val output = process.inputStream.bufferedReader().readLines()
+        check(process.exitValue() == 0) { "package path lookup failed" }
+        return output.asSequence()
+            .map(String::trim)
+            .filter { it.startsWith("package:") }
+            .map { File(it.removePrefix("package:")).canonicalPath }
+            .distinct()
+            .toList()
     }
 }

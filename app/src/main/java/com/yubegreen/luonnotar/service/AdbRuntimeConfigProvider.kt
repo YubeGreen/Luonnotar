@@ -1030,7 +1030,15 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             "permissionApprovalAttempt" to response.optInt("permissionApprovalAttempt", 0),
             "permissionApprovalElapsed" to response.optLong("permissionApprovalElapsed", -1L),
             "callbackCount" to response.optInt("callbackCount", 0),
-            "callbackTraceFile" to response.optString("callbackTraceFile", "")
+            "callbackTraceFile" to response.optString("callbackTraceFile", ""),
+            "installState" to response.optString("installState", ""),
+            "installCode" to response.optString("installCode", ""),
+            "handoffState" to response.optString("handoffState", ""),
+            "handoffReason" to response.optString("handoffReason", "").take(400),
+            "handoffOwner" to response.optString("handoffOwner", ""),
+            "handoffExpectedRevision" to response.optInt("handoffExpectedRevision", -1),
+            "handoffCandidateRevision" to response.optInt("handoffCandidateRevision", -1),
+            "handoffCandidatePid" to response.optInt("handoffCandidatePid", -1)
         )
         return engineResultBundle(ok = true, reason = "", values = values)
     }

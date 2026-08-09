@@ -32,13 +32,18 @@ internal object EmbeddedGuardianTransactionalHandoff {
     ): String {
         val request = JSONObject(payload)
         val apkPath = request.optString("apkPath").trim()
-        val expectedRevision = request.optInt("expectedRevision", -1)
+        val requestedExpectedRevision = request.optInt("expectedRevision", -1)
+        val discoverExpectedRevision = request.optBoolean("discoverExpectedRevision", false)
         val reason = request.optString("reason", "remote_request").take(120)
-        require(expectedRevision >= EmbeddedGuardianProtocol.ENGINE_REVISION) {
-            "transactional handoff cannot downgrade revision"
+        if (!discoverExpectedRevision) {
+            require(requestedExpectedRevision >= EmbeddedGuardianProtocol.ENGINE_REVISION) {
+                "transactional handoff cannot downgrade revision"
+            }
         }
+        val minimumRevision = EmbeddedGuardianProtocol.ENGINE_REVISION
+        var targetRevision = if (discoverExpectedRevision) minimumRevision else requestedExpectedRevision
         EmbeddedGuardianHandoffLauncher.verifyInstalledPackagePathForTransaction(apkPath)
-        check(primaryGuard.beginHandoffExclusion(expectedRevision)) {
+        check(primaryGuard.beginHandoffExclusion(targetRevision)) {
             "handoff exclusion unavailable"
         }
 
@@ -53,7 +58,7 @@ internal object EmbeddedGuardianTransactionalHandoff {
                 apkPath = apkPath,
                 port = candidatePort,
                 token = candidateToken,
-                expectedRevision = expectedRevision,
+                expectedRevision = targetRevision,
                 reason = reason
             )
             val candidateClient = EmbeddedGuardianClient(
@@ -62,14 +67,20 @@ internal object EmbeddedGuardianTransactionalHandoff {
                 connectTimeoutMs = 400,
                 readTimeoutMs = 2_000
             )
-            val ping = awaitCandidate(candidateClient, candidatePid, expectedRevision)
+            val ping = awaitCandidate(
+                client = candidateClient,
+                candidatePid = candidatePid,
+                minimumRevision = minimumRevision,
+                exactExpectedRevision = requestedExpectedRevision.takeUnless { discoverExpectedRevision }
+            )
             candidateRevision = ping.optInt("engineRevision", -1)
+            targetRevision = if (discoverExpectedRevision) candidateRevision else requestedExpectedRevision
             val configJson = engine.exportConfigJson()
             val prepared = JSONObject(
                 candidateClient.handoffPrepare(
                     JSONObject()
                         .put("config", configJson)
-                        .put("expectedRevision", expectedRevision)
+                        .put("expectedRevision", targetRevision)
                         .put("reason", reason)
                         .toString()
                 )
@@ -81,7 +92,7 @@ internal object EmbeddedGuardianTransactionalHandoff {
             // candidate starts its own watchdogs on the authenticated temporary
             // endpoint. This preserves the invariant that a READY engine exists
             // throughout candidate activation.
-            check(primaryGuard.releasePrimaryForHandoff(expectedRevision)) {
+            check(primaryGuard.releasePrimaryForHandoff(targetRevision)) {
                 "old primary lock release failed"
             }
             primaryReleased = true
@@ -90,13 +101,13 @@ internal object EmbeddedGuardianTransactionalHandoff {
                 candidateClient.handoffActivate(
                     JSONObject()
                         .put("config", configJson)
-                        .put("expectedRevision", expectedRevision)
+                        .put("expectedRevision", targetRevision)
                         .put("reason", reason)
                         .toString()
                 )
             )
             check(activated.optBoolean("ready", false)) { "candidate activation failed" }
-            check(activated.optInt("engineRevision", -1) == expectedRevision) {
+            check(activated.optInt("engineRevision", -1) == targetRevision) {
                 "candidate revision mismatch after activation"
             }
 
@@ -112,7 +123,7 @@ internal object EmbeddedGuardianTransactionalHandoff {
                     JSONObject()
                         .put("primaryPort", primaryPort)
                         .put("primaryToken", primaryToken)
-                        .put("expectedRevision", expectedRevision)
+                        .put("expectedRevision", targetRevision)
                         .toString()
                 )
             )
@@ -129,7 +140,7 @@ internal object EmbeddedGuardianTransactionalHandoff {
             val primaryPing = JSONObject(primaryClient.ping())
             check(primaryPing.optBoolean("ready", false)) { "promoted candidate not READY" }
             check(primaryPing.optString("role") == "primary") { "promoted candidate role mismatch" }
-            check(primaryPing.optInt("engineRevision", -1) == expectedRevision) {
+            check(primaryPing.optInt("engineRevision", -1) == targetRevision) {
                 "promoted endpoint revision mismatch"
             }
 
@@ -140,7 +151,7 @@ internal object EmbeddedGuardianTransactionalHandoff {
             val cleanupWarnings = mutableListOf<String>()
             runCatching {
                 primaryGuard.recordHandoffTakeoverConfirmed(
-                    expectedRevision = expectedRevision,
+                    expectedRevision = targetRevision,
                     candidateRevision = activated.optInt("engineRevision", -1),
                     candidatePid = activated.optInt("pid", candidatePid)
                 )
@@ -151,23 +162,27 @@ internal object EmbeddedGuardianTransactionalHandoff {
                 .onFailure { cleanupWarnings += "old_stop:${it.javaClass.simpleName}" }
             runCatching { primaryGuard.finishHandoffExclusion("handoff_takeover_confirmed") }
                 .onFailure { cleanupWarnings += "exclusion_release:${it.javaClass.simpleName}" }
-            return JSONObject()
+            val successOutcome = JSONObject()
                 .put("accepted", true)
                 .put("transactional", true)
                 .put("ready", true)
                 .put("fromRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
-                .put("expectedRevision", expectedRevision)
+                .put("expectedRevision", targetRevision)
                 .put("candidateRevision", activated.optInt("engineRevision", -1))
                 .put("oldPid", android.os.Process.myPid())
                 .put("candidatePid", activated.optInt("pid", candidatePid))
                 .put("ssh", activated.optJSONObject("ssh") ?: JSONObject.NULL)
                 .put("cleanupWarnings", cleanupWarnings.joinToString(","))
-                .toString()
+            if (request.optBoolean("selfUpdateHandoff", false)) {
+                EmbeddedSelfUpdateCoordinator.recordHandoffSuccess(successOutcome)
+            }
+            return successOutcome.toString()
+
         } catch (error: Throwable) {
             val rollbackWarnings = mutableListOf<String>()
             runCatching {
                 primaryGuard.recordHandoffFailed(
-                    expectedRevision = expectedRevision,
+                    expectedRevision = targetRevision,
                     candidateRevision = candidateRevision,
                     candidatePid = candidatePid,
                     reason = "${error.javaClass.simpleName}:${error.message.orEmpty()}"
@@ -195,22 +210,29 @@ internal object EmbeddedGuardianTransactionalHandoff {
             }
             runCatching { primaryGuard.finishHandoffExclusion("handoff_failed") }
                 .onFailure { rollbackWarnings += "exclusion_release:${it.javaClass.simpleName}" }
-            return JSONObject()
+            val failureOutcome = JSONObject()
                 .put("accepted", false)
                 .put("transactional", true)
                 .put("ready", false)
-                .put("expectedRevision", expectedRevision)
+                .put("expectedRevision", targetRevision)
                 .put("candidatePid", candidatePid)
                 .put("reason", "${error.javaClass.simpleName}:${error.message.orEmpty()}".take(500))
                 .put("rollbackWarnings", rollbackWarnings.joinToString(","))
-                .toString()
+            if (request.optBoolean("selfUpdateHandoff", false)) {
+                EmbeddedSelfUpdateCoordinator.recordHandoffFailure(
+                    failureOutcome.optString("reason", "handoff_failed"),
+                    failureOutcome
+                )
+            }
+            return failureOutcome.toString()
         }
     }
 
     private fun awaitCandidate(
         client: EmbeddedGuardianClient,
         candidatePid: Int,
-        expectedRevision: Int
+        minimumRevision: Int,
+        exactExpectedRevision: Int?
     ): JSONObject {
         var lastError: Throwable? = null
         repeat(CANDIDATE_PING_ATTEMPTS) {
@@ -219,11 +241,13 @@ internal object EmbeddedGuardianTransactionalHandoff {
             }
             val result = runCatching { JSONObject(client.ping()) }
             val ping = result.getOrNull()
-            if (
-                ping != null &&
-                ping.optInt("engineRevision", -1) == expectedRevision &&
-                ping.optString("role") == "candidate"
-            ) {
+            val revision = ping?.optInt("engineRevision", -1) ?: -1
+            val revisionAccepted = if (exactExpectedRevision != null) {
+                revision == exactExpectedRevision
+            } else {
+                revision >= minimumRevision
+            }
+            if (ping != null && revisionAccepted && ping.optString("role") == "candidate") {
                 return ping
             }
             lastError = result.exceptionOrNull()

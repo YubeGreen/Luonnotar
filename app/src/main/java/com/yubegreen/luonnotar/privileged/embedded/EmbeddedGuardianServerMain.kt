@@ -146,7 +146,11 @@ object EmbeddedGuardianServerMain {
                         }
                         EmbeddedGuardianProtocol.OP_INSTALL_SELF_UPDATE -> {
                             check(role.get() == "primary") { "install_self_update requires primary role" }
-                            EmbeddedSelfUpdateCoordinator.start(payload)
+                            EmbeddedSelfUpdateCoordinator.start(
+                                payload = payload,
+                                primaryPort = serverControl.port,
+                                primaryToken = serverControl.token()
+                            )
                         }
                         EmbeddedGuardianProtocol.OP_SELF_UPDATE_STATUS ->
                             EmbeddedSelfUpdateCoordinator.status()
@@ -228,11 +232,16 @@ object EmbeddedGuardianServerMain {
                         EmbeddedGuardianProtocol.OP_HANDOFF -> {
                             check(role.get() == "primary") { "handoff requires primary role" }
                             val guard = primaryGuardRef.get() ?: error("primary guard missing")
-                            val expectedRevision = runCatching { JSONObject(payload).optInt("expectedRevision", -1) }
-                                .getOrDefault(-1)
-                            guard.recordHandoffScheduled(expectedRevision, runCatching {
-                                JSONObject(payload).optString("reason")
-                            }.getOrDefault(""))
+                            val handoffRequest = runCatching { JSONObject(payload) }.getOrElse { JSONObject() }
+                            val expectedRevision = if (handoffRequest.optBoolean("discoverExpectedRevision", false)) {
+                                EmbeddedGuardianProtocol.ENGINE_REVISION
+                            } else {
+                                handoffRequest.optInt("expectedRevision", -1)
+                            }
+                            guard.recordHandoffScheduled(
+                                expectedRevision,
+                                handoffRequest.optString("reason")
+                            )
                             val value = EmbeddedGuardianTransactionalHandoff.execute(
                                 payload = payload,
                                 primaryPort = serverControl.port,
