@@ -586,12 +586,27 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         restartScheduleLocked()
         if (firstStart) scheduleInitialCycleLocked()
 
-        // Keep candidate activation free of disk diagnostics and shell helper
-        // subprocesses. The initial cycle, scheduled one second from now,
-        // performs capability discovery and the ordinary persisted status path.
-        cachedStatusJson = statusJsonLocked()
+        // Keep candidate activation free of disk diagnostics, lazy vendor
+        // detection and shell helper subprocesses. statusJsonLocked() is not a
+        // pure formatter: on a fresh candidate it can lazily resolve the vendor
+        // family and synchronously spawn a series of getprop commands. That is
+        // enough to overflow an old r294 predecessor's 2-second activate RPC.
+        // Publish only the takeover-critical in-memory state here. The normal
+        // configure/initial-cycle path refreshes the full status after commit.
+        val activationStatus = JSONObject()
+            .put("schema", STATUS_SCHEMA)
+            .put("engine", "PrivilegedGuardianEngine")
+            .put("snapshotElapsed", SystemClock.elapsedRealtime())
+            .put("running", running)
+            .put("uid", Process.myUid())
+            .put("identity", identity)
+            .put("sshGuardian", prepared.toJson())
+            .put("startedElapsed", startedElapsed)
+            .put("handoffActivation", true)
+            .toString()
+        cachedStatusJson = activationStatus
         clearPreparedHandoffLocked()
-        cachedStatusJson
+        activationStatus
     }
 
     fun handoffSshSnapshot(): String = synchronized(lock) {
