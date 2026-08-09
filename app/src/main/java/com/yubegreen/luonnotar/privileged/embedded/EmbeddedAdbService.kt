@@ -45,6 +45,11 @@ class EmbeddedAdbService : Service() {
 
     override fun onCreate() {
         super.onCreate()
+        LogManager.event(
+            this,
+            "embedded_adb_service_created",
+            mapOf("pid" to android.os.Process.myPid())
+        )
         startForeground(
             NotificationChannelManager.PRIVILEGED_SETUP_NOTIFICATION_ID,
             EmbeddedGuardianNotifier.setupNotification(
@@ -57,6 +62,16 @@ class EmbeddedAdbService : Service() {
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        LogManager.event(
+            this,
+            "embedded_adb_service_command_received",
+            mapOf(
+                "pid" to android.os.Process.myPid(),
+                "action" to intent?.action.orEmpty(),
+                "requestedGeneration" to (intent?.getLongExtra(EXTRA_GENERATION, -1L) ?: -1L),
+                "startId" to startId
+            )
+        )
         val command = intent ?: run {
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf(startId)
@@ -71,6 +86,17 @@ class EmbeddedAdbService : Service() {
         }
         val generation = command.getLongExtra(EXTRA_GENERATION, snapshot.generation)
         if (!EmbeddedGuardianStore.isGenerationActive(this, generation)) {
+            LogManager.event(
+                this,
+                "embedded_adb_service_generation_rejected",
+                mapOf(
+                    "pid" to android.os.Process.myPid(),
+                    "requestedGeneration" to generation,
+                    "currentGeneration" to snapshot.generation,
+                    "featureEnabled" to snapshot.featureEnabled,
+                    "action" to command.action.orEmpty()
+                )
+            )
             stopForeground(STOP_FOREGROUND_REMOVE)
             stopSelf(startId)
             return START_NOT_STICKY

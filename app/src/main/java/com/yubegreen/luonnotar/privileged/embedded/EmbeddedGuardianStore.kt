@@ -8,7 +8,6 @@ import com.yubegreen.luonnotar.util.LogManager
 import java.io.File
 import java.net.ServerSocket
 import java.security.SecureRandom
-import java.util.UUID
 
 object EmbeddedGuardianStore {
     private const val PREFS = "luonnotar_embedded_guardian"
@@ -41,10 +40,22 @@ object EmbeddedGuardianStore {
     private const val LEGACY_KEY_BINDER_ALIVE = "binder_alive"
     private const val LEGACY_KEY_LAST_UID = "last_uid"
     private const val LEGACY_KEY_LAST_KNOWN_STATE = "last_known_state"
-    private val PROCESS_RUNTIME_OWNER = UUID.randomUUID().toString()
     private val PROCESS_BOOT_ID = runCatching {
         File("/proc/sys/kernel/random/boot_id").readText().trim()
     }.getOrDefault("unavailable")
+    /**
+     * Runtime ownership must be process-neutral. The embedded control plane is
+     * intentionally multi-process (:keeper provider + default-process UI/setup
+     * service), while the shell engine itself is expected to outlive either app
+     * process. A random per-process owner made every cross-process read look like
+     * a stale-runtime takeover and could silently invalidate the generation that
+     * had just been dispatched to EmbeddedAdbService.
+     *
+     * Scope runtime validity to the Android boot instead. A real reboot still
+     * invalidates transient app-side connection state; an app/keeper process
+     * restart no longer destroys a still-valid shell-engine generation.
+     */
+    private val RUNTIME_OWNER = "boot:$PROCESS_BOOT_ID"
 
     data class Snapshot(
         val featureEnabled: Boolean,
@@ -492,9 +503,24 @@ object EmbeddedGuardianStore {
 
     private fun ensureRuntimeOwner(context: Context, prefs: SharedPreferences) {
         val schema = prefs.getInt(KEY_STATE_SCHEMA, 0)
-        val ownerMatches = prefs.getString(KEY_RUNTIME_OWNER, "") == PROCESS_RUNTIME_OWNER
+        val ownerMatches = prefs.getString(KEY_RUNTIME_OWNER, "") == RUNTIME_OWNER
         val bootMatches = prefs.getString(KEY_RUNTIME_BOOT_ID, "") == PROCESS_BOOT_ID
-        if (schema == STATE_SCHEMA && ownerMatches && bootMatches) return
+
+        // r294 vCode118 migrates the old random per-process owner in place.
+        // Same schema + same Android boot means the persisted generation is
+        // still valid; only rewrite the ownership marker. Do not clear runtime
+        // state or increment generation merely because another app process is
+        // reading the store.
+        if (schema == STATE_SCHEMA && bootMatches) {
+            if (!ownerMatches) {
+                check(
+                    prefs.edit()
+                        .putString(KEY_RUNTIME_OWNER, RUNTIME_OWNER)
+                        .commit()
+                ) { "failed to migrate embedded runtime owner" }
+            }
+            return
+        }
 
         val featureEnabled = prefs.getBoolean(KEY_ENABLED, false)
         val oldState = prefs.getString(LEGACY_KEY_STATE, "").orEmpty()
@@ -512,7 +538,7 @@ object EmbeddedGuardianStore {
         val generation = prefs.getLong(KEY_GENERATION, 0L) + 1L
         val editor = prefs.edit()
             .putInt(KEY_STATE_SCHEMA, STATE_SCHEMA)
-            .putString(KEY_RUNTIME_OWNER, PROCESS_RUNTIME_OWNER)
+            .putString(KEY_RUNTIME_OWNER, RUNTIME_OWNER)
             .putString(KEY_RUNTIME_BOOT_ID, PROCESS_BOOT_ID)
             .putBoolean(KEY_ENABLED, featureEnabled)
             .putString(KEY_SETUP_STATE, EmbeddedSetupState.IDLE.name)
@@ -552,7 +578,7 @@ object EmbeddedGuardianStore {
                     "schemaBefore" to schema,
                     "legacyMigration" to (schema != STATE_SCHEMA),
                     "bootChanged" to !bootMatches,
-                    "processChanged" to !ownerMatches
+                    "runtimeOwnerChanged" to !ownerMatches
                 )
             )
         }

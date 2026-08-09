@@ -29,7 +29,7 @@ android {
         applicationId = "com.yubegreen.luonnotar"
         minSdk = 26
         targetSdk = 36
-        versionCode = 117
+        versionCode = 118
         versionName = "2.6.0"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEVELOPER_NAME", "\"YubeGreen\"")
