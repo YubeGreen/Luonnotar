@@ -1,5 +1,22 @@
 # Luonnotar
 
+## 2.6.0 v130 / r294 mainline consolidation
+
+This build freezes the control-plane recovery architecture proven on the OriginOS SDK 36 target and turns the v127-v129 rescue work into a mainline baseline. No new privileged capability is added in v130.
+
+- Keeps transactional self-update/hot handoff unchanged at engine revision **r294**.
+- Treats Luonnotar SSH `:8025`, fixed ADB `:5555`, and optional Termux SSH `:8022` as explicit recovery channels with one shared side-effect-free phase model: `disabled`, `healthy`, `missing_grace`, `recovery_due`, `backoff`.
+- Removes `service.adb.tcp.port` from the shell guardian's decision to arm or describe `:5555` recovery. On the tested OriginOS build that property can be `0` while Wireless ADB remains healthy.
+- Keeps the runtime-verified Binder path (`service call adb 12` gate, transaction 10 wireless-port query) as the primary source for the live Wireless ADB port. Snapshot and mDNS discovery remain app-side fallbacks.
+- Keeps the v129 generation rebind: maintenance recovery uses the EmbeddedAdbService process' current generation instead of a stale keeper-process generation.
+- Adds recovery phase/deadline/last-result fields to guardian status and advances status schema to **56**.
+- Consolidates listener parsing and recovery timing used by ADB and Termux into `ControlPlaneRecoveryPolicy`, and adds unit coverage for the live SDK 36 Binder Parcel values.
+- Raises `luoterm`'s default recovery wait to 120 seconds so the host shortcut covers the full dual-channel recovery window observed in live fault injection.
+
+Live acceptance baseline on the target device: Termux `sshd` was killed and `adb usb` removed `:5555` while `:8025` was also taken down by adbd restarts. With no manual rescue calls, `:8025` returned first, `:5555` was reasserted through the live Wireless ADB Binder port, `:8025` respawned again after that adbd restart, and Termux `:8022` returned last.
+
+> Current mainline candidate: **2.6.0 (versionCode 130)** — embedded engine **r294** — status schema **56**.
+
 ## 2.5.1 r262 vendor-defense ownership + self-update PoC
 
 - Keeps r261 provider-first engine control and r260 hot handoff.

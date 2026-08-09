@@ -1,5 +1,31 @@
 # Luonnotar ADB 工具
 
+## v130 远程控制面入口
+
+Mac 端推荐统一使用项目安装的 `luoterm` 快捷入口。它必须显式选择设备；iQOO 快捷方式为：
+
+```bash
+luoterm --iq
+```
+
+也支持：
+
+```bash
+luoterm HOST
+luoterm HOST:PORT
+luoterm USER@HOST:PORT
+```
+
+若 Termux `:8022` 不可达，脚本先尝试固定 ADB `:5555` 的 `rescue_termux_sshd`，再回退到努昂诺塔独立 SSH `:8025`；若 adbd restart 正好让 `:8025` 短暂消失，则等待 keeper 重生后再主动发一次恢复。默认等待 120 秒。
+
+手机端三条控制面职责：
+
+- `:8025`：努昂诺塔 shell rescue SSH；由 keeper 在 shell engine / adbd restart 后重新建立。
+- `:5555`：固定远程 ADB；guardian 从 Binder 取得当前 Wireless ADB 端口后由 app-side Kadb 重发 `tcpip:5555`。
+- `:8022`：Termux sshd；guardian 同时要求 sshd PID 与端口 listener 存在，失联后通过 Termux `RUN_COMMAND` 重启。
+
+主线状态文件 `/data/local/tmp/luonnotar-guardian-status.json` 中的 `adbTcp5555.phase` 与 `termuxSshd.phase` 可直接区分 grace、恢复到期和 cooldown/backoff。
+
 ## 锁屏状态修改守护配置
 
 1.7.14 继续使用 `android.permission.DUMP` 保护的同步 ContentProvider 入口。

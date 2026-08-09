@@ -1,56 +1,66 @@
 package com.yubegreen.luonnotar.privileged
 
-/**
- * Health/recovery cadence for the fixed ADB TCP listener used by remote devices.
- *
- * The shell guardian decides when recovery is warranted. v128 resolves the live
- * Wireless ADB port through IAdbManager before dispatching the app-side Kadb transport, so
- * this policy remains side-effect free and independently testable.
- */
+/** Health/recovery cadence for the fixed ADB TCP listener used by remote devices. */
 internal object AdbTcpPortHealthPolicy {
     const val PORT = 5555
-    // Engine cycles every ~15s. Two consecutive missing probes are enough to
-    // recover, while a one-minute cooldown prevents restart storms.
     const val PROBE_INTERVAL_MS = 15_000L
     const val MISSING_GRACE_MS = 15_000L
     const val RECOVERY_COOLDOWN_MS = 60_000L
 
     fun listeningOnPort(output: String, port: Int = PORT): Boolean =
-        output.lineSequence().any { line ->
-            val fields = line.trim().split(Regex("\\s+")).filter(String::isNotBlank)
-            if (!fields.firstOrNull().equals("LISTEN", ignoreCase = true)) return@any false
-            val localEndpoint = fields.getOrNull(3) ?: return@any false
-            endpointPort(localEndpoint) == port
-        }
+        ControlPlaneRecoveryPolicy.listeningOnPort(output, port)
 
-    fun shouldProbe(nowElapsed: Long, lastProbeElapsed: Long): Boolean {
-        if (nowElapsed < 0L || lastProbeElapsed > nowElapsed) return false
-        if (lastProbeElapsed <= 0L) return true
-        return nowElapsed - lastProbeElapsed >= PROBE_INTERVAL_MS
-    }
+    fun shouldProbe(nowElapsed: Long, lastProbeElapsed: Long): Boolean =
+        ControlPlaneRecoveryPolicy.shouldProbe(
+            nowElapsed = nowElapsed,
+            lastProbeElapsed = lastProbeElapsed,
+            intervalMs = PROBE_INTERVAL_MS
+        )
+
+    fun phase(
+        nowElapsed: Long,
+        enabled: Boolean,
+        healthy: Boolean,
+        missingSinceElapsed: Long,
+        lastRecoveryElapsed: Long
+    ): ControlPlaneRecoveryPolicy.Phase = ControlPlaneRecoveryPolicy.phase(
+        nowElapsed = nowElapsed,
+        enabled = enabled,
+        healthy = healthy,
+        missingSinceElapsed = missingSinceElapsed,
+        lastRecoveryElapsed = lastRecoveryElapsed,
+        graceMs = MISSING_GRACE_MS,
+        cooldownMs = RECOVERY_COOLDOWN_MS
+    )
+
+    fun nextRecoveryEligibleElapsed(
+        nowElapsed: Long,
+        enabled: Boolean,
+        healthy: Boolean,
+        missingSinceElapsed: Long,
+        lastRecoveryElapsed: Long
+    ): Long = ControlPlaneRecoveryPolicy.nextRecoveryEligibleElapsed(
+        nowElapsed = nowElapsed,
+        enabled = enabled,
+        healthy = healthy,
+        missingSinceElapsed = missingSinceElapsed,
+        lastRecoveryElapsed = lastRecoveryElapsed,
+        graceMs = MISSING_GRACE_MS,
+        cooldownMs = RECOVERY_COOLDOWN_MS
+    )
 
     fun shouldRecover(
         nowElapsed: Long,
         armed: Boolean,
         missingSinceElapsed: Long,
         lastRecoveryElapsed: Long
-    ): Boolean {
-        if (
-            !armed ||
-            nowElapsed < 0L ||
-            missingSinceElapsed <= 0L ||
-            missingSinceElapsed > nowElapsed ||
-            lastRecoveryElapsed > nowElapsed
-        ) {
-            return false
-        }
-        if (nowElapsed - missingSinceElapsed < MISSING_GRACE_MS) return false
-        if (lastRecoveryElapsed <= 0L) return true
-        return nowElapsed - lastRecoveryElapsed >= RECOVERY_COOLDOWN_MS
-    }
-
-    private fun endpointPort(endpoint: String): Int? {
-        val normalized = endpoint.trim().removePrefix("[").replace("]:", ":")
-        return normalized.substringAfterLast(':', missingDelimiterValue = "").toIntOrNull()
-    }
+    ): Boolean = ControlPlaneRecoveryPolicy.shouldRecover(
+        nowElapsed = nowElapsed,
+        enabled = armed,
+        healthy = false,
+        missingSinceElapsed = missingSinceElapsed,
+        lastRecoveryElapsed = lastRecoveryElapsed,
+        graceMs = MISSING_GRACE_MS,
+        cooldownMs = RECOVERY_COOLDOWN_MS
+    )
 }

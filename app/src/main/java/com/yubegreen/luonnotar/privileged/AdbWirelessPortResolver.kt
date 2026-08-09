@@ -2,15 +2,18 @@ package com.yubegreen.luonnotar.privileged
 
 /**
  * Parses Android's `service call adb` Parcel output without depending on hidden
- * framework classes. IAdbManager has kept getAdbWirelessPort() as transaction
- * 10 and isAdbWifiSupported() as transaction 12; both calls are read-only.
+ * framework classes. The SDK 36 target is runtime-gated with the read-only
+ * isAdbWifiSupported() transaction before transaction 10 is accepted as the
+ * live getAdbWirelessPort() result.
  *
- * The target OriginOS / SDK 36 device was also live-verified with tx10 returning
- * 0x8349 (=33609) while that exact port accepted an authenticated ADB shell.
+ * Mainline intentionally treats the Binder result as authoritative on this
+ * device family: OriginOS can leave service.adb.tls.port empty while the Binder
+ * port is listening and accepts an authenticated ADB shell.
  */
 internal object AdbWirelessPortResolver {
     const val GET_WIRELESS_PORT_TRANSACTION = 10
     const val WIFI_SUPPORTED_TRANSACTION = 12
+    const val SOURCE_BINDER_TX10 = "binder_tx10"
 
     fun parseBooleanParcel(output: String): Boolean? {
         val words = parcelWords(output)

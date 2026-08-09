@@ -1,5 +1,22 @@
 # 努昂诺塔（Luonnotar）
 
+## 2.6.0 v130 / r294 真·主线整编
+
+v130 不再继续堆特权能力，而是冻结已经在 OriginOS / SDK 36 真机上通过故障注入的控制面自愈架构，把 v127-v129 的救援实验收束成正式主线基线。
+
+- transactional self-update / hot handoff 核心不动，内置引擎仍为 **r294**。
+- 将努昂诺塔 SSH `:8025`、固定 ADB `:5555`、可选 Termux SSH `:8022` 统一视为控制面恢复通道，共用 `disabled / healthy / missing_grace / recovery_due / backoff` 五阶段策略。
+- shell guardian 不再使用 `service.adb.tcp.port` 判断或描述 `:5555` 是否“配置好”。实测 OriginOS 上该属性可以是 `0`，但 Wireless ADB 本身仍完全可用。
+- Wireless ADB 端口主来源固定为真机验证过的 Binder 只读路径：先用 `service call adb 12` 确认 Wi-Fi ADB 支持，再用 transaction 10 取得实际监听端口；app-side snapshot 与 mDNS 只保留 fallback。
+- 保留 v129 generation rebind：ADB 维护恢复使用 `EmbeddedAdbService` 自己看到的当前 generation，不再接受 `:keeper` 的跨进程旧 generation 作为恢复事务权威。
+- guardian status 新增每条恢复通道的 `phase`、`nextRecoveryEligibleElapsed` 与 ADB `lastRecoveryResult`，状态 schema 升为 **56**。
+- ADB / Termux 的端口解析、grace、cooldown 统一收进纯策略 `ControlPlaneRecoveryPolicy`；补上 SDK 36 真机 Binder Parcel（33609 / 42949）解析回归测试，并修正旧的 15 秒 cadence 测试。
+- `luoterm` 默认等待从 75 秒提高到 120 秒，覆盖真机双杀时完整自愈窗口；设备选择仍与 `luosfud` 一致，iQOO 使用 `luoterm --iq`。
+
+真机主线验收基线：人工 `pkill sshd` 杀掉 Termux `:8022`，再用 `adb usb` 杀掉固定 `:5555`，adbd restart 同时带走 `:8025`。全程不执行任何 `rescue_*`：`8025` 先由 keeper 重生，随后 guardian 通过 Binder 找到 Wireless ADB 端口并恢复 `5555`，第二次 adbd restart 后 `8025` 再次重生，最终 Termux `8022` 也自行恢复。
+
+> 当前主线候选：**2.6.0（versionCode 130）**；内置引擎 **r294**；状态 schema **56**。
+
 ## 2.5.1 r262 厂商回冻 Recovery Owner + 自更新 PoC
 
 - 保留 r261 Provider-first 引擎控制和 r260 hot handoff。

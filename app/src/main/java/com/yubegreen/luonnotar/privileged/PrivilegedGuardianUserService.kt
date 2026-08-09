@@ -362,7 +362,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsBadAuthenticationCount = 0L
     private var lastGmsMcsConnectAttemptElapsed = 0L
     private var adbTcp5555ObservedHealthy = false
-    private var adbTcp5555Configured = false
     private var adbTcp5555LastProbeElapsed = 0L
     private var adbTcp5555LastHealthyElapsed = 0L
     private var adbTcp5555MissingSinceElapsed = 0L
@@ -374,6 +373,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var adbTcp5555WirelessPortSource = "none"
     private var adbTcp5555WirelessPortLastResolveElapsed = 0L
     private var adbTcp5555WirelessPortLastResolveResult = "never"
+    private var adbTcp5555LastRecoveryResult = "never"
     private var termuxSshdEligible = false
     private var termuxSshdObservedHealthy = false
     private var termuxSshdRunning = false
@@ -4340,11 +4340,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val listenerPresent =
             AdbTcpPortHealthPolicy.listeningOnPort(socketResult.stdout)
-        val configured = adbTcp5555ConfiguredLocked()
-        adbTcp5555Configured = configured
-        // v128: recovery intent is configuration, not volatile history. adb usb
-        // kills the shell engine, so "observed healthy" cannot be the only arm
-        // bit or a freshly respawned engine would refuse to restore :5555.
+        // Mainline: recovery intent is explicit configuration, not volatile history
+        // and not service.adb.tcp.port. On current OriginOS that property can read
+        // 0 while Wireless ADB remains healthy and capable of restoring :5555.
+        // adb usb also kills the shell engine, so a freshly respawned engine must
+        // remain armed even when it has never observed :5555 healthy itself.
         val armed = config.adbTcp5555RecoveryEnabled
         val changed = listenerPresent != adbTcp5555ListenerPresent
         adbTcp5555ListenerPresent = listenerPresent
@@ -4356,7 +4356,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (changed) {
                 eventLocked(
                     "adb_tcp_5555_listener_healthy",
-                    "configured=$configured source=ss"
+                    "recoveryEnabled=$armed source=ss"
                 )
             }
             return
@@ -4366,7 +4366,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (changed || adbTcp5555ProbeCount == 1L) {
                 eventLocked(
                     "adb_tcp_5555_monitor_unarmed",
-                    "listenerNeverObserved=true configured=$configured"
+                    "listenerNeverObserved=true recoveryEnabled=false"
                 )
             }
             return
@@ -4379,7 +4379,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             adbTcp5555MissingSinceElapsed = now
             eventLocked(
                 "adb_tcp_5555_listener_missing",
-                "configured=$configured lastHealthy=$adbTcp5555LastHealthyElapsed"
+                "recoveryEnabled=$armed lastHealthy=$adbTcp5555LastHealthyElapsed"
             )
         }
 
@@ -4401,7 +4401,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 add("--extra")
                 add("$RESCUE_EXTRA_WIRELESS_PORT:i:$wirelessPort")
                 add("--extra")
-                add("$RESCUE_EXTRA_WIRELESS_PORT_SOURCE:s:binder_tx10")
+                add("$RESCUE_EXTRA_WIRELESS_PORT_SOURCE:s:${AdbWirelessPortResolver.SOURCE_BINDER_TX10}")
             }
         }
         val dispatch = dispatchRescueProviderLocked(
@@ -4409,13 +4409,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             reason = "adb_tcp_5555_listener_missing",
             extras = extras
         )
+        adbTcp5555LastRecoveryResult = dispatch.summary()
         eventLocked(
             if (dispatch.success && dispatch.stdout.contains("ok=true")) {
                 "adb_tcp_5555_recovery_dispatched"
             } else {
                 "adb_tcp_5555_recovery_dispatch_failed"
             },
-            "configured=$configured result=${dispatch.summary()}"
+            "result=${dispatch.summary()}"
         )
     }
 
@@ -4545,11 +4546,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         adbTcp5555WirelessPort = port
-        adbTcp5555WirelessPortSource = "binder_tx10"
+        adbTcp5555WirelessPortSource = AdbWirelessPortResolver.SOURCE_BINDER_TX10
         adbTcp5555WirelessPortLastResolveResult = "port=$port"
         eventLocked(
             "adb_wireless_port_resolved",
-            "source=binder_tx10 port=$port"
+            "source=${AdbWirelessPortResolver.SOURCE_BINDER_TX10} port=$port"
         )
         return port
     }
@@ -4579,16 +4580,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         return result
     }
 
-    private fun adbTcp5555ConfiguredLocked(): Boolean =
-        listOf("service.adb.tcp.port", "persist.adb.tcp.port").any { property ->
-            val value = runner.run(
-                "getprop", property,
-                timeoutMs = PACKAGE_QUERY_TIMEOUT_MS
-            ).stdout.trim()
-            value.split(',', ' ').any { token ->
-                token.trim().toIntOrNull() == AdbTcpPortHealthPolicy.PORT
-            }
-        }
 
     private fun pulseAbsentPackageLocked(packageName: String, reason: String) {
         val details = mutableListOf<String>()
@@ -8307,7 +8298,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("adbTcp5555", JSONObject()
             .put("recoveryEnabled", config.adbTcp5555RecoveryEnabled)
             .put("armed", config.adbTcp5555RecoveryEnabled)
-            .put("configured", adbTcp5555Configured)
+            .put("phase", AdbTcpPortHealthPolicy.phase(
+                nowElapsed = SystemClock.elapsedRealtime(),
+                enabled = config.adbTcp5555RecoveryEnabled,
+                healthy = adbTcp5555ListenerPresent,
+                missingSinceElapsed = adbTcp5555MissingSinceElapsed,
+                lastRecoveryElapsed = adbTcp5555LastRecoveryElapsed
+            ).wireName)
+            .put("nextRecoveryEligibleElapsed", AdbTcpPortHealthPolicy.nextRecoveryEligibleElapsed(
+                nowElapsed = SystemClock.elapsedRealtime(),
+                enabled = config.adbTcp5555RecoveryEnabled,
+                healthy = adbTcp5555ListenerPresent,
+                missingSinceElapsed = adbTcp5555MissingSinceElapsed,
+                lastRecoveryElapsed = adbTcp5555LastRecoveryElapsed
+            ))
             .put("listenerPresent", adbTcp5555ListenerPresent)
             .put("observedHealthy", adbTcp5555ObservedHealthy)
             .put("lastProbeElapsed", adbTcp5555LastProbeElapsed)
@@ -8316,6 +8320,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastRecoveryElapsed", adbTcp5555LastRecoveryElapsed)
             .put("probeCount", adbTcp5555ProbeCount)
             .put("recoveryCount", adbTcp5555RecoveryCount)
+            .put("lastRecoveryResult", adbTcp5555LastRecoveryResult)
             .put("wirelessPort", if (adbTcp5555WirelessPort > 0) {
                 adbTcp5555WirelessPort
             } else {
@@ -8329,6 +8334,20 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("recoveryEnabled", config.termuxSshdRecoveryEnabled)
             .put("port", config.termuxSshPort)
             .put("eligible", termuxSshdEligible)
+            .put("phase", TermuxSshdHealthPolicy.phase(
+                nowElapsed = SystemClock.elapsedRealtime(),
+                enabled = termuxSshdEligible,
+                healthy = termuxSshdRunning,
+                missingSinceElapsed = termuxSshdMissingSinceElapsed,
+                lastRecoveryElapsed = termuxSshdLastRecoveryElapsed
+            ).wireName)
+            .put("nextRecoveryEligibleElapsed", TermuxSshdHealthPolicy.nextRecoveryEligibleElapsed(
+                nowElapsed = SystemClock.elapsedRealtime(),
+                enabled = termuxSshdEligible,
+                healthy = termuxSshdRunning,
+                missingSinceElapsed = termuxSshdMissingSinceElapsed,
+                lastRecoveryElapsed = termuxSshdLastRecoveryElapsed
+            ))
             .put("observedHealthy", termuxSshdObservedHealthy)
             .put("running", termuxSshdRunning)
             .put("lastProbeElapsed", termuxSshdLastProbeElapsed)
@@ -8668,7 +8687,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 55
+        private const val STATUS_SCHEMA = 56
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"

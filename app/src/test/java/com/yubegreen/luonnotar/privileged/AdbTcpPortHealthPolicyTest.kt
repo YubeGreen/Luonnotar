@@ -1,5 +1,6 @@
 package com.yubegreen.luonnotar.privileged
 
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -33,7 +34,7 @@ class AdbTcpPortHealthPolicyTest {
     fun recoveryRequiresArmingGraceAndCooldown() {
         assertFalse(
             AdbTcpPortHealthPolicy.shouldRecover(
-                nowElapsed = 200_000L,
+                nowElapsed = 115_000L,
                 armed = false,
                 missingSinceElapsed = 100_000L,
                 lastRecoveryElapsed = 0L
@@ -41,7 +42,7 @@ class AdbTcpPortHealthPolicyTest {
         )
         assertFalse(
             AdbTcpPortHealthPolicy.shouldRecover(
-                nowElapsed = 150_000L,
+                nowElapsed = 114_999L,
                 armed = true,
                 missingSinceElapsed = 100_000L,
                 lastRecoveryElapsed = 0L
@@ -49,7 +50,7 @@ class AdbTcpPortHealthPolicyTest {
         )
         assertTrue(
             AdbTcpPortHealthPolicy.shouldRecover(
-                nowElapsed = 200_000L,
+                nowElapsed = 115_000L,
                 armed = true,
                 missingSinceElapsed = 100_000L,
                 lastRecoveryElapsed = 0L
@@ -57,33 +58,40 @@ class AdbTcpPortHealthPolicyTest {
         )
         assertFalse(
             AdbTcpPortHealthPolicy.shouldRecover(
-                nowElapsed = 300_000L,
+                nowElapsed = 159_999L,
                 armed = true,
                 missingSinceElapsed = 100_000L,
-                lastRecoveryElapsed = 250_000L
-            )
-        )
-    }
-    @Test
-    fun probesImmediatelyThenAtOneMinuteIntervals() {
-        assertTrue(
-            AdbTcpPortHealthPolicy.shouldProbe(
-                nowElapsed = 100_000L,
-                lastProbeElapsed = 0L
-            )
-        )
-        assertFalse(
-            AdbTcpPortHealthPolicy.shouldProbe(
-                nowElapsed = 150_000L,
-                lastProbeElapsed = 100_000L
+                lastRecoveryElapsed = 100_000L
             )
         )
         assertTrue(
-            AdbTcpPortHealthPolicy.shouldProbe(
+            AdbTcpPortHealthPolicy.shouldRecover(
                 nowElapsed = 160_000L,
-                lastProbeElapsed = 100_000L
+                armed = true,
+                missingSinceElapsed = 100_000L,
+                lastRecoveryElapsed = 100_000L
             )
         )
     }
 
+    @Test
+    fun probesAtFifteenSecondCadence() {
+        assertTrue(AdbTcpPortHealthPolicy.shouldProbe(100_000L, 0L))
+        assertFalse(AdbTcpPortHealthPolicy.shouldProbe(114_999L, 100_000L))
+        assertTrue(AdbTcpPortHealthPolicy.shouldProbe(115_000L, 100_000L))
+    }
+
+    @Test
+    fun exposesMainlinePhaseAndDeadline() {
+        assertEquals(
+            ControlPlaneRecoveryPolicy.Phase.MISSING_GRACE,
+            AdbTcpPortHealthPolicy.phase(110_000L, true, false, 100_000L, 0L)
+        )
+        assertEquals(
+            115_000L,
+            AdbTcpPortHealthPolicy.nextRecoveryEligibleElapsed(
+                110_000L, true, false, 100_000L, 0L
+            )
+        )
+    }
 }
