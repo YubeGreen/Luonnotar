@@ -38,4 +38,4 @@ PY
 
 echo "MAC_SHORTCUT_OK: installed luoterm -> $PROJECT_ROOT/tools/luonnotar-remote-termux.sh"
 echo "Run: source \"$ZSHRC\""
-echo "Then: luoterm --iq   (or simply: luoterm)"
+echo "Then: luoterm --iq   (or: luoterm HOST / USER@HOST:PORT)"
