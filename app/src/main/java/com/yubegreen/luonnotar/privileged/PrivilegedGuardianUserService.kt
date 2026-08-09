@@ -370,6 +370,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var adbTcp5555ProbeCount = 0L
     private var adbTcp5555RecoveryCount = 0L
     private var adbTcp5555ListenerPresent = false
+    private var termuxSshdEligible = false
+    private var termuxSshdObservedHealthy = false
+    private var termuxSshdRunning = false
+    private var termuxSshdLastProbeElapsed = 0L
+    private var termuxSshdLastHealthyElapsed = 0L
+    private var termuxSshdMissingSinceElapsed = 0L
+    private var termuxSshdLastRecoveryElapsed = 0L
+    private var termuxSshdProbeCount = 0L
+    private var termuxSshdRecoveryCount = 0L
+    private var termuxSshdLastRecoveryResult = "never"
     private var diagnosticWriteErrorCount = 0L
     private var lastDiagnosticStatusWriteElapsed = 0L
     @Volatile private var cachedStatusJson = "{}"
@@ -4376,60 +4386,107 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) {
             return
         }
+        adbTcp5555LastRecoveryElapsed = now
+        adbTcp5555RecoveryCount += 1
+        val dispatch = dispatchRescueProviderLocked(
+            method = RESCUE_METHOD_ADB_5555,
+            reason = "adb_tcp_5555_listener_missing"
+        )
+        eventLocked(
+            if (dispatch.success && dispatch.stdout.contains("ok=true")) {
+                "adb_tcp_5555_recovery_dispatched"
+            } else {
+                "adb_tcp_5555_recovery_dispatch_failed"
+            },
+            "configured=$configured result=${dispatch.summary()}"
+        )
+    }
+
+    private fun maybeProbeTermuxSshdLocked(now: Long) {
         if (
-            "com.termux" !in config.packageTargets ||
-            !packageInstalled("com.termux")
-        ) {
-            eventLocked(
-                "adb_tcp_5555_recovery_skipped",
-                "termux_not_targeted_or_not_installed"
+            !TermuxSshdHealthPolicy.shouldProbe(
+                nowElapsed = now,
+                lastProbeElapsed = termuxSshdLastProbeElapsed
             )
+        ) {
+            return
+        }
+        termuxSshdLastProbeElapsed = now
+        termuxSshdProbeCount += 1
+        termuxSshdEligible =
+            "com.termux" in config.packageTargets && packageInstalled("com.termux")
+        if (!termuxSshdEligible) {
+            termuxSshdRunning = false
+            termuxSshdMissingSinceElapsed = 0L
             return
         }
 
-        adbTcp5555LastRecoveryElapsed = now
-        adbTcp5555RecoveryCount += 1
-        tunePackageLocked("com.termux")
-        GuardianProcessParser.matching(
-            listProcessesLocked(),
-            processTargetsForPackage("com.termux")
-        ).forEach { process ->
-            if (readFreezeState(process.pid).frozen == true) {
-                val unfreeze = unfreezeLocked(process)
-                if (!unfreeze.stdout.contains("not_applicable_secondary_process")) {
-                    actionCount += 1
-                    if (!isUnfreezeAccepted(unfreeze)) commandFailureCount += 1
-                }
+        val pidof = runner.run("pidof", "sshd", timeoutMs = TERMUX_SSHD_PROBE_TIMEOUT_MS)
+        val runningNow = pidof.success && TermuxSshdHealthPolicy.processRunning(pidof.stdout)
+        val changed = runningNow != termuxSshdRunning
+        termuxSshdRunning = runningNow
+        if (runningNow) {
+            termuxSshdObservedHealthy = true
+            termuxSshdLastHealthyElapsed = now
+            termuxSshdMissingSinceElapsed = 0L
+            if (changed) {
+                eventLocked("termux_sshd_healthy", "pids=${pidof.stdout.trim().take(120)}")
             }
+            return
         }
-        val launcher = attemptBackgroundLauncherWakeLocked(
-            packageName = "com.termux",
-            reason = "adb_tcp_5555_listener_missing",
-            foregroundHoldMs = AdbTcpPortHealthPolicy.FOREGROUND_HOLD_MS
+
+        if (termuxSshdMissingSinceElapsed <= 0L || termuxSshdMissingSinceElapsed > now) {
+            termuxSshdMissingSinceElapsed = now
+            eventLocked(
+                "termux_sshd_missing",
+                "observedHealthy=$termuxSshdObservedHealthy probe=${pidof.summary()}"
+            )
+        }
+        if (
+            !TermuxSshdHealthPolicy.shouldRecover(
+                nowElapsed = now,
+                armed = true,
+                missingSinceElapsed = termuxSshdMissingSinceElapsed,
+                lastRecoveryElapsed = termuxSshdLastRecoveryElapsed
+            )
+        ) {
+            return
+        }
+
+        termuxSshdLastRecoveryElapsed = now
+        termuxSshdRecoveryCount += 1
+        tunePackageLocked("com.termux")
+        val dispatch = dispatchRescueProviderLocked(
+            method = RESCUE_METHOD_TERMUX_SSHD,
+            reason = "termux_sshd_missing"
         )
-        SystemClock.sleep(1_000L)
-        val verify = runner.run(
-            "ss", "-H", "-ltn",
-            timeoutMs = SOCKET_PROBE_TIMEOUT_MS
+        termuxSshdLastRecoveryResult = dispatch.summary()
+        eventLocked(
+            if (dispatch.success && dispatch.stdout.contains("ok=true")) {
+                "termux_sshd_recovery_dispatched"
+            } else {
+                "termux_sshd_recovery_dispatch_failed"
+            },
+            dispatch.summary()
         )
-        val recovered =
-            verify.success &&
-                AdbTcpPortHealthPolicy.listeningOnPort(verify.stdout)
-        if (recovered) {
-            adbTcp5555ListenerPresent = true
-            adbTcp5555ObservedHealthy = true
-            adbTcp5555LastHealthyElapsed = SystemClock.elapsedRealtime()
-            adbTcp5555MissingSinceElapsed = 0L
+    }
+
+    private fun dispatchRescueProviderLocked(method: String, reason: String): GuardianCommandResult {
+        val result = runner.run(
+            "content", "call",
+            "--uri", RESCUE_PROVIDER_URI,
+            "--method", method,
+            timeoutMs = RESCUE_PROVIDER_TIMEOUT_MS
+        )
+        actionCount += 1
+        if (!result.success || !result.stdout.contains("ok=true")) {
+            commandFailureCount += 1
         }
         eventLocked(
-            if (recovered) {
-                "adb_tcp_5555_recovery_verified"
-            } else {
-                "adb_tcp_5555_recovery_unresolved"
-            },
-            "launcher=${launcher.name.lowercase()} configured=$configured " +
-                "verify=${verify.summary()}"
+            "rescue_provider_request",
+            "method=$method reason=$reason result=${result.summary()}"
         )
+        return result
     }
 
     private fun adbTcp5555ConfiguredLocked(): Boolean =
@@ -5195,6 +5252,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         latestProcesses = states
         maybeWakeManagedPackagesLocked(now, matched)
         maybeProbeAdbTcp5555Locked(now)
+        maybeProbeTermuxSshdLocked(now)
 
         if (force || lastTuneElapsed <= 0L || now - lastTuneElapsed >= config.tuningIntervalMs) {
             tunePackagesLocked()
@@ -7765,6 +7823,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("TAILSCALE_INGRESS_OK", JSONObject.NULL)
             .put("TAILSCALE_INGRESS_STATE", "external_probe_not_configured")
             .put("ADB_5555_OK", adbTcp5555ListenerPresent)
+            .put("TERMUX_SSHD_OK", if (termuxSshdEligible) termuxSshdRunning else JSONObject.NULL)
         )
         .put("startedElapsed", startedElapsed)
         .put("lastCycleElapsed", lastCycleElapsed)
@@ -8167,6 +8226,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("probeCount", adbTcp5555ProbeCount)
             .put("recoveryCount", adbTcp5555RecoveryCount)
         )
+        .put("termuxSshd", JSONObject()
+            .put("eligible", termuxSshdEligible)
+            .put("observedHealthy", termuxSshdObservedHealthy)
+            .put("running", termuxSshdRunning)
+            .put("lastProbeElapsed", termuxSshdLastProbeElapsed)
+            .put("lastHealthyElapsed", termuxSshdLastHealthyElapsed)
+            .put("missingSinceElapsed", termuxSshdMissingSinceElapsed)
+            .put("lastRecoveryElapsed", termuxSshdLastRecoveryElapsed)
+            .put("probeCount", termuxSshdProbeCount)
+            .put("recoveryCount", termuxSshdRecoveryCount)
+            .put("lastRecoveryResult", termuxSshdLastRecoveryResult)
+        )
         .put("protectionHealth", protectionHealthJsonLocked())
         .put("backgroundPolicy", lastBackgroundPolicyReport.toJsonObject())
         .put("config", JSONObject(config.toJson()))
@@ -8496,7 +8567,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 53
+        private const val STATUS_SCHEMA = 54
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
@@ -8559,6 +8630,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val GMS_LOG_SIGNAL_DEBOUNCE_MS = 5_000L
         private const val GMS_FROZEN_TRANSPORT_PROBE_INTERVAL_MS = 10_000L
         private const val SOCKET_PROBE_TIMEOUT_MS = 4_000L
+        private const val TERMUX_SSHD_PROBE_TIMEOUT_MS = 1_500L
+        private const val RESCUE_PROVIDER_TIMEOUT_MS = 3_000L
+        private const val RESCUE_PROVIDER_URI =
+            "content://com.yubegreen.luonnotar.adb_runtime_config"
+        private const val RESCUE_METHOD_ADB_5555 = "rescue_adb_5555"
+        private const val RESCUE_METHOD_TERMUX_SSHD = "rescue_termux_sshd"
         private const val PACKAGE_KILL_TIMEOUT_MS = 8_000L
         private const val PACKAGE_STOP_APP_TIMEOUT_MS = 8_000L
         private const val PACKAGE_FORCE_STOP_TIMEOUT_MS = 10_000L

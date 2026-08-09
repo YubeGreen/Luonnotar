@@ -2,18 +2,22 @@ package com.yubegreen.luonnotar.service
 
 import android.content.ContentProvider
 import android.content.ContentValues
+import android.content.Intent
 import android.database.Cursor
 import android.net.Uri
 import android.os.Binder
 import android.os.Bundle
 import android.os.Process
 import android.os.SystemClock
+import androidx.core.content.ContextCompat
 import com.yubegreen.luonnotar.BuildConfig
 import com.yubegreen.luonnotar.experiment.ExperimentSessionOperationResult
 import com.yubegreen.luonnotar.experiment.ExperimentSessionRecorder
 import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianClient
 import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianManager
 import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianProtocol
+import com.yubegreen.luonnotar.privileged.embedded.EmbeddedAdbService
+import com.yubegreen.luonnotar.privileged.embedded.TermuxRunCommandBridge
 import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianStore
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
@@ -67,6 +71,8 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             METHOD_SSH_STATUS -> sshStatus(appContext)
             METHOD_SSH_RECONCILE -> sshReconcile(appContext)
             METHOD_SSH_INSTALL_AUTHORIZED_KEY -> sshInstallAuthorizedKey(appContext, extras ?: Bundle.EMPTY)
+            METHOD_RESCUE_ADB_5555 -> rescueAdb5555(appContext)
+            METHOD_RESCUE_TERMUX_SSHD -> rescueTermuxSshd(appContext)
             METHOD_SET -> setRuntimeConfig(appContext, extras ?: Bundle.EMPTY)
             METHOD_PROBE -> probeNow(appContext, extras ?: Bundle.EMPTY)
             METHOD_EXPERIMENT_START -> experimentStart(
@@ -84,6 +90,49 @@ class AdbRuntimeConfigProvider : ContentProvider() {
                 values = emptyMap()
             )
         }
+    }
+
+    private fun rescueAdb5555(context: android.content.Context): Bundle {
+        val snapshot = EmbeddedGuardianStore.snapshot(context)
+        if (!snapshot.featureEnabled) {
+            return resultBundle(false, "feature_disabled", emptyMap())
+        }
+        val dispatched = runCatching {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, EmbeddedAdbService::class.java)
+                    .setAction(EmbeddedAdbService.ACTION_RECOVER_ADB_5555)
+                    .putExtra(EmbeddedAdbService.EXTRA_GENERATION, snapshot.generation)
+            )
+            true
+        }.getOrElse { error ->
+            LogManager.event(
+                context,
+                "adb_tcp_5555_recovery_dispatch_failed",
+                mapOf("error" to error.toString().take(500))
+            )
+            false
+        }
+        return resultBundle(
+            ok = dispatched,
+            reason = if (dispatched) "" else "dispatch_failed",
+            values = mapOf(
+                "dispatched" to dispatched,
+                "generation" to snapshot.generation
+            )
+        )
+    }
+
+    private fun rescueTermuxSshd(context: android.content.Context): Bundle {
+        val result = TermuxRunCommandBridge.startSshd(context)
+        return resultBundle(
+            ok = result.ok,
+            reason = if (result.ok) "" else result.reason,
+            values = mapOf(
+                "dispatched" to result.ok,
+                "permissionGranted" to result.permissionGranted
+            )
+        )
     }
 
     private fun status(context: android.content.Context): Bundle {
@@ -1327,6 +1376,8 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val METHOD_SSH_STATUS = "ssh_status"
         const val METHOD_SSH_RECONCILE = "ssh_reconcile"
         const val METHOD_SSH_INSTALL_AUTHORIZED_KEY = "ssh_install_authorized_key"
+        const val METHOD_RESCUE_ADB_5555 = "rescue_adb_5555"
+        const val METHOD_RESCUE_TERMUX_SSHD = "rescue_termux_sshd"
         const val METHOD_SET = "set"
         const val METHOD_PROBE = "probe"
         const val METHOD_EXPERIMENT_START = "experiment_start"

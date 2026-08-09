@@ -1,18 +1,17 @@
 package com.yubegreen.luonnotar.privileged
 
 /**
- * Read-only health policy for the local ADB TCP listener used by remote devices.
+ * Health/recovery cadence for the fixed ADB TCP listener used by remote devices.
  *
- * The guardian never restarts adbd or changes a TCP port. When a previously
- * observed/configured listener disappears for long enough, it may wake Termux
- * so the user's existing recovery script can reassert the tunnel/listener.
+ * The shell guardian only decides when recovery is warranted. v127 dispatches
+ * the actual tcpip:5555 request through the app-side paired Kadb transport, so
+ * this policy remains side-effect free and independently testable.
  */
 internal object AdbTcpPortHealthPolicy {
     const val PORT = 5555
     const val PROBE_INTERVAL_MS = 60_000L
     const val MISSING_GRACE_MS = 90_000L
     const val RECOVERY_COOLDOWN_MS = 5 * 60_000L
-    const val FOREGROUND_HOLD_MS = 8_000L
 
     fun listeningOnPort(output: String, port: Int = PORT): Boolean =
         output.lineSequence().any { line ->

@@ -13,6 +13,7 @@ import com.yubegreen.luonnotar.util.LogManager
 import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.CountDownLatch
+import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.Executors
 import java.util.concurrent.atomic.AtomicBoolean
@@ -114,6 +115,7 @@ class EmbeddedAdbService : Service() {
                     .orEmpty()
                     .ifBlank { "engine_restart" }
             )
+            ACTION_RECOVER_ADB_5555 -> startAdbTcp5555Recovery(generation)
             ACTION_PAIR -> {
                 val code = RemoteInput.getResultsFromIntent(command)
                     ?.getCharSequence(EmbeddedGuardianNotifier.REMOTE_INPUT_KEY)
@@ -175,6 +177,113 @@ class EmbeddedAdbService : Service() {
     }
 
     override fun onBind(intent: Intent?): IBinder? = null
+
+    private fun startAdbTcp5555Recovery(generation: Long) {
+        if (!isActive(generation)) return
+        LogManager.event(
+            this,
+            "adb_tcp_5555_recovery_started",
+            mapOf("generation" to generation)
+        )
+        executor.execute {
+            val result = runCatching { recoverAdbTcp5555(generation) }
+            val recovered = result.getOrDefault(false)
+            LogManager.event(
+                this,
+                if (recovered) "adb_tcp_5555_recovery_verified" else "adb_tcp_5555_recovery_failed",
+                mapOf(
+                    "generation" to generation,
+                    "error" to (result.exceptionOrNull()?.toString()?.take(500) ?: "")
+                )
+            )
+            stopForeground(STOP_FOREGROUND_REMOVE)
+            stopSelf()
+        }
+    }
+
+    /**
+     * Reassert traditional ADB TCP mode through an already-authorized Android
+     * wireless-debugging endpoint. The request is sent to adbd itself using the
+     * existing Kadb identity; shell setprop is intentionally not used.
+     */
+    private fun recoverAdbTcp5555(generation: Long): Boolean {
+        if (!isActive(generation)) return false
+        if (probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)) return true
+        val snapshot = EmbeddedGuardianStore.snapshot(this)
+        check(snapshot.paired) { "wireless ADB identity is not paired" }
+        EmbeddedAdbIdentity.ensure(this)
+
+        val ports = LinkedBlockingQueue<Int>()
+        val seen = linkedSetOf<Int>()
+        snapshot.connectPort
+            .takeIf { it in 1..65535 && it != ADB_TCP_RECOVERY_PORT }
+            ?.let(ports::offer)
+        val localDiscovery = WirelessAdbDiscovery(
+            context = this,
+            onPairingPort = {},
+            onConnectPort = { port ->
+                if (port in 1..65535 && port != ADB_TCP_RECOVERY_PORT) ports.offer(port)
+            },
+            onError = { error ->
+                LogManager.event(
+                    this,
+                    "adb_tcp_5555_recovery_mdns_error",
+                    mapOf("error" to error.take(400))
+                )
+            }
+        )
+        localDiscovery.start()
+        try {
+            val deadline = SystemClock.elapsedRealtime() + ADB_TCP_RECOVERY_DISCOVERY_MS
+            while (isActive(generation) && SystemClock.elapsedRealtime() < deadline) {
+                if (probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)) return true
+                val remaining = (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(1L)
+                val port = ports.poll(remaining.coerceAtMost(1_000L), TimeUnit.MILLISECONDS)
+                    ?: continue
+                if (!seen.add(port)) continue
+                LogManager.event(
+                    this,
+                    "adb_tcp_5555_recovery_endpoint_attempt",
+                    mapOf("generation" to generation, "port" to port)
+                )
+                if (reassertAdbTcp5555Through(port)) return true
+            }
+        } finally {
+            localDiscovery.close()
+        }
+        return probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)
+    }
+
+    private fun reassertAdbTcp5555Through(adbPort: Int): Boolean {
+        if (!probeLocalTcpPort(adbPort)) return false
+        var requestError: Throwable? = null
+        runCatching {
+            Kadb.create("127.0.0.1", adbPort).use { adb ->
+                adb.open("tcpip:$ADB_TCP_RECOVERY_PORT").use {
+                    // adbd restarts as a side effect; the transport may disappear
+                    // immediately after accepting OPEN, so verification is decisive.
+                    Thread.sleep(150L)
+                }
+            }
+        }.onFailure { requestError = it }
+
+        repeat(ADB_TCP_RECOVERY_VERIFY_ATTEMPTS) {
+            Thread.sleep(ADB_TCP_RECOVERY_VERIFY_INTERVAL_MS)
+            if (probeLocalTcpPort(ADB_TCP_RECOVERY_PORT)) {
+                LogManager.event(
+                    this,
+                    "adb_tcp_5555_recovery_transport_verified",
+                    mapOf(
+                        "sourcePort" to adbPort,
+                        "requestError" to (requestError?.toString()?.take(300) ?: "")
+                    )
+                )
+                return true
+            }
+        }
+        if (requestError != null) throw requestError as Throwable
+        return false
+    }
 
     private fun startEngineRestart(generation: Long, source: String) {
         if (!isActive(generation)) return
@@ -751,10 +860,16 @@ class EmbeddedAdbService : Service() {
         const val ACTION_STOP = "com.yubegreen.luonnotar.action.EMBEDDED_ADB_STOP"
         const val ACTION_RESTART_ENGINE =
             "com.yubegreen.luonnotar.action.EMBEDDED_ADB_RESTART_ENGINE"
+        const val ACTION_RECOVER_ADB_5555 =
+            "com.yubegreen.luonnotar.action.EMBEDDED_ADB_RECOVER_5555"
         const val EXTRA_GENERATION = "embedded_guardian_generation"
         const val EXTRA_RESTART_SOURCE = "embedded_guardian_restart_source"
         private const val LOCAL_PROPERTY_TIMEOUT_MS = 1_000L
         private const val LOCAL_TCP_PROBE_TIMEOUT_MS = 600
+        private const val ADB_TCP_RECOVERY_PORT = 5555
+        private const val ADB_TCP_RECOVERY_DISCOVERY_MS = 20_000L
+        private const val ADB_TCP_RECOVERY_VERIFY_ATTEMPTS = 16
+        private const val ADB_TCP_RECOVERY_VERIFY_INTERVAL_MS = 250L
         private const val MIN_RETRY_DELAY_MS = 1_000L
         private val PAIRING_CODE = Regex("^[0-9]{6}$")
     }
