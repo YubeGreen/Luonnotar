@@ -22,7 +22,7 @@ internal object EmbeddedGuardianHandoffLauncher {
         require(expectedRevision >= EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION) {
             "invalid expected revision"
         }
-        verifyInstalledPackagePathForTransaction(apkPath)
+        verifyInstalledPackagePath(apkPath)
 
         val oldPid = Process.myPid()
         val oldStartTicks = readStartTicks(oldPid)
@@ -66,7 +66,7 @@ internal object EmbeddedGuardianHandoffLauncher {
             ?: error("missing proc starttime")
     }
 
-    internal fun verifyInstalledPackagePathForTransaction(apkPath: String) {
+    private fun verifyInstalledPackagePath(apkPath: String) {
         require(apkPath.startsWith('/') && apkPath.endsWith(".apk")) { "invalid APK path" }
         val canonical = File(apkPath).canonicalPath
         require(File(canonical).isFile && File(canonical).canRead()) { "APK is not readable" }

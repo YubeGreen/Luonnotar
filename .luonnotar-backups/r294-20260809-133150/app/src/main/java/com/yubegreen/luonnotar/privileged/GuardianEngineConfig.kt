@@ -33,9 +33,7 @@ data class GuardianEngineConfig(
     val gmsTransportBadAuthWindowMs: Long = 10 * 60_000L,
     val gmsTransportMissingAfterBadAuthMs: Long = 90_000L,
     val gmsTransportLostMs: Long = 4 * 60_000L,
-    val gmsTransportVerifyWaitMs: Long = 60_000L,
-    val sshGuardianEnabled: Boolean = true,
-    val sshPort: Int = 8025
+    val gmsTransportVerifyWaitMs: Long = 60_000L
 ) {
     fun normalized(): GuardianEngineConfig = copy(
         processTargets = processTargets
@@ -63,8 +61,7 @@ data class GuardianEngineConfig(
         gmsTransportMissingAfterBadAuthMs =
             gmsTransportMissingAfterBadAuthMs.coerceIn(30_000L, 15 * 60_000L),
         gmsTransportLostMs = gmsTransportLostMs.coerceIn(2 * 60_000L, 30 * 60_000L),
-        gmsTransportVerifyWaitMs = gmsTransportVerifyWaitMs.coerceIn(15_000L, 3 * 60_000L),
-        sshPort = sshPort.coerceIn(1024, 65535)
+        gmsTransportVerifyWaitMs = gmsTransportVerifyWaitMs.coerceIn(15_000L, 3 * 60_000L)
     )
 
     fun toJson(): String = JSONObject()
@@ -95,12 +92,10 @@ data class GuardianEngineConfig(
         .put("gmsTransportMissingAfterBadAuthMs", gmsTransportMissingAfterBadAuthMs)
         .put("gmsTransportLostMs", gmsTransportLostMs)
         .put("gmsTransportVerifyWaitMs", gmsTransportVerifyWaitMs)
-        .put("sshGuardianEnabled", sshGuardianEnabled)
-        .put("sshPort", sshPort)
         .toString()
 
     companion object {
-        const val SCHEMA = 8
+        const val SCHEMA = 7
 
         val DEFAULT_PROCESS_TARGETS = listOf(
             "com.google.android.gms",
@@ -188,10 +183,7 @@ data class GuardianEngineConfig(
                     gmsTransportLostMs =
                         json.optLong("gmsTransportLostMs", 4 * 60_000L),
                     gmsTransportVerifyWaitMs =
-                        json.optLong("gmsTransportVerifyWaitMs", 60_000L),
-                    sshGuardianEnabled = if (schema < 8) true else
-                        json.optBoolean("sshGuardianEnabled", true),
-                    sshPort = if (schema < 8) 8025 else json.optInt("sshPort", 8025)
+                        json.optLong("gmsTransportVerifyWaitMs", 60_000L)
                 ).normalized()
             }.getOrElse { GuardianEngineConfig() }
         }

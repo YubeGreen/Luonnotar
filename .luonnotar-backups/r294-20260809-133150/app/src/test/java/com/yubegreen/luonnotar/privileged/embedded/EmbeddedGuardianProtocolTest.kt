@@ -29,14 +29,10 @@ class EmbeddedGuardianProtocolTest {
         assertFalse(JSONObject(EmbeddedGuardianProtocol.failure("bad")).getBoolean("ok"))
     }
 
-    @Test fun engineRevisionMatches260ReleaseR294() {
-        assertEquals(294, EmbeddedGuardianProtocol.ENGINE_REVISION)
+    @Test fun engineRevisionMatches253ReleaseR293() {
+        assertEquals(293, EmbeddedGuardianProtocol.ENGINE_REVISION)
         assertEquals(260, EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION)
         assertEquals("handoff", EmbeddedGuardianProtocol.OP_HANDOFF)
-        assertEquals("handoff_prepare", EmbeddedGuardianProtocol.OP_HANDOFF_PREPARE)
-        assertEquals("handoff_promote", EmbeddedGuardianProtocol.OP_HANDOFF_PROMOTE)
-        assertEquals("handoff_activate", EmbeddedGuardianProtocol.OP_HANDOFF_ACTIVATE)
-        assertEquals("ssh_status", EmbeddedGuardianProtocol.OP_SSH_STATUS)
         assertEquals("install_self_update", EmbeddedGuardianProtocol.OP_INSTALL_SELF_UPDATE)
     }
 }

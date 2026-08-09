@@ -47,34 +47,6 @@ internal object EmbeddedGuardianHandoffCommand {
         }
     }
 
-    fun buildCandidate(
-        apkPath: String,
-        mainClass: String,
-        port: Int,
-        token: String,
-        expectedRevision: Int,
-        reason: String
-    ): String {
-        require(apkPath.isNotBlank() && apkPath.startsWith('/')) { "invalid APK path" }
-        require(mainClass.matches(CLASS_NAME)) { "invalid main class" }
-        require(port in 1024..65535) { "invalid candidate port" }
-        require(token.matches(TOKEN)) { "invalid candidate token" }
-        require(expectedRevision >= EmbeddedGuardianProtocol.ENGINE_REVISION) { "invalid expected revision" }
-        val q = EmbeddedGuardianProtocol::shellQuote
-        return buildString {
-            append("export CLASSPATH=").append(q(apkPath)).append("; ")
-            append("(")
-            append("exec /system/bin/app_process /system/bin --nice-name=")
-                .append(EmbeddedGuardianStarterCommand.PROCESS_NAME).append(' ')
-            append(q(mainClass)).append(" --port ").append(port)
-            append(" --token ").append(q(token))
-            append(" --reason ").append(q("transactional_candidate:$reason:expected_r$expectedRevision"))
-            append(" --role candidate")
-            append(" </dev/null >>").append(q(EmbeddedGuardianStarterCommand.LOG_PATH)).append(" 2>&1")
-            append(") & echo $!")
-        }
-    }
-
     private val TOKEN = Regex("^[a-f0-9]{64}$")
     private val CLASS_NAME = Regex("^[A-Za-z_][A-Za-z0-9_$.]*$")
 }

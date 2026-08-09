@@ -18,19 +18,9 @@ class EmbeddedGuardianClient(
     fun applyBackgroundPolicy(requestJson: String): String =
         call(EmbeddedGuardianProtocol.OP_BACKGROUND_POLICY, requestJson)
     fun handoff(requestJson: String): String = call(EmbeddedGuardianProtocol.OP_HANDOFF, requestJson)
-    fun handoffPrepare(requestJson: String): String =
-        call(EmbeddedGuardianProtocol.OP_HANDOFF_PREPARE, requestJson)
-    fun handoffPromote(requestJson: String): String =
-        call(EmbeddedGuardianProtocol.OP_HANDOFF_PROMOTE, requestJson)
-    fun handoffActivate(requestJson: String): String =
-        call(EmbeddedGuardianProtocol.OP_HANDOFF_ACTIVATE, requestJson)
     fun installSelfUpdate(requestJson: String): String =
         call(EmbeddedGuardianProtocol.OP_INSTALL_SELF_UPDATE, requestJson)
     fun selfUpdateStatus(): String = call(EmbeddedGuardianProtocol.OP_SELF_UPDATE_STATUS)
-    fun sshStatus(): String = call(EmbeddedGuardianProtocol.OP_SSH_STATUS)
-    fun sshReconcile(): String = call(EmbeddedGuardianProtocol.OP_SSH_RECONCILE)
-    fun sshInstallAuthorizedKey(requestJson: String): String =
-        call(EmbeddedGuardianProtocol.OP_SSH_INSTALL_AUTHORIZED_KEY, requestJson)
     fun stop(): String = call(EmbeddedGuardianProtocol.OP_STOP)
     fun destroy(): String = call(EmbeddedGuardianProtocol.OP_DESTROY)
 

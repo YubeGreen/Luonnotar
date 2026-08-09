@@ -29,8 +29,8 @@ android {
         applicationId = "com.yubegreen.luonnotar"
         minSdk = 26
         targetSdk = 36
-        versionCode = 116
-        versionName = "2.6.0"
+        versionCode = 115
+        versionName = "2.5.3"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEVELOPER_NAME", "\"YubeGreen\"")
     }
@@ -133,8 +133,6 @@ dependencies {
     implementation("dev.rikka.shizuku:api:13.1.5")
     implementation("dev.rikka.shizuku:provider:13.1.5")
     implementation("com.flyfishxu:kadb-android:1.3.0")
-    implementation("org.apache.sshd:sshd-core:2.19.0")
-    implementation("org.slf4j:slf4j-nop:2.0.18")
 
     testImplementation("junit:junit:4.13.2")
     testImplementation("org.json:json:20240303")

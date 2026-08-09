@@ -16,8 +16,8 @@ import kotlin.concurrent.thread
  * unclean process death, unlike PID-file-only schemes.
  */
 internal class EmbeddedEngineInstanceGuard private constructor(
-    private var randomAccessFile: RandomAccessFile?,
-    private var fileLock: FileLock?,
+    private val randomAccessFile: RandomAccessFile,
+    private val fileLock: FileLock,
     private val lifecycleFile: File,
     private val stateFile: File,
     val instanceId: String,
@@ -26,8 +26,6 @@ internal class EmbeddedEngineInstanceGuard private constructor(
     private val startReason: String
 ) : Closeable {
     private val closed = AtomicBoolean(false)
-    private var handoffRandomAccessFile: RandomAccessFile? = null
-    private var handoffFileLock: FileLock? = null
     private val heartbeatThread = thread(
         start = true,
         isDaemon = true,
@@ -53,123 +51,16 @@ internal class EmbeddedEngineInstanceGuard private constructor(
         )
     }
 
-    fun recordHandoffFailed(
-        expectedRevision: Int,
-        candidateRevision: Int,
-        candidatePid: Int,
-        reason: String
-    ) {
-        appendLifecycle(
-            "handoff_failed",
-            mapOf(
-                "expectedRevision" to expectedRevision,
-                "candidateRevision" to candidateRevision,
-                "candidatePid" to candidatePid,
-                "reason" to reason.take(500)
-            )
-        )
-    }
-
-    fun recordCandidateReady(expectedRevision: Int, sshHealthy: Boolean, sshProvisioned: Boolean) {
-        appendLifecycle(
-            "candidate_ready",
-            mapOf(
-                "expectedRevision" to expectedRevision,
-                "actualRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION,
-                "sshHealthy" to sshHealthy,
-                "sshProvisioned" to sshProvisioned
-            )
-        )
-    }
-
-    fun recordHandoffTakeoverConfirmed(
-        expectedRevision: Int,
-        candidateRevision: Int,
-        candidatePid: Int
-    ) {
-        appendLifecycle(
-            "takeover_confirmed",
-            mapOf(
-                "expectedRevision" to expectedRevision,
-                "candidateRevision" to candidateRevision,
-                "candidatePid" to candidatePid
-            )
-        )
-    }
-
     fun recordDuplicateRejected(candidatePid: Int = Process.myPid()) {
         appendLifecycle("duplicate_engine_rejected", mapOf("candidatePid" to candidatePid))
-    }
-
-    @Synchronized
-    fun beginHandoffExclusion(expectedRevision: Int): Boolean {
-        if (handoffFileLock != null) return true
-        val lockFile = File(HANDOFF_LOCK_PATH)
-        lockFile.parentFile?.mkdirs()
-        val raf = RandomAccessFile(lockFile, "rw")
-        val lock = runCatching { raf.channel.tryLock() }.getOrNull()
-        if (lock == null) {
-            runCatching { raf.close() }
-            appendLifecycle("handoff_exclusion_failed", mapOf("expectedRevision" to expectedRevision))
-            return false
-        }
-        handoffRandomAccessFile = raf
-        handoffFileLock = lock
-        appendLifecycle("handoff_exclusion_acquired", mapOf("expectedRevision" to expectedRevision))
-        return true
-    }
-
-    @Synchronized
-    fun releasePrimaryForHandoff(expectedRevision: Int): Boolean {
-        val lock = fileLock ?: return true
-        val released = runCatching { lock.release(); true }.getOrDefault(false)
-        if (released) {
-            fileLock = null
-            runCatching { randomAccessFile?.close() }
-            randomAccessFile = null
-            appendLifecycle("handoff_primary_lock_released", mapOf("expectedRevision" to expectedRevision))
-        }
-        return released
-    }
-
-    @Synchronized
-    fun reacquirePrimaryAfterRollback(reason: String): Boolean {
-        if (fileLock != null) return true
-        val lockFile = File(LOCK_PATH)
-        val raf = RandomAccessFile(lockFile, "rw")
-        val lock = runCatching { raf.channel.tryLock() }.getOrNull()
-        if (lock == null) {
-            runCatching { raf.close() }
-            appendLifecycle("handoff_rollback_lock_failed", mapOf("reason" to reason.take(120)))
-            return false
-        }
-        randomAccessFile = raf
-        fileLock = lock
-        appendLifecycle("handoff_rollback_lock_reacquired", mapOf("reason" to reason.take(120)))
-        return true
-    }
-
-    @Synchronized
-    fun finishHandoffExclusion(event: String) {
-        appendLifecycle(event)
-        runCatching { handoffFileLock?.release() }
-        runCatching { handoffRandomAccessFile?.close() }
-        handoffFileLock = null
-        handoffRandomAccessFile = null
     }
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
         appendLifecycle("clean_stop")
         heartbeatThread.interrupt()
-        runCatching { fileLock?.release() }
-        runCatching { randomAccessFile?.close() }
-        fileLock = null
-        randomAccessFile = null
-        runCatching { handoffFileLock?.release() }
-        runCatching { handoffRandomAccessFile?.close() }
-        handoffFileLock = null
-        handoffRandomAccessFile = null
+        runCatching { fileLock.release() }
+        runCatching { randomAccessFile.close() }
     }
 
     @Synchronized
@@ -189,10 +80,6 @@ internal class EmbeddedEngineInstanceGuard private constructor(
         runCatching {
             lifecycleFile.parentFile?.mkdirs()
             lifecycleFile.appendText(json.toString() + "\n")
-            // After a transactional lock transfer the predecessor may remain
-            // alive briefly to finish its response. It must never overwrite
-            // the durable state already owned by the promoted candidate.
-            if (fileLock?.isValid != true) return@runCatching
             val state = JSONObject()
                 .put("bootId", bootId)
                 .put("engineInstanceId", instanceId)
@@ -212,27 +99,12 @@ internal class EmbeddedEngineInstanceGuard private constructor(
 
     companion object {
         private const val LOCK_PATH = "/data/local/tmp/luonnotar-guardian-engine.lock"
-        private const val HANDOFF_LOCK_PATH = "/data/local/tmp/luonnotar-guardian-handoff.lock"
         const val LIFECYCLE_PATH = "/data/local/tmp/luonnotar-guardian-lifecycle.log"
         const val STATE_PATH = "/data/local/tmp/luonnotar-guardian-engine-state.json"
         private const val HEARTBEAT_INTERVAL_MS = 10_000L
         private const val MAX_LIFECYCLE_BYTES = 1_000_000L
 
         fun acquire(startReason: String): EmbeddedEngineInstanceGuard? {
-            if (handoffExclusionHeld()) {
-                appendRejectedLifecycle("handoff_exclusion:$startReason")
-                return null
-            }
-            return acquirePrimary(startReason, promoted = false)
-        }
-
-        fun acquirePromoted(startReason: String): EmbeddedEngineInstanceGuard? =
-            acquirePrimary(startReason, promoted = true)
-
-        private fun acquirePrimary(
-            startReason: String,
-            promoted: Boolean
-        ): EmbeddedEngineInstanceGuard? {
             val lockFile = File(LOCK_PATH)
             lockFile.parentFile?.mkdirs()
             val raf = RandomAccessFile(lockFile, "rw")
@@ -247,7 +119,6 @@ internal class EmbeddedEngineInstanceGuard private constructor(
             val bootId = readBootId()
             val previous = runCatching { JSONObject(state.readText()) }.getOrNull()
             if (
-                !promoted &&
                 previous != null &&
                 previous.optString("bootId") == bootId &&
                 !previous.optBoolean("cleanStop", false)
@@ -273,22 +144,8 @@ internal class EmbeddedEngineInstanceGuard private constructor(
                 bootId = bootId,
                 startReason = startReason.take(120)
             )
-            guard.appendLifecycle(if (promoted) "engine_promoted_primary" else "engine_started")
+            guard.appendLifecycle("engine_started")
             return guard
-        }
-
-        private fun handoffExclusionHeld(): Boolean {
-            val file = File(HANDOFF_LOCK_PATH)
-            file.parentFile?.mkdirs()
-            val raf = RandomAccessFile(file, "rw")
-            val lock = runCatching { raf.channel.tryLock() }.getOrNull()
-            if (lock == null) {
-                runCatching { raf.close() }
-                return true
-            }
-            runCatching { lock.release() }
-            runCatching { raf.close() }
-            return false
         }
 
         private fun appendRejectedLifecycle(startReason: String) {

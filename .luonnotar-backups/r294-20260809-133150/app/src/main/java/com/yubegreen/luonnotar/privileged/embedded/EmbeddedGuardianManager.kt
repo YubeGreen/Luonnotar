@@ -927,7 +927,7 @@ object EmbeddedGuardianManager {
     private const val CONFIGURE_READ_TIMEOUT_MS = 30_000
     private const val OPERATION_READ_TIMEOUT_MS = 30_000
     private const val RECOVERY_REQUEST_TIMEOUT_MS = 10_000
-    private const val HANDOFF_REQUEST_TIMEOUT_MS = 25_000
+    private const val HANDOFF_REQUEST_TIMEOUT_MS = 5_000
     private const val HANDOFF_PING_TIMEOUT_MS = 750
     private const val HANDOFF_VERIFY_ATTEMPTS = 40
     private const val HANDOFF_VERIFY_DELAY_MS = 200L

@@ -64,9 +64,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             METHOD_ENGINE_RESTART -> engineRestart(appContext)
             METHOD_SELF_UPDATE -> selfUpdate(appContext, extras ?: Bundle.EMPTY)
             METHOD_SELF_UPDATE_STATUS -> selfUpdateStatus(appContext)
-            METHOD_SSH_STATUS -> sshStatus(appContext)
-            METHOD_SSH_RECONCILE -> sshReconcile(appContext)
-            METHOD_SSH_INSTALL_AUTHORIZED_KEY -> sshInstallAuthorizedKey(appContext, extras ?: Bundle.EMPTY)
             METHOD_SET -> setRuntimeConfig(appContext, extras ?: Bundle.EMPTY)
             METHOD_PROBE -> probeNow(appContext, extras ?: Bundle.EMPTY)
             METHOD_EXPERIMENT_START -> experimentStart(
@@ -842,83 +839,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
     }
 
 
-    private fun sshStatus(context: android.content.Context): Bundle =
-        sshEngineCall(context, "status") { it.sshStatus() }
-
-    private fun sshReconcile(context: android.content.Context): Bundle =
-        sshEngineCall(context, "reconcile") { it.sshReconcile() }
-
-    private fun sshInstallAuthorizedKey(
-        context: android.content.Context,
-        extras: Bundle
-    ): Bundle {
-        val key = extras.getString(EXTRA_SSH_AUTHORIZED_KEY).orEmpty().trim()
-        if (key.isBlank()) {
-            return engineResultBundle(
-                ok = false,
-                reason = "authorized_key_required",
-                values = emptyMap()
-            )
-        }
-        return sshEngineCall(context, "install_authorized_key") { client ->
-            client.sshInstallAuthorizedKey(
-                JSONObject().put("authorizedKey", key).toString()
-            )
-        }
-    }
-
-    private fun sshEngineCall(
-        context: android.content.Context,
-        action: String,
-        call: (EmbeddedGuardianClient) -> String
-    ): Bundle {
-        val identity = EmbeddedGuardianStore.identity(context)
-            ?: return engineResultBundle(false, "identity_missing", emptyMap())
-        val raw = runCatching {
-            call(
-                EmbeddedGuardianClient(
-                    identity.port,
-                    identity.token,
-                    connectTimeoutMs = 1_000,
-                    readTimeoutMs = 5_000
-                )
-            )
-        }.getOrElse { error ->
-            LogManager.event(
-                context,
-                "adb_provider_ssh_${action}_failed",
-                mapOf("error" to error.toString())
-            )
-            return engineResultBundle(
-                ok = false,
-                reason = "engine_rpc_failed",
-                values = mapOf("error" to error.toString().take(400))
-            )
-        }
-        val json = runCatching { JSONObject(raw) }.getOrNull()
-            ?: return engineResultBundle(
-                ok = false,
-                reason = "invalid_ssh_status",
-                values = mapOf("raw" to raw.take(400))
-            )
-        return engineResultBundle(
-            ok = true,
-            reason = "",
-            values = linkedMapOf(
-                "state" to json.optString("state"),
-                "healthy" to json.optBoolean("healthy", false),
-                "provisioned" to json.optBoolean("provisioned", false),
-                "port" to json.optInt("port", 8025),
-                "pidOk" to json.optBoolean("pidOk", false),
-                "listenerOk" to json.optBoolean("listenerOk", false),
-                "handshakeOk" to json.optBoolean("handshakeOk", false),
-                "reasonDetail" to json.optString("reason"),
-                "restartCount" to json.optLong("restartCount", 0L),
-                "consecutiveFailures" to json.optInt("consecutiveFailures", 0)
-            )
-        )
-    }
-
     private fun selfUpdate(
         context: android.content.Context,
         extras: Bundle
@@ -1204,9 +1124,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val METHOD_ENGINE_RESTART = "engine_restart"
         const val METHOD_SELF_UPDATE = "self_update"
         const val METHOD_SELF_UPDATE_STATUS = "self_update_status"
-        const val METHOD_SSH_STATUS = "ssh_status"
-        const val METHOD_SSH_RECONCILE = "ssh_reconcile"
-        const val METHOD_SSH_INSTALL_AUTHORIZED_KEY = "ssh_install_authorized_key"
         const val METHOD_SET = "set"
         const val METHOD_PROBE = "probe"
         const val METHOD_EXPERIMENT_START = "experiment_start"
@@ -1217,7 +1134,6 @@ class AdbRuntimeConfigProvider : ContentProvider() {
         const val EXTRA_MARK_LABEL = "mark_label"
         const val EXTRA_PROBE = "probe"
         const val EXTRA_APK_PATH = "apk_path"
-        const val EXTRA_SSH_AUTHORIZED_KEY = "authorized_key"
         const val EXTRA_LAB_LEVEL = "lab_level"
         const val RESULT_OK = "ok"
         const val RESULT_REASON = "reason"

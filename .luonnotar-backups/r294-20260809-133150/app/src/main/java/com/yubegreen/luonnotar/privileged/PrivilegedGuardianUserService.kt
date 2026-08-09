@@ -3,7 +3,6 @@ package com.yubegreen.luonnotar.privileged
 import android.content.Context
 import android.os.Process
 import android.os.SystemClock
-import com.yubegreen.luonnotar.privileged.embedded.ShellSshGuardian
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
@@ -35,7 +34,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val runner = GuardianCommandRunner()
     private val backgroundPolicyEngine = BackgroundPolicyEngine(runner)
     private val diagnosticStore = GuardianDiagnosticStore()
-    private val sshGuardian = ShellSshGuardian()
     private val executor = Executors.newSingleThreadScheduledExecutor { runnable ->
         Thread(runnable, "luonnotar-privileged-guardian").apply { isDaemon = true }
     }
@@ -45,14 +43,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private val gmsFastThawExecutor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "luonnotar-gms-fast-thaw").apply { isDaemon = true }
     }
-    private val sshGuardianExecutor = Executors.newSingleThreadScheduledExecutor { runnable ->
-        Thread(runnable, "luonnotar-ssh-guardian").apply { isDaemon = true }
-    }
     private val gmsFastThawWorkerActive = AtomicBoolean(false)
     private val gmsFastThawPendingSignalElapsed = AtomicLong(0L)
     private val recentEvents = ArrayDeque<GuardianEvent>()
     private var scheduled: ScheduledFuture<*>? = null
-    private var sshGuardianScheduled: ScheduledFuture<*>? = null
     private var initialCycleFuture: ScheduledFuture<*>? = null
     private var eventWatcherRestartFuture: ScheduledFuture<*>? = null
     private var eventFastLaneReadyTimeoutFuture: ScheduledFuture<*>? = null
@@ -380,17 +374,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         config = GuardianEngineConfig.fromJson(configJson)
         running = true
         if (startedElapsed <= 0L) startedElapsed = SystemClock.elapsedRealtime()
-        sshGuardian.configure(
-            enabled = config.sshGuardianEnabled,
-            port = config.sshPort,
-            apkPath = currentEngineApkPath()
-        )
-        val ssh = sshGuardian.reconcile(force = firstStart)
-        restartSshGuardianScheduleLocked()
-        eventLocked(
-            "ssh_guardian_configured",
-            "state=${ssh.state} healthy=${ssh.healthy} port=${ssh.port} provisioned=${ssh.provisioned}"
-        )
         ensureCapabilitiesLocked()
         startEventWatcherLocked()
         startVendorBridgeLocked()
@@ -505,57 +488,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     override fun stop(): String = synchronized(lock) {
-        stopLocked(preserveSsh = false, reason = "requested_by_client")
-    }
-
-    /** Used only by transactional embedded-engine takeover. */
-    fun stopForHandoff(): String = synchronized(lock) {
-        stopLocked(preserveSsh = true, reason = "transactional_handoff")
-    }
-
-    fun exportConfigJson(): String = synchronized(lock) { config.toJson() }
-
-    fun prepareHandoffCandidate(configJson: String): String = synchronized(lock) {
-        val candidateConfig = GuardianEngineConfig.fromJson(configJson)
-        sshGuardian.configure(
-            enabled = candidateConfig.sshGuardianEnabled,
-            port = candidateConfig.sshPort,
-            apkPath = currentEngineApkPath()
-        )
-        val ssh = sshGuardian.reconcile(force = false)
-        val sshRequired = candidateConfig.sshGuardianEnabled && ssh.provisioned
-        val ready = !sshRequired || ssh.healthy
-        JSONObject()
-            .put("ready", ready)
-            .put("engineRevision", com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianProtocol.ENGINE_REVISION)
-            .put("sshRequired", sshRequired)
-            .put("ssh", ssh.toJson())
-            .put("configSchema", GuardianEngineConfig.SCHEMA)
-            .toString()
-    }
-
-    fun sshStatus(): String = synchronized(lock) {
-        sshGuardian.probeOnly().toJson().toString()
-    }
-
-    fun sshReconcile(): String = synchronized(lock) {
-        sshGuardian.reconcile(force = true).toJson().toString()
-    }
-
-    fun sshInstallAuthorizedKey(requestJson: String): String = synchronized(lock) {
-        val key = JSONObject(requestJson).optString("authorizedKey").trim()
-        require(key.isNotBlank()) { "authorizedKey required" }
-        sshGuardian.installAuthorizedKey(key).toJson().toString()
-    }
-
-    private fun stopLocked(preserveSsh: Boolean, reason: String): String {
         running = false
         gmsManualRecoveryQueued = false
         if (gmsManualRecoveryState == "queued") gmsManualRecoveryState = "cancelled_engine_stopped"
         scheduled?.cancel(false)
         scheduled = null
-        sshGuardianScheduled?.cancel(false)
-        sshGuardianScheduled = null
         initialCycleFuture?.cancel(false)
         initialCycleFuture = null
         cancelVendorRecoveryBurstsLocked()
@@ -566,27 +503,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         cancelGmsDeferredForceStopContinuationLocked("engine_stopped")
         stopVendorBridgeLocked()
         stopEventWatcherLocked()
-        if (!preserveSsh) sshGuardian.stopManagedDaemon("engine_explicitly_stopped")
-        eventLocked(
-            "engine_stopped",
-            "$reason preserveSsh=$preserveSsh"
-        )
+        eventLocked("engine_stopped", "requested_by_client")
         persistStatusLocked(force = true)
-        return statusJsonLocked()
+        statusJsonLocked()
     }
-
-    private fun currentEngineApkPath(): String = System.getenv("CLASSPATH").orEmpty()
-        .split(':')
-        .firstOrNull { it.startsWith('/') && it.endsWith(".apk") }
-        .orEmpty()
 
     override fun destroy() {
         synchronized(lock) {
             running = false
             scheduled?.cancel(true)
             scheduled = null
-            sshGuardianScheduled?.cancel(true)
-            sshGuardianScheduled = null
             initialCycleFuture?.cancel(true)
             initialCycleFuture = null
             cancelVendorRecoveryBurstsLocked()
@@ -600,7 +526,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             executor.shutdownNow()
             longOperationExecutor.shutdownNow()
             gmsFastThawExecutor.shutdownNow()
-            sshGuardianExecutor.shutdownNow()
             gmsManualRecoveryQueued = false
             gmsManualRecoveryState = "destroyed"
             eventLocked("engine_destroyed", "user_service_replaced_or_removed")
@@ -4844,20 +4769,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         eventFastLaneVerifiedSequences.clear()
     }
 
-    private fun restartSshGuardianScheduleLocked() {
-        sshGuardianScheduled?.cancel(false)
-        sshGuardianScheduled = if (config.sshGuardianEnabled) {
-            sshGuardianExecutor.scheduleWithFixedDelay(
-                { runCatching { sshGuardian.reconcile(force = false) } },
-                SSH_GUARDIAN_INTERVAL_MS,
-                SSH_GUARDIAN_INTERVAL_MS,
-                TimeUnit.MILLISECONDS
-            )
-        } else {
-            null
-        }
-    }
-
     private fun scheduleInitialCycleLocked() {
         initialCycleFuture?.cancel(false)
         initialCycleFuture = try {
@@ -4908,13 +4819,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val now = SystemClock.elapsedRealtime()
         vendorHoldUntilByPackage.entries.removeAll { (_, until) -> until <= now }
         vendorRecoveryExhaustedUntilByPackage.entries.removeAll { (_, until) -> until <= now }
-        val ssh = sshGuardian.probeOnly()
-        if (!ssh.healthy && ssh.enabled && ssh.provisioned) {
-            eventLocked(
-                "ssh_guardian_degraded",
-                "state=${ssh.state} reason=${ssh.reason} pidOk=${ssh.pidOk} listener=${ssh.listenerOk} handshake=${ssh.handshakeOk}"
-            )
-        }
         ensureCapabilitiesLocked()
         if (!eventWatcherAlive) startEventWatcherLocked()
         if (isVendorBridgeTargetedLocked() &&
@@ -7672,15 +7576,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("running", running)
         .put("uid", Process.myUid())
         .put("identity", identity)
-        .put("sshGuardian", sshGuardian.snapshot().toJson())
-        .put("networkHealth", JSONObject()
-            .put("LOCAL_SSH_OK", sshGuardian.snapshot().healthy)
-            .put("TAILSCALE_CONTROL_OK", JSONObject.NULL)
-            .put("TAILSCALE_CONTROL_STATE", "phase5_probe_not_implemented")
-            .put("TAILSCALE_INGRESS_OK", JSONObject.NULL)
-            .put("TAILSCALE_INGRESS_STATE", "external_probe_not_configured")
-            .put("ADB_5555_OK", adbTcp5555ListenerPresent)
-        )
         .put("startedElapsed", startedElapsed)
         .put("lastCycleElapsed", lastCycleElapsed)
         .put("lastTuneElapsed", lastTuneElapsed)
@@ -8411,8 +8306,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 53
-        private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
+        private const val STATUS_SCHEMA = 52
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"

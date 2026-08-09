@@ -45,22 +45,4 @@ class EmbeddedGuardianHandoffCommandTest {
             reason = "bad_path"
         )
     }
-    @Test
-    fun candidateStartsBeforePredecessorExits() {
-        val command = EmbeddedGuardianHandoffCommand.buildCandidate(
-            apkPath = "/data/app/example/base.apk",
-            mainClass = "com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianServerMain",
-            port = 42345,
-            token = "cd".repeat(32),
-            expectedRevision = 294,
-            reason = "transaction_test"
-        )
-
-        assertTrue(command.contains("--port 42345"))
-        assertTrue(command.contains("--role candidate"))
-        assertTrue(command.contains("transactional_candidate:transaction_test:expected_r294"))
-        assertFalse(command.contains("/proc/\$old_pid/stat"))
-        assertFalse(command.contains("kill"))
-    }
-
 }
