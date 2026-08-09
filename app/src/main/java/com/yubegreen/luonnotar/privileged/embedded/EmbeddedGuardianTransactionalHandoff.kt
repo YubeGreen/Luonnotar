@@ -19,6 +19,7 @@ import java.util.concurrent.TimeUnit
  */
 internal object EmbeddedGuardianTransactionalHandoff {
     private const val CANDIDATE_START_TIMEOUT_MS = 6_000L
+    private const val CANDIDATE_PREPARE_TIMEOUT_MS = 30_000
     private const val CANDIDATE_PING_DELAY_MS = 100L
     private const val CANDIDATE_PING_ATTEMPTS = 60
 
@@ -76,8 +77,18 @@ internal object EmbeddedGuardianTransactionalHandoff {
             candidateRevision = ping.optInt("engineRevision", -1)
             targetRevision = if (discoverExpectedRevision) candidateRevision else requestedExpectedRevision
             val configJson = engine.exportConfigJson()
+            // SSH candidate preparation may launch the rescue daemon and perform
+            // up to twenty bounded handshake probes. Keep the ordinary candidate
+            // RPCs tight, but give this one blocking preflight its own budget so
+            // the predecessor does not mask a real candidate result as a 2s read timeout.
+            val prepareClient = EmbeddedGuardianClient(
+                candidatePort,
+                candidateToken,
+                connectTimeoutMs = 400,
+                readTimeoutMs = CANDIDATE_PREPARE_TIMEOUT_MS
+            )
             val prepared = JSONObject(
-                candidateClient.handoffPrepare(
+                prepareClient.handoffPrepare(
                     JSONObject()
                         .put("config", configJson)
                         .put("expectedRevision", targetRevision)

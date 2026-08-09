@@ -6,64 +6,74 @@ import java.io.IOException;
 import java.security.AlgorithmParameters;
 import java.security.AlgorithmParametersSpi;
 import java.security.GeneralSecurityException;
+import java.security.KeyPair;
+import java.security.KeyPairGenerator;
+import java.security.KeyPairGeneratorSpi;
 import java.security.Provider;
+import java.security.SecureRandom;
 import java.security.spec.AlgorithmParameterSpec;
 import java.security.spec.ECGenParameterSpec;
 import java.security.spec.InvalidParameterSpecException;
+import java.security.InvalidAlgorithmParameterException;
 import java.util.Locale;
 
 /**
- * Process-local AlgorithmParameters.EC shim for Apache MINA's SSH curve names.
+ * Process-local JCA EC compatibility shim for Apache MINA's SSH curve names.
  *
- * MINA 2.19 asks JCA for EC parameters using SSH names such as "nistp384".
- * Android's platform provider on the target shell runtime does not resolve
- * those aliases, and BC itself intentionally accepts the standard SEC names
- * instead. This provider translates only those three SSH aliases and delegates
- * all EC parameter work to Luonnotar's bundled Bouncy Castle instance.
+ * MINA 2.19 reaches the NIST curve catalogue through more than one JCA surface
+ * on the Android shell runtime. AlgorithmParameters.EC alone is therefore not
+ * sufficient: the daemon can pass the bootstrap probe and still fail while
+ * ECCurves initializes. This provider translates nistp256/nistp384/nistp521
+ * for both AlgorithmParameters.EC and KeyPairGenerator.EC and delegates the
+ * actual EC implementation to Luonnotar's bundled Bouncy Castle instance.
  */
 public final class ShellSshNistEcAlgorithmParametersProvider extends Provider {
     static final String NAME = "LuonnotarSSH-EC";
-    private static final double VERSION = 1.0d;
+    private static final double VERSION = 1.1d;
+    private static final Provider BACKEND = new BouncyCastleProvider();
 
     ShellSshNistEcAlgorithmParametersProvider() {
-        super(NAME, VERSION, "Luonnotar SSH NIST EC AlgorithmParameters alias shim");
+        super(NAME, VERSION, "Luonnotar SSH NIST EC JCA compatibility shim");
         put("AlgorithmParameters.EC", NistEcAlgorithmParametersSpi.class.getName());
+        put("KeyPairGenerator.EC", NistEcKeyPairGeneratorSpi.class.getName());
+    }
+
+    private static String canonicalCurveName(String name) {
+        if (name == null) {
+            return null;
+        }
+        switch (name.toLowerCase(Locale.ROOT)) {
+            case "nistp256":
+                return "secp256r1";
+            case "nistp384":
+                return "secp384r1";
+            case "nistp521":
+                return "secp521r1";
+            default:
+                return name;
+        }
+    }
+
+    private static AlgorithmParameterSpec canonicalize(AlgorithmParameterSpec paramSpec) {
+        if (paramSpec instanceof ECGenParameterSpec) {
+            ECGenParameterSpec ec = (ECGenParameterSpec) paramSpec;
+            return new ECGenParameterSpec(canonicalCurveName(ec.getName()));
+        }
+        return paramSpec;
     }
 
     public static final class NistEcAlgorithmParametersSpi extends AlgorithmParametersSpi {
-        private static final Provider BACKEND = new BouncyCastleProvider();
         private AlgorithmParameters delegate;
 
         private AlgorithmParameters newDelegate() throws GeneralSecurityException {
             return AlgorithmParameters.getInstance("EC", BACKEND);
         }
 
-        private static String canonicalCurveName(String name) {
-            if (name == null) {
-                return null;
-            }
-            switch (name.toLowerCase(Locale.ROOT)) {
-                case "nistp256":
-                    return "secp256r1";
-                case "nistp384":
-                    return "secp384r1";
-                case "nistp521":
-                    return "secp521r1";
-                default:
-                    return name;
-            }
-        }
-
         @Override
         protected void engineInit(AlgorithmParameterSpec paramSpec) throws InvalidParameterSpecException {
-            AlgorithmParameterSpec mapped = paramSpec;
-            if (paramSpec instanceof ECGenParameterSpec) {
-                ECGenParameterSpec ec = (ECGenParameterSpec) paramSpec;
-                mapped = new ECGenParameterSpec(canonicalCurveName(ec.getName()));
-            }
             try {
                 delegate = newDelegate();
-                delegate.init(mapped);
+                delegate.init(canonicalize(paramSpec));
             } catch (GeneralSecurityException error) {
                 InvalidParameterSpecException wrapped = new InvalidParameterSpecException(
                         "Unable to initialize delegated EC parameters: " + error.getMessage());
@@ -118,6 +128,48 @@ public final class ShellSshNistEcAlgorithmParametersProvider extends Provider {
         @Override
         protected String engineToString() {
             return delegate == null ? "Luonnotar SSH EC alias parameters (uninitialized)" : delegate.toString();
+        }
+    }
+
+    public static final class NistEcKeyPairGeneratorSpi extends KeyPairGeneratorSpi {
+        private KeyPairGenerator delegate;
+
+        private KeyPairGenerator newDelegate() {
+            try {
+                return KeyPairGenerator.getInstance("EC", BACKEND);
+            } catch (GeneralSecurityException error) {
+                throw new IllegalStateException("Unable to create delegated EC key generator", error);
+            }
+        }
+
+        @Override
+        public void initialize(int keysize, SecureRandom random) {
+            delegate = newDelegate();
+            if (random == null) {
+                delegate.initialize(keysize);
+            } else {
+                delegate.initialize(keysize, random);
+            }
+        }
+
+        @Override
+        public void initialize(AlgorithmParameterSpec params, SecureRandom random)
+                throws InvalidAlgorithmParameterException {
+            delegate = newDelegate();
+            AlgorithmParameterSpec mapped = canonicalize(params);
+            if (random == null) {
+                delegate.initialize(mapped);
+            } else {
+                delegate.initialize(mapped, random);
+            }
+        }
+
+        @Override
+        public KeyPair generateKeyPair() {
+            if (delegate == null) {
+                delegate = newDelegate();
+            }
+            return delegate.generateKeyPair();
         }
     }
 }
