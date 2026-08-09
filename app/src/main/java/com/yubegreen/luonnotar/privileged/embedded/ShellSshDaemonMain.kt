@@ -1,6 +1,8 @@
 package com.yubegreen.luonnotar.privileged.embedded
 
 import android.os.Process
+import org.apache.sshd.common.util.OsUtils
+import org.apache.sshd.common.util.io.PathUtils
 import org.apache.sshd.server.SshServer
 import org.apache.sshd.server.auth.password.PasswordAuthenticator
 import org.apache.sshd.server.config.keys.AuthorizedKeysAuthenticator
@@ -49,6 +51,14 @@ object ShellSshDaemonMain {
         stateDir.mkdirs()
         chmod("700", stateDir)
         chmod("600", authorizedKeys)
+
+        // Apache MINA SSHD deliberately exposes Android hooks because Android
+        // does not guarantee the standard user.home / user.dir JVM properties.
+        // Configure them before touching ServerBuilder / SshServer: their static
+        // initialization constructs default authorized-keys helpers which query
+        // PathUtils.getUserHomeFolder() even though Luonnotar later supplies its
+        // own explicit authorized_keys path.
+        configureAndroidRuntime(stateDir)
 
         // Must execute before SshServer.setUpDefaultServer(): Apache MINA 2.19
         // initializes ECCurves from the current JCA provider set during static
@@ -122,6 +132,29 @@ object ShellSshDaemonMain {
             if (stopping.compareAndSet(false, true)) {
                 runCatching { server.stop(true) }
             }
+        }
+    }
+
+    private fun configureAndroidRuntime(stateDir: File) {
+        val homeDir = File(stateDir, ShellSshPaths.HOME_DIR_NAME)
+        homeDir.mkdirs()
+        chmod("700", homeDir)
+
+        val homePath = Paths.get(homeDir.absolutePath)
+        System.setProperty("user.home", homeDir.absolutePath)
+        System.setProperty("user.dir", homeDir.absolutePath)
+        System.setProperty("user.name", ShellSshPaths.LOGIN_USER)
+
+        OsUtils.setAndroid(true)
+        OsUtils.setCurrentUser(ShellSshPaths.LOGIN_USER)
+        PathUtils.setUserHomeFolderResolver { homePath }
+        OsUtils.setCurrentWorkingDirectoryResolver { homePath }
+
+        check(PathUtils.getUserHomeFolder() == homePath) {
+            "Apache MINA user home resolver did not bind to ${homeDir.absolutePath}"
+        }
+        check(OsUtils.getCurrentWorkingDirectory() == homePath) {
+            "Apache MINA working directory resolver did not bind to ${homeDir.absolutePath}"
         }
     }
 
@@ -215,6 +248,7 @@ object ShellSshDaemonMain {
 internal object ShellSshPaths {
     const val STATE_DIR = "/data/local/tmp/luonnotar-ssh"
     const val AUTHORIZED_KEYS_NAME = "authorized_keys"
+    const val HOME_DIR_NAME = "home"
     const val HOST_KEY_NAME = "ssh_host_key"
     const val DAEMON_STATE_NAME = "daemon-state.json"
     const val LAST_FAILURE_NAME = "last-failure.json"
