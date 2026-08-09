@@ -7,7 +7,7 @@ set -euo pipefail
 
 PROJECT_ROOT="${LUONNOTAR_PROJECT_ROOT:-$(cd "$(dirname "$0")/.." && pwd -P)}"
 SEND_EVENTS="${LUOOVN_SEND_EVENTS:-/Volumes/SMBProbe/send-events.csv}"
-OUTPUT_BASE="${LUOOVN_OUTPUT_BASE:-$HOME/Desktop}"
+OUTPUT_BASE="${LUOOVN_OUTPUT_BASE:-$HOME/Developer/Desktop}"
 RESCUE_PORT="${LUONNOTAR_RESCUE_PORT:-8025}"
 RESCUE_KEY="${LUONNOTAR_RESCUE_KEY:-$HOME/.ssh/luonnotar_iqoo_ed25519}"
 LOGCAT_RING_SIZE="${LUOOVN_LOGCAT_RING_SIZE:-64M}"
@@ -59,7 +59,7 @@ Time syntax:
 
 Options:
   --send-events PATH     sender truth CSV (default: /Volumes/SMBProbe/send-events.csv)
-  --output-base DIR      parent directory for capture folder (default: ~/Desktop)
+  --output-base DIR      parent directory for capture folder (default: ~/Developer/Desktop)
   --no-ring-resize       do not request a 64M Android logcat ring
   --keep-adb             keep the host ADB transport attached during observation
                           (explicitly accepts the extra ADB-side interference)
