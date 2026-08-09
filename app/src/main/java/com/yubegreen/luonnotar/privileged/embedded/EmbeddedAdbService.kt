@@ -78,6 +78,7 @@ class EmbeddedAdbService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
+        val action = command.action ?: ACTION_START
         val snapshot = EmbeddedGuardianStore.snapshot(this)
         if (!snapshot.featureEnabled) {
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -85,17 +86,44 @@ class EmbeddedAdbService : Service() {
             stopSelf(startId)
             return START_NOT_STICKY
         }
-        val generation = command.getLongExtra(EXTRA_GENERATION, snapshot.generation)
+        val requestedGeneration = command.getLongExtra(EXTRA_GENERATION, -1L)
+        // Recovery commands may cross from :keeper into the default process. Android
+        // SharedPreferences are not a coherent cross-process generation transport, so
+        // a keeper-side cached generation can lag the authoritative service process.
+        // Recovery is maintenance of the currently enabled runtime, not a setup
+        // transaction: bind it to the service process' current generation instead of
+        // rejecting an otherwise valid rescue because the caller supplied a stale one.
+        val generation = if (action == ACTION_RECOVER_ADB_5555) {
+            snapshot.generation
+        } else {
+            requestedGeneration.takeIf { it >= 0L } ?: snapshot.generation
+        }
+        if (
+            action == ACTION_RECOVER_ADB_5555 &&
+            requestedGeneration >= 0L &&
+            requestedGeneration != generation
+        ) {
+            LogManager.event(
+                this,
+                "embedded_adb_recovery_generation_rebound",
+                mapOf(
+                    "pid" to android.os.Process.myPid(),
+                    "requestedGeneration" to requestedGeneration,
+                    "currentGeneration" to generation
+                )
+            )
+        }
         if (!EmbeddedGuardianStore.isGenerationActive(this, generation)) {
             LogManager.event(
                 this,
                 "embedded_adb_service_generation_rejected",
                 mapOf(
                     "pid" to android.os.Process.myPid(),
-                    "requestedGeneration" to generation,
+                    "requestedGeneration" to requestedGeneration,
+                    "resolvedGeneration" to generation,
                     "currentGeneration" to snapshot.generation,
                     "featureEnabled" to snapshot.featureEnabled,
-                    "action" to command.action.orEmpty()
+                    "action" to action
                 )
             )
             stopForeground(STOP_FOREGROUND_REMOVE)
@@ -104,7 +132,7 @@ class EmbeddedAdbService : Service() {
         }
         val generationChanged = activeGeneration != generation
         activeGeneration = generation
-        when (command.action ?: ACTION_START) {
+        when (action) {
             ACTION_START, ACTION_RETRY -> startDiscovery(
                 reset = command.action == ACTION_RETRY || generationChanged,
                 generation = generation
@@ -297,7 +325,14 @@ class EmbeddedAdbService : Service() {
     }
 
     private fun reassertAdbTcp5555Through(adbPort: Int, source: String): Boolean {
-        if (!probeLocalTcpPort(adbPort)) return false
+        if (!probeLocalTcpPort(adbPort)) {
+            LogManager.event(
+                this,
+                "adb_tcp_5555_recovery_endpoint_unreachable",
+                mapOf("sourcePort" to adbPort, "source" to source.take(80))
+            )
+            return false
+        }
         var requestError: Throwable? = null
         runCatching {
             Kadb.create("127.0.0.1", adbPort).use { adb ->
@@ -307,7 +342,18 @@ class EmbeddedAdbService : Service() {
                     Thread.sleep(150L)
                 }
             }
-        }.onFailure { requestError = it }
+        }.onFailure { error ->
+            requestError = error
+            LogManager.event(
+                this,
+                "adb_tcp_5555_recovery_transport_request_error",
+                mapOf(
+                    "sourcePort" to adbPort,
+                    "source" to source.take(80),
+                    "error" to error.toString().take(500)
+                )
+            )
+        }
 
         repeat(ADB_TCP_RECOVERY_VERIFY_ATTEMPTS) {
             Thread.sleep(ADB_TCP_RECOVERY_VERIFY_INTERVAL_MS)
@@ -324,6 +370,15 @@ class EmbeddedAdbService : Service() {
                 return true
             }
         }
+        LogManager.event(
+            this,
+            "adb_tcp_5555_recovery_transport_unverified",
+            mapOf(
+                "sourcePort" to adbPort,
+                "source" to source.take(80),
+                "requestError" to (requestError?.toString()?.take(500) ?: "")
+            )
+        )
         if (requestError != null) throw requestError as Throwable
         return false
     }

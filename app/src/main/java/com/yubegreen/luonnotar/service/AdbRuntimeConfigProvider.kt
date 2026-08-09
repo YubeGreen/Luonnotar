@@ -93,21 +93,21 @@ class AdbRuntimeConfigProvider : ContentProvider() {
     }
 
     private fun rescueAdb5555(context: android.content.Context, extras: Bundle): Bundle {
-        val snapshot = EmbeddedGuardianStore.snapshot(context)
+        // This provider normally runs in :keeper while EmbeddedAdbService runs in
+        // the default app process. Do not use a keeper-cached SharedPreferences
+        // generation as a transaction token for recovery: the service resolves its
+        // own current generation when it receives ACTION_RECOVER_ADB_5555.
+        val providerSnapshot = EmbeddedGuardianStore.snapshot(context)
         val preferredWirelessPort = extras.getInt(EXTRA_WIRELESS_PORT, -1)
             .takeIf { it in 1..65535 && it != 5555 } ?: -1
         val preferredWirelessPortSource = extras.getString(EXTRA_WIRELESS_PORT_SOURCE)
             .orEmpty()
             .take(80)
-        if (!snapshot.featureEnabled) {
-            return resultBundle(false, "feature_disabled", emptyMap())
-        }
         val dispatched = runCatching {
             ContextCompat.startForegroundService(
                 context,
                 Intent(context, EmbeddedAdbService::class.java)
                     .setAction(EmbeddedAdbService.ACTION_RECOVER_ADB_5555)
-                    .putExtra(EmbeddedAdbService.EXTRA_GENERATION, snapshot.generation)
                     .putExtra(EmbeddedAdbService.EXTRA_RECOVERY_WIRELESS_PORT, preferredWirelessPort)
                     .putExtra(
                         EmbeddedAdbService.EXTRA_RECOVERY_WIRELESS_PORT_SOURCE,
@@ -128,7 +128,9 @@ class AdbRuntimeConfigProvider : ContentProvider() {
             reason = if (dispatched) "" else "dispatch_failed",
             values = mapOf(
                 "dispatched" to dispatched,
-                "generation" to snapshot.generation,
+                "generationSource" to "service_current",
+                "providerObservedGeneration" to providerSnapshot.generation,
+                "providerObservedFeatureEnabled" to providerSnapshot.featureEnabled,
                 "preferredWirelessPort" to preferredWirelessPort,
                 "preferredWirelessPortSource" to preferredWirelessPortSource
             )
