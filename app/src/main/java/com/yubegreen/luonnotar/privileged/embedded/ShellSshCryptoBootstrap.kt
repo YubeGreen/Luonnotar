@@ -1,59 +1,64 @@
 package com.yubegreen.luonnotar.privileged.embedded
 
-import org.bouncycastle.jce.provider.BouncyCastleProvider
 import java.security.AlgorithmParameters
-import java.security.Provider
 import java.security.Security
 import java.security.spec.ECGenParameterSpec
 import java.security.spec.ECParameterSpec
 
 /**
- * Installs a process-local crypto provider before Apache MINA SSHD initializes
- * its static ECCurve catalogue.
+ * Installs a process-local EC AlgorithmParameters compatibility shim before
+ * Apache MINA SSHD initializes its static ECCurve catalogue.
  *
- * Android's platform EC implementation on the target shell runtime does not
- * resolve MINA's SSH curve aliases (for example nistp384). MINA 2.19.0 then
- * aborts in ECCurves.<clinit>. A bundled Bouncy Castle provider is installed
- * at priority 1 in this isolated SSH process and the exact aliases used by SSH
- * are verified before any SshServer class is initialized.
+ * MINA 2.19 asks JCA for SSH curve aliases such as nistp384. The Android shell
+ * runtime observed on the target device does not resolve those aliases. The
+ * shim translates only nistp256/nistp384/nistp521 to their SEC equivalents and
+ * delegates the actual EC work to Luonnotar's bundled Bouncy Castle provider.
+ * Other algorithms/providers are left untouched.
  */
 internal object ShellSshCryptoBootstrap {
-    private const val PROVIDER_NAME = "BC"
-    private val requiredCurves = listOf("nistp256", "nistp384", "nistp521")
+    private const val PROVIDER_NAME = ShellSshNistEcAlgorithmParametersProvider.NAME
+    private val requiredCurves = listOf(
+        "nistp256" to 256,
+        "nistp384" to 384,
+        "nistp521" to 521
+    )
 
     fun installAndVerify(): String {
-        val provider = BouncyCastleProvider()
-
-        // Android may expose a platform provider named BC. Replace it only in
-        // this stand-alone app_process so Apache MINA deterministically sees
-        // the bundled implementation selected for Luonnotar SSH.
         Security.removeProvider(PROVIDER_NAME)
+        val provider = ShellSshNistEcAlgorithmParametersProvider()
         check(Security.insertProviderAt(provider, 1) == 1) {
-            "unable to install Bouncy Castle as primary security provider"
+            "unable to install Luonnotar SSH EC alias provider as primary security provider"
         }
 
         val active = Security.getProvider(PROVIDER_NAME)
-            ?: error("Bouncy Castle provider missing after installation")
+            ?: error("Luonnotar SSH EC alias provider missing after installation")
         check(active === provider) {
-            "unexpected BC provider instance: ${active.javaClass.name}"
+            "unexpected SSH EC provider instance: ${active.javaClass.name}"
         }
 
-        requiredCurves.forEach { verifyCurve(active, it) }
+        // Verify through the provider-free JCA lookup. This mirrors MINA's
+        // initialization path and proves our priority-1 shim is actually used.
+        requiredCurves.forEach { (name, expectedBits) ->
+            verifyCurve(name, expectedBits)
+        }
 
         val firstEcProvider = Security.getProviders().firstOrNull { candidate ->
             candidate.getService("AlgorithmParameters", "EC") != null
         }
         check(firstEcProvider?.name == PROVIDER_NAME) {
-            "BC is not the primary EC AlgorithmParameters provider: ${firstEcProvider?.name.orEmpty()}"
+            "Luonnotar SSH EC shim is not the primary EC AlgorithmParameters provider: " +
+                firstEcProvider?.name.orEmpty()
         }
 
         return "$PROVIDER_NAME:${active.javaClass.name}"
     }
 
-    private fun verifyCurve(provider: Provider, name: String) {
-        val parameters = AlgorithmParameters.getInstance("EC", provider)
+    private fun verifyCurve(name: String, expectedBits: Int) {
+        val parameters = AlgorithmParameters.getInstance("EC")
         parameters.init(ECGenParameterSpec(name))
         val spec = parameters.getParameterSpec(ECParameterSpec::class.java)
-        check(spec.curve.field.fieldSize > 0) { "invalid EC parameters for $name" }
+        check(spec.curve.field.fieldSize == expectedBits) {
+            "invalid EC parameters for $name: expected=$expectedBits actual=${spec.curve.field.fieldSize}"
+        }
     }
 }
