@@ -384,6 +384,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var termuxSshdProbeCount = 0L
     private var termuxSshdRecoveryCount = 0L
     private var termuxSshdLastRecoveryResult = "never"
+    private var termuxRunCommandPermissionGranted = false
+    private var termuxRunCommandPermissionLastEnsureElapsed = 0L
+    private var termuxRunCommandPermissionLastResult = "never"
     private var diagnosticWriteErrorCount = 0L
     private var lastDiagnosticStatusWriteElapsed = 0L
     @Volatile private var cachedStatusJson = "{}"
@@ -5333,12 +5336,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         latestProcesses = states
         maybeWakeManagedPackagesLocked(now, matched)
         maybeProbeAdbTcp5555Locked(now)
-        maybeProbeTermuxSshdLocked(now)
 
+        // A forced first cycle is the shell engine's standard startup bootstrap.
+        // Reassert the same background/OEM policy used by periodic tuning and,
+        // in the same stage, make sure the app-UID -> Termux RUN_COMMAND bridge
+        // has its shell-grant before Termux health recovery is allowed to fire.
         if (force || lastTuneElapsed <= 0L || now - lastTuneElapsed >= config.tuningIntervalMs) {
             tunePackagesLocked()
             lastTuneElapsed = now
         }
+
+        maybeProbeTermuxSshdLocked(now)
 
         maybeProbeGmsTransportLocked(now)
         maybeStartVerifiedGmsCampaignLocked()
@@ -7687,10 +7695,76 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     private fun tunePackagesLocked() {
+        reconcileTermuxRunCommandPermissionLocked(source = "scheduled_tune")
         applyBackgroundPolicyLocked(
             JSONObject()
                 .put("source", "scheduled_tune")
                 .toString()
+        )
+    }
+
+    private fun reconcileTermuxRunCommandPermissionLocked(source: String) {
+        if (!config.termuxSshdRecoveryEnabled) {
+            termuxRunCommandPermissionGranted = false
+            termuxRunCommandPermissionLastResult = "recovery_disabled"
+            return
+        }
+        if (TermuxRunCommandPermissionPolicy.TERMUX_PACKAGE !in config.packageTargets) {
+            termuxRunCommandPermissionGranted = false
+            termuxRunCommandPermissionLastResult = "termux_not_managed"
+            return
+        }
+        if (!packageInstalled(TermuxRunCommandPermissionPolicy.TERMUX_PACKAGE)) {
+            termuxRunCommandPermissionGranted = false
+            termuxRunCommandPermissionLastResult = "termux_not_installed"
+            return
+        }
+
+        val now = SystemClock.elapsedRealtime()
+        val before = runner.run(
+            "dumpsys", "package", TermuxRunCommandPermissionPolicy.LUONNOTAR_PACKAGE,
+            timeoutMs = PACKAGE_QUERY_TIMEOUT_MS
+        )
+        val alreadyGranted = before.success &&
+            TermuxRunCommandPermissionPolicy.permissionGranted(before.stdout)
+
+        val grant = if (alreadyGranted) {
+            null
+        } else {
+            runner.run(
+                "pm", "grant", "--user", "0",
+                TermuxRunCommandPermissionPolicy.LUONNOTAR_PACKAGE,
+                TermuxRunCommandPermissionPolicy.RUN_COMMAND_PERMISSION,
+                timeoutMs = TUNING_COMMAND_TIMEOUT_MS
+            ).also { actionCount += 1 }
+        }
+        val after = if (alreadyGranted) before else runner.run(
+            "dumpsys", "package", TermuxRunCommandPermissionPolicy.LUONNOTAR_PACKAGE,
+            timeoutMs = PACKAGE_QUERY_TIMEOUT_MS
+        )
+        val granted = after.success &&
+            TermuxRunCommandPermissionPolicy.permissionGranted(after.stdout)
+
+        termuxRunCommandPermissionGranted = granted
+        termuxRunCommandPermissionLastEnsureElapsed = now
+        termuxRunCommandPermissionLastResult = when {
+            alreadyGranted -> "already_granted"
+            granted -> "granted"
+            grant != null && !grant.success -> "grant_failed:${grant.summary()}"
+            !after.success -> "verify_failed:${after.summary()}"
+            else -> "not_granted_after_apply"
+        }.take(MAX_EVENT_DETAIL)
+
+        if (!granted) {
+            commandFailureCount += 1
+            errorCount += 1
+        }
+        val grantSummary = grant?.summary() ?: "skipped_already_granted"
+        eventLocked(
+            if (granted) "termux_run_command_permission_ready"
+            else "termux_run_command_permission_failed",
+            "source=$source before=${before.summary()} grant=$grantSummary after=${after.summary()} " +
+                "result=$termuxRunCommandPermissionLastResult"
         )
     }
 
@@ -8357,6 +8431,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("probeCount", termuxSshdProbeCount)
             .put("recoveryCount", termuxSshdRecoveryCount)
             .put("lastRecoveryResult", termuxSshdLastRecoveryResult)
+            .put("runCommandPermissionGranted", termuxRunCommandPermissionGranted)
+            .put("runCommandPermissionLastEnsureElapsed", termuxRunCommandPermissionLastEnsureElapsed)
+            .put("runCommandPermissionLastResult", termuxRunCommandPermissionLastResult)
         )
         .put("protectionHealth", protectionHealthJsonLocked())
         .put("backgroundPolicy", lastBackgroundPolicyReport.toJsonObject())
@@ -8687,7 +8764,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 56
+        private const val STATUS_SCHEMA = 57
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
