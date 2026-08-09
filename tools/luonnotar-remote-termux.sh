@@ -5,6 +5,10 @@ IQ_HOST="${LUONNOTAR_IQ_HOST:-100.111.89.64}"
 IQ_USER="${LUONNOTAR_IQ_TERMUX_USER:-u0_a440}"
 IQ_PORT="${LUONNOTAR_IQ_TERMUX_PORT:-8022}"
 IQ_SSH_ALIAS="${LUONNOTAR_IQ_SSH_ALIAS:-iqoo}"
+PAD_HOST="${LUONNOTAR_PAD_HOST:-100.117.209.84}"
+PAD_USER="${LUONNOTAR_PAD_TERMUX_USER:-u0_a372}"
+PAD_PORT="${LUONNOTAR_PAD_TERMUX_PORT:-8022}"
+PAD_SSH_ALIAS="${LUONNOTAR_PAD_SSH_ALIAS:-pad}"
 TERMUX_USER="${LUONNOTAR_TERMUX_USER:-u0_a440}"
 TERMUX_PORT="${LUONNOTAR_TERMUX_PORT:-8022}"
 RESCUE_PORT="${LUONNOTAR_RESCUE_PORT:-8025}"
@@ -13,17 +17,20 @@ WAIT_SECONDS="${LUONNOTAR_TERMUX_WAIT_SECONDS:-120}"
 HOST=""
 TARGET_SEEN=0
 IQ_SELECTED=0
+PAD_SELECTED=0
 
 usage() {
   cat <<'EOF_USAGE'
 Usage:
   luoterm --iq [--user USER] [--port PORT] [--wait SECONDS]
+  luoterm --pad [--user USER] [--port PORT] [--wait SECONDS]
   luoterm HOST [--user USER] [--port PORT] [--wait SECONDS]
   luoterm HOST:PORT [--user USER] [--wait SECONDS]
   luoterm USER@HOST[:PORT] [--wait SECONDS]
 
 Device selector logic mirrors luosfud:
   --iq                iQOO shortcut -> 100.111.89.64 (Termux :8022; SSH Host alias: iqoo)
+  --pad               Pad shortcut -> 100.117.209.84 (Termux u0_a372:8022; SSH Host alias: pad)
   HOST                explicit target device
   HOST:PORT           explicit target and Termux SSH port
   USER@HOST[:PORT]    explicit Termux user, target and optional port
@@ -70,6 +77,19 @@ while [[ $# -gt 0 ]]; do
       HOST="$IQ_HOST"
       TERMUX_USER="$IQ_USER"
       TERMUX_PORT="$IQ_PORT"
+      shift
+      ;;
+    --pad)
+      [[ "$TARGET_SEEN" -eq 0 ]] || {
+        echo "LUOTERM_ERROR: multiple device selectors supplied" >&2
+        usage >&2
+        exit 2
+      }
+      TARGET_SEEN=1
+      PAD_SELECTED=1
+      HOST="$PAD_HOST"
+      TERMUX_USER="$PAD_USER"
+      TERMUX_PORT="$PAD_PORT"
       shift
       ;;
     --user)
@@ -176,6 +196,8 @@ fi
 
 if (( IQ_SELECTED )); then
   command ssh -p "$TERMUX_PORT" -l "$TERMUX_USER" "$IQ_SSH_ALIAS"
+elif (( PAD_SELECTED )); then
+  command ssh -p "$TERMUX_PORT" -l "$TERMUX_USER" "$PAD_SSH_ALIAS"
 else
   command ssh -p "$TERMUX_PORT" "$TERMUX_USER@$HOST"
 fi
