@@ -1,5 +1,20 @@
 # Luonnotar
 
+## 2.6.1 v132 / r295 thawed-transport recovery split
+
+2.6.1 stops treating “GMS is physically thawed” and “FCM/MCS is connected again” as the same success condition. The captured OriginOS failure showed both core GMS processes thawed, important and network-unblocked while MCS remained offline and `BAD_AUTHENTICATION` continued. r295 therefore separates freezer/process recovery from thawed transport/auth recovery.
+
+- Adds `GmsThawedTransportBootstrapPolicy` for VIVO/OriginOS. Once GMS is physically thawed and both core processes exist, the normal recovery actions are bounded `GCM_RECONNECT` broadcasts plus the existing Binder stabilization lease.
+- Treats `BAD_AUTHENTICATION` as evidence that Google authentication needs a stable settling window, not as a trigger for force-stop. A soft reset is prohibited while authentication errors remain recent.
+- Network/VPN transitions, recent `fast_freezer` evidence, and stalled MCS reconnect attempts can start the thawed-transport bootstrap. After two minutes of stalled transport with a quiet auth window, at most one `am stop-app` soft reset is allowed, followed by Binder pulse, policy tune, stabilization lease and reconnect.
+- A freezer recovery campaign hands off after six seconds of physically-thawed/MCS-missing state via `transport_bootstrap_handoff`, instead of continuing process reset/refreeze loops or poisoning adaptive failure cooldown.
+- Repeated MCS-kick exhaustion does not escalate into another destructive campaign while physical cgroup readback is already thawed.
+- The watcher records Luonnotar network transitions and controlled `push_test_arrival_observed` events. A real controlled delivery is considered stronger recovery evidence than a point-in-time absence of 5228/5229/5230 in `ss`.
+- Includes the v131 shell-start bootstrap: the UID 2000 engine reasserts Luonnotar → Termux `RUN_COMMAND` permission and standard Android/OEM background policy before checking Termux `:8022`.
+- Keeps the proven r294 transactional handoff structure unchanged apart from the protocol revision bump to **r295**. Status schema advances to **58** with `gmsTransportBootstrap` and network/delivery evidence.
+
+> Current mainline candidate: **2.6.1 (versionCode 132)** — embedded engine **r295** — status schema **58**.
+
 ## 2.6.0 v130 / r294 mainline consolidation
 
 This build freezes the control-plane recovery architecture proven on the OriginOS SDK 36 target and turns the v127-v129 rescue work into a mainline baseline. No new privileged capability is added in v130.
@@ -15,7 +30,7 @@ This build freezes the control-plane recovery architecture proven on the OriginO
 
 Live acceptance baseline on the target device: Termux `sshd` was killed and `adb usb` removed `:5555` while `:8025` was also taken down by adbd restarts. With no manual rescue calls, `:8025` returned first, `:5555` was reasserted through the live Wireless ADB Binder port, `:8025` respawned again after that adbd restart, and Termux `:8022` returned last.
 
-> Current mainline candidate: **2.6.0 (versionCode 130)** — embedded engine **r294** — status schema **56**.
+> v130 frozen baseline: **2.6.0 (versionCode 130)** — embedded engine **r294** — status schema **56**.
 
 ## 2.5.1 r262 vendor-defense ownership + self-update PoC
 

@@ -1,5 +1,20 @@
 # 努昂诺塔（Luonnotar）
 
+## 2.6.1 v132 / r295 OriginOS 解冻后传输恢复分层
+
+2.6.1 不再把“GMS 已经从 freezer 中解冻”和“FCM/MCS 已恢复”当成同一个成功条件。真机故障现场证明 GMS main/persistent 可以同时 `cgroup.freeze=0`、保持高重要性并拥有有效网络，但 MCS 仍持续离线且伴随 `BAD_AUTHENTICATION`。r295 因此把恢复状态机拆成 freezer/process 层与 thawed-transport 层。
+
+- 新增 `GmsThawedTransportBootstrapPolicy`：VIVO/OriginOS 上只有在 GMS 物理解冻、两个核心进程存在、MCS 持续缺失时才接管；正常动作只做有界 `GCM_RECONNECT` 与既有 Binder stabilization lease。
+- `BAD_AUTHENTICATION` 被视为“需要稳定窗口等待 Google 自己重认证”的证据，不再直接触发 `force-stop`；90 秒内仍有新 auth 错误时禁止软重置。
+- 网络/VPN 切换、近期 `fast_freezer`、MCS reconnect stall 都可触发 thawed-transport bootstrap。重连持续两分钟且 auth 已安静时，最多允许一次 `am stop-app` 软重置；随后重新建立 Binder pulse、后台策略、stabilization lease 与 GCM reconnect。
+- 原 GMS freezer campaign 一旦确认物理解冻而 MCS 连续缺失 6 秒，立即以 `transport_bootstrap_handoff` 交棒，不再继续 reset/refreeze 循环，也不把这次交棒计入 adaptive failure cooldown。
+- MCS kick 连续失败时，如果当前物理 cgroup 已解冻，不再升级成新的 destructive campaign；由 transport bootstrap 独占这一阶段。
+- 控制面 watcher 额外记录努昂诺塔自己的网络切换与 `push_test_arrival_observed`。受控推送真实到达被视为比某一瞬间 `ss` 看不到 5228/5229/5230 更强的恢复证据。
+- 继承 v131 shell-start bootstrap：每次 UID 2000 shell engine 启动会先确认/补齐 Luonnotar → Termux `RUN_COMMAND` 权限，再重申标准 Android/OEM 后台策略，随后才进入 Termux `:8022` 健康检查。
+- transactional self-update / hot handoff 核心保持 r294 已验证结构，只提升协议修订号到 **r295**；状态 schema 升为 **58**，新增 `gmsTransportBootstrap` 与网络切换/受控到达证据。
+
+> 当前主线候选：**2.6.1（versionCode 132）**；内置引擎 **r295**；状态 schema **58**。
+
 ## 2.6.0 v130 / r294 真·主线整编
 
 v130 不再继续堆特权能力，而是冻结已经在 OriginOS / SDK 36 真机上通过故障注入的控制面自愈架构，把 v127-v129 的救援实验收束成正式主线基线。
@@ -15,7 +30,7 @@ v130 不再继续堆特权能力，而是冻结已经在 OriginOS / SDK 36 真�
 
 真机主线验收基线：人工 `pkill sshd` 杀掉 Termux `:8022`，再用 `adb usb` 杀掉固定 `:5555`，adbd restart 同时带走 `:8025`。全程不执行任何 `rescue_*`：`8025` 先由 keeper 重生，随后 guardian 通过 Binder 找到 Wireless ADB 端口并恢复 `5555`，第二次 adbd restart 后 `8025` 再次重生，最终 Termux `8022` 也自行恢复。
 
-> 当前主线候选：**2.6.0（versionCode 130）**；内置引擎 **r294**；状态 schema **56**。
+> v130 冻结基线：**2.6.0（versionCode 130）**；内置引擎 **r294**；状态 schema **56**。
 
 ## 2.5.1 r262 厂商回冻 Recovery Owner + 自更新 PoC
 

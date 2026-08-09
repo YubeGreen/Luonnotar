@@ -20,12 +20,12 @@ Repository: https://github.com/RikkaApps/Shizuku
 
 ## Apache MINA SSHD
 
-Luonnotar 2.6.0 uses **Apache MINA SSHD** (`org.apache.sshd:sshd-core:2.19.0`) to provide the shell-owned SSH rescue daemon. Apache MINA SSHD is licensed under the Apache License 2.0.
+Luonnotar 2.6.1 uses **Apache MINA SSHD** (`org.apache.sshd:sshd-core:2.19.0`) to provide the shell-owned SSH rescue daemon. Apache MINA SSHD is licensed under the Apache License 2.0.
 Repository: https://github.com/apache/mina-sshd
 
 ## Bouncy Castle
 
-Luonnotar 2.6.0 uses **Bouncy Castle Provider** (`org.bouncycastle:bcprov-jdk18on:1.84`) inside the shell-owned SSH runtime to provide a complete JCA/JCE EC implementation on Android. Bouncy Castle is distributed under the Bouncy Castle Licence.
+Luonnotar 2.6.1 uses **Bouncy Castle Provider** (`org.bouncycastle:bcprov-jdk18on:1.84`) inside the shell-owned SSH runtime to provide a complete JCA/JCE EC implementation on Android. Bouncy Castle is distributed under the Bouncy Castle Licence.
 Repository: https://github.com/bcgit/bc-java
 
 ## SLF4J

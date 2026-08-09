@@ -4,7 +4,9 @@ package com.yubegreen.luonnotar.privileged
  * gap from an authentication/transport failure. */
 enum class GmsTransportLogSignalKind {
     BAD_AUTHENTICATION,
-    MCS_CONNECT_ATTEMPT
+    MCS_CONNECT_ATTEMPT,
+    NETWORK_TRANSITION,
+    CONTROLLED_DELIVERY
 }
 
 data class GmsTransportLogSignal(
@@ -22,10 +24,23 @@ object GmsTransportLogSignalParser {
             MCS_PORTS.any { port -> line.contains(":$port") } ->
             GmsTransportLogSignal(GmsTransportLogSignalKind.MCS_CONNECT_ATTEMPT, line)
 
+        line.contains("Luonnotar", ignoreCase = true) &&
+            NETWORK_EVENTS.any { event -> line.contains(event, ignoreCase = true) } ->
+            GmsTransportLogSignal(GmsTransportLogSignalKind.NETWORK_TRANSITION, line)
+
+        line.contains("Luonnotar", ignoreCase = true) &&
+            line.contains("push_test_arrival_observed", ignoreCase = true) ->
+            GmsTransportLogSignal(GmsTransportLogSignalKind.CONTROLLED_DELIVERY, line)
+
         else -> null
     }
 
     private val MCS_PORTS = setOf(443, 5228, 5229, 5230)
+    private val NETWORK_EVENTS = setOf(
+        "default_network_handle_changed",
+        "vpn_network_changed",
+        "vpn_recovered"
+    )
 }
 
 data class GmsTransportProbe(

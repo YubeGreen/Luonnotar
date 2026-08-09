@@ -35,6 +35,18 @@ class GmsTransportHealthTest {
     }
 
     @Test
+    fun parsesNetworkTransitionAndControlledDeliveryLogs() {
+        val network = GmsTransportLogSignalParser.parse(
+            "I Luonnotar: guardian_timeline {timelineEvent=vpn_network_changed}"
+        )
+        val arrival = GmsTransportLogSignalParser.parse(
+            "I Luonnotar: push_test_arrival_observed {sequence=16743}"
+        )
+        assertEquals(GmsTransportLogSignalKind.NETWORK_TRANSITION, network?.kind)
+        assertEquals(GmsTransportLogSignalKind.CONTROLLED_DELIVERY, arrival?.kind)
+    }
+
+    @Test
     fun recentBadAuthenticationPlusSustainedMissingTransportAllowsRecovery() {
         val decision = GmsTransportHealthPolicy.decide(
             automaticEnabled = true,
