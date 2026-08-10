@@ -22,6 +22,28 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
+internal object ArrivalNotificationListenerFaultBridge {
+    @Volatile
+    private var activeInstance: ArrivalNotificationListener? = null
+
+    fun connected(instance: ArrivalNotificationListener) {
+        activeInstance = instance
+    }
+
+    fun destroyed(instance: ArrivalNotificationListener) {
+        if (activeInstance === instance) activeInstance = null
+    }
+
+    // Test-only: disconnect runtime listener without revoking notification access.
+    fun requestDiagnosticUnbind(): Boolean {
+        val instance = activeInstance ?: return false
+        return runCatching {
+            instance.requestUnbind()
+            true
+        }.getOrDefault(false)
+    }
+}
+
 class ArrivalNotificationListener : NotificationListenerService() {
     private enum class ObservationSource {
         LIVE_CALLBACK,
@@ -110,6 +132,7 @@ class ArrivalNotificationListener : NotificationListenerService() {
 
     override fun onListenerConnected() {
         super.onListenerConnected()
+        ArrivalNotificationListenerFaultBridge.connected(this)
         listenerConnected = true
         activeInstance = WeakReference(this)
         rebindHandler.removeCallbacks(rebindRunnable)
@@ -161,6 +184,7 @@ class ArrivalNotificationListener : NotificationListenerService() {
 
     override fun onDestroy() {
         destroying = true
+        ArrivalNotificationListenerFaultBridge.destroyed(this)
         listenerConnected = false
         if (activeInstance?.get() === this) activeInstance = null
         rebindHandler.removeCallbacks(rebindRunnable)

@@ -255,5 +255,12 @@
             android:directBootAware="true"
             android:exported="false"
             android:process=":keeper" />
+
+        <!-- r300: explicit-component, shell-only NotificationListener fault injection. -->
+        <receiver
+            android:name=".receiver.AdbNotificationListenerFaultReceiver"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.DUMP" />
     </application>
 </manifest>

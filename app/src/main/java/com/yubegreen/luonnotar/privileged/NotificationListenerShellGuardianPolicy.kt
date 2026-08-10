@@ -1,7 +1,17 @@
 package com.yubegreen.luonnotar.privileged
 
 internal object NotificationListenerShellGuardianPolicy {
+    const val PROBE_INTERVAL_MS = 30_000L
+
     enum class Action { NONE, ORDINARY_REBIND, STRONG_REREGISTER }
+
+    fun shouldProbe(nowElapsed: Long, lastProbeElapsed: Long): Boolean {
+        if (nowElapsed < 0L) return false
+        if (lastProbeElapsed <= 0L) return true
+        if (nowElapsed < lastProbeElapsed) return true
+        return nowElapsed - lastProbeElapsed >= PROBE_INTERVAL_MS
+    }
+
 
     data class Decision(val action: Action, val reason: String)
 

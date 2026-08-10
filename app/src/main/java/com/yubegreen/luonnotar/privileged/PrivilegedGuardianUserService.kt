@@ -323,6 +323,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     // socket sample. This grace suppresses recovery reopen only; raw socket
     // health remains an observation and is not rewritten.
     private var gmsTransportIncidentDeliveryGraceUntilElapsed = 0L
+    private var notificationListenerShellGuardianLastProbeElapsed = 0L
     private var notificationListenerShellGuardianUnhealthySinceElapsed = 0L
     private var notificationListenerShellGuardianLastNormalRebindElapsed = 0L
     private var notificationListenerShellGuardianLastStrongRecoveryElapsed = 0L
@@ -5490,6 +5491,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
 
         maybeProbeTermuxSshdLocked(now)
+        maybeReconcileNotificationListenerShellGuardianLocked(now)
 
         maybeProbeGmsTransportLocked(now)
         maybeStartVerifiedGmsCampaignLocked()
@@ -7090,6 +7092,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         ) return
         if (!lastGmsTransportProbe.observable || lastGmsTransportProbe.healthy) return
         if (gmsTransportConsecutiveMissing < 3) return
+        val deliveryGraceNow = SystemClock.elapsedRealtime()
+        if (deliveryGraceNow < gmsTransportIncidentDeliveryGraceUntilElapsed) {
+            eventLocked(
+                "gms_recovery_campaign_suppressed_controlled_delivery_grace",
+                "remainingMs=${gmsTransportIncidentDeliveryGraceUntilElapsed - deliveryGraceNow} " +
+                    "missing=$gmsTransportConsecutiveMissing " +
+                    "ports=${lastGmsTransportProbe.establishedPorts.sorted()}"
+            )
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val gmsProcesses = listGmsProcessesLocked()
         val currentPids = gmsProcesses.mapTo(linkedSetOf()) { it.pid }
@@ -8898,6 +8910,21 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
      * recovered the captured OriginOS failure. Strong re-registration is
      * attempted only after ordinary requestRebind has had two minutes to work.
      */
+    private fun maybeReconcileNotificationListenerShellGuardianLocked(
+        nowElapsed: Long
+    ) {
+        if (
+            !NotificationListenerShellGuardianPolicy.shouldProbe(
+                nowElapsed = nowElapsed,
+                lastProbeElapsed = notificationListenerShellGuardianLastProbeElapsed
+            )
+        ) {
+            return
+        }
+        notificationListenerShellGuardianLastProbeElapsed = nowElapsed
+        reconcileNotificationListenerShellGuardianLocked()
+    }
+
     private fun reconcileNotificationListenerShellGuardianLocked() {
         val now = SystemClock.elapsedRealtime()
         val snapshot = readNotificationListenerDiagnosticLocked() ?: run {
@@ -9903,6 +9930,17 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("runCommandPermissionLastEnsureElapsed", termuxRunCommandPermissionLastEnsureElapsed)
             .put("runCommandPermissionLastResult", termuxRunCommandPermissionLastResult)
         )
+        .put("notificationListenerShellGuardian", JSONObject()
+            .put("probeIntervalMs", NotificationListenerShellGuardianPolicy.PROBE_INTERVAL_MS)
+            .put("strongAfterMs", NOTIFICATION_LISTENER_STRONG_RECOVERY_AFTER_MS)
+            .put("strongCooldownMs", NOTIFICATION_LISTENER_STRONG_RECOVERY_COOLDOWN_MS)
+            .put("lastProbeElapsed", notificationListenerShellGuardianLastProbeElapsed)
+            .put("unhealthySinceElapsed", notificationListenerShellGuardianUnhealthySinceElapsed)
+            .put("lastOrdinaryRebindElapsed", notificationListenerShellGuardianLastNormalRebindElapsed)
+            .put("lastStrongRecoveryElapsed", notificationListenerShellGuardianLastStrongRecoveryElapsed)
+            .put("strongRecoveryCount", notificationListenerShellGuardianStrongRecoveryCount)
+            .put("lastResult", notificationListenerShellGuardianLastResult)
+        )
         .put("protectionHealth", protectionHealthJsonLocked())
         .put("backgroundPolicy", lastBackgroundPolicyReport.toJsonObject())
         .put("config", JSONObject(config.toJson()))
@@ -10350,7 +10388,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 61
+        private const val STATUS_SCHEMA = 62
         private const val GMS_CONTROLLED_DELIVERY_REOPEN_GRACE_MS = 60_000L
 
         private const val NOTIFICATION_LISTENER_COMPONENT =
