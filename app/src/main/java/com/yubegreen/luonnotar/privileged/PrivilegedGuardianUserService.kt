@@ -319,6 +319,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     // r297: destructive-tier usage and recovery probation belong to the entire
     // outage incident, not to a six-minute bootstrap generation.
     private var gmsTransportIncident: GmsTransportIncident? = null
+    // r299: a real controlled delivery is stronger than a point-in-time
+    // socket sample. This grace suppresses recovery reopen only; raw socket
+    // health remains an observation and is not rewritten.
+    private var gmsTransportIncidentDeliveryGraceUntilElapsed = 0L
+    private var notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+    private var notificationListenerShellGuardianLastNormalRebindElapsed = 0L
+    private var notificationListenerShellGuardianLastStrongRecoveryElapsed = 0L
+    private var notificationListenerShellGuardianStrongRecoveryCount = 0L
+    private var notificationListenerShellGuardianLastResult = "never"
     private var gmsTransportIncidentGeneration = 0L
     private var gmsTransportIncidentStartedCount = 0L
     private var gmsTransportIncidentRecoveredCount = 0L
@@ -2349,6 +2358,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
             GmsTransportLogSignalKind.CONTROLLED_DELIVERY -> {
                 lastGmsControlledDeliveryElapsed = now
+                gmsTransportIncidentDeliveryGraceUntilElapsed =
+                    maxOf(
+                        gmsTransportIncidentDeliveryGraceUntilElapsed,
+                        now + GMS_CONTROLLED_DELIVERY_REOPEN_GRACE_MS
+                    )
                 eventLocked("gms_controlled_delivery_observed", "source=notification_listener")
                 val incident = gmsTransportIncident
                 if (
@@ -6226,23 +6240,25 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         gmsTransportIncident?.let { return it }
 
         gmsTransportIncidentGeneration += 1
-        val start = gmsTransportMissingSinceElapsed
+        val outageStart = gmsTransportMissingSinceElapsed
             .takeIf { it > 0L && it <= nowElapsed }
             ?: nowElapsed
         val incident = GmsTransportIncident(
             generation = gmsTransportIncidentGeneration,
             trigger = trigger,
-            startedElapsed = start,
+            startedElapsed = nowElapsed,
+            outageSinceElapsed = outageStart,
             lastBootstrapStartedElapsed = 0L,
-            currentOutageSinceElapsed = start,
+            currentOutageSinceElapsed = outageStart,
             bootstrapGenerationCount = 0
         )
         gmsTransportIncident = incident
         gmsTransportIncidentStartedCount += 1
         eventLocked(
             "gms_transport_incident_started",
-            "incident=${incident.generation} trigger=$trigger startedElapsed=$start " +
-                "missingAgeMs=${(nowElapsed - start).coerceAtLeast(0L)}"
+            "incident=${incident.generation} trigger=$trigger startedElapsed=${incident.startedElapsed} " +
+                "outageSinceElapsed=${incident.outageSinceElapsed} " +
+                "missingAgeMs=${(nowElapsed - incident.outageSinceElapsed).coerceAtLeast(0L)}"
         )
         return incident
     }
@@ -6486,6 +6502,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         forceFromFreezerHandoff: Boolean = false
     ): Boolean {
         val now = SystemClock.elapsedRealtime()
+        if (now < gmsTransportIncidentDeliveryGraceUntilElapsed) {
+            return false
+        }
         if (!running || gmsTransportBootstrap != null) return false
         if (gmsRecoveryInProgress || gmsRecoveryCampaign != null) return false
 
@@ -7885,7 +7904,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val vendorFamily = currentVendorFamilyLocked()
         val nextResetCount = campaign.resetCount + 1
         val hardResetRequested = campaign.hardResetRequested
-        val incident = if (transportProbe.observable && !transportProbe.healthy) {
+        val deliveryGraceActive =
+            now < gmsTransportIncidentDeliveryGraceUntilElapsed
+        val incident = if (
+            !deliveryGraceActive &&
+            transportProbe.observable &&
+            !transportProbe.healthy
+        ) {
             // The older freezer recovery campaign may reach reset before the
             // thawed-transport bootstrap. Create/adopt the same incident here
             // so it cannot bypass the one-soft/one-hard destructive ledger.
@@ -7909,7 +7934,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 forceStopCount = campaign.forceStopCount
             )
         val campaignForceStopAllowed =
-            !incidentHardResetUsed &&
+            !deliveryGraceActive &&
+                !incidentHardResetUsed &&
                 (normalForceStopRequested ||
                     (hardResetRequested && hardResetBudgetAvailable))
         val forceStopDecision = RecoveryCampaignPolicy.decideGmsForceStop(
@@ -8037,7 +8063,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         var remainingOldPids: Set<Int> = oldPids
         var stopAppSucceeded = false
-        if (!forceStopAllowed && supportsStopApp && !incidentSoftResetUsed) {
+        if (
+            !forceStopAllowed &&
+            !deliveryGraceActive &&
+            supportsStopApp &&
+            !incidentSoftResetUsed
+        ) {
             if (incident != null) {
                 incident.softResetUsed = true
                 incident.softResetElapsed = now
@@ -8846,6 +8877,237 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         return BackgroundPolicyVendorDetector.detect(properties).family
     }
 
+
+    private data class NotificationListenerDiagnosticSnapshot(
+        val privacyAcknowledged: Boolean,
+        val persistedConnected: Boolean,
+        val runtimeConnected: Boolean,
+        val heartbeatAgeMs: Long
+    ) {
+        fun healthy(): Boolean =
+            persistedConnected &&
+                runtimeConnected &&
+                heartbeatAgeMs in 0L..NOTIFICATION_LISTENER_HEARTBEAT_STALE_MS
+    }
+
+    /**
+     * r299 second-layer NotificationListener guardian.
+     *
+     * The listener cannot repair itself while it is unbound. The embedded
+     * engine is UID shell, so it can use the same shell control surface that
+     * recovered the captured OriginOS failure. Strong re-registration is
+     * attempted only after ordinary requestRebind has had two minutes to work.
+     */
+    private fun reconcileNotificationListenerShellGuardianLocked() {
+        val now = SystemClock.elapsedRealtime()
+        val snapshot = readNotificationListenerDiagnosticLocked() ?: run {
+            notificationListenerShellGuardianLastResult = "diagnostic_unavailable"
+            return
+        }
+        val authorized = notificationListenerSystemAuthorizationPresentLocked()
+
+        if (snapshot.healthy()) {
+            if (notificationListenerShellGuardianUnhealthySinceElapsed > 0L) {
+                eventLocked(
+                    "notification_listener_shell_guardian_recovered",
+                    "method=observed heartbeatAgeMs=${snapshot.heartbeatAgeMs} " +
+                        "strongCount=$notificationListenerShellGuardianStrongRecoveryCount"
+                )
+            }
+            notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianLastNormalRebindElapsed = 0L
+            notificationListenerShellGuardianLastResult = "healthy"
+            return
+        }
+
+        if (!snapshot.privacyAcknowledged) {
+            notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianLastResult = "privacy_not_acknowledged"
+            return
+        }
+        if (!authorized) {
+            notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianLastResult = "system_access_not_authorized"
+            return
+        }
+
+        val episodeWasNew =
+            notificationListenerShellGuardianUnhealthySinceElapsed <= 0L
+        if (episodeWasNew) {
+            notificationListenerShellGuardianUnhealthySinceElapsed = now
+            eventLocked(
+                "notification_listener_shell_guardian_episode_started",
+                "persisted=${snapshot.persistedConnected} runtime=${snapshot.runtimeConnected} " +
+                    "heartbeatAgeMs=${snapshot.heartbeatAgeMs}"
+            )
+        }
+
+        val decision = NotificationListenerShellGuardianPolicy.decide(
+            privacyAcknowledged = snapshot.privacyAcknowledged,
+            systemAuthorized = authorized,
+            healthy = false,
+            nowElapsed = now,
+            unhealthySinceElapsed =
+                if (episodeWasNew) 0L
+                else notificationListenerShellGuardianUnhealthySinceElapsed,
+            lastOrdinaryRebindElapsed =
+                notificationListenerShellGuardianLastNormalRebindElapsed,
+            lastStrongRecoveryElapsed =
+                notificationListenerShellGuardianLastStrongRecoveryElapsed,
+            strongAfterMs = NOTIFICATION_LISTENER_STRONG_RECOVERY_AFTER_MS,
+            strongCooldownMs = NOTIFICATION_LISTENER_STRONG_RECOVERY_COOLDOWN_MS
+        )
+
+        if (
+            decision.action ==
+            NotificationListenerShellGuardianPolicy.Action.ORDINARY_REBIND
+        ) {
+            notificationListenerShellGuardianLastNormalRebindElapsed = now
+            val requested = requestNotificationListenerOrdinaryRebindLocked()
+            notificationListenerShellGuardianLastResult =
+                if (requested) "ordinary_rebind_requested" else "ordinary_rebind_failed"
+            eventLocked(
+                "notification_listener_shell_guardian_rebind_requested",
+                "requested=$requested heartbeatAgeMs=${snapshot.heartbeatAgeMs} " +
+                    "persistedConnected=${snapshot.persistedConnected}"
+            )
+            return
+        }
+        if (
+            decision.action !=
+            NotificationListenerShellGuardianPolicy.Action.STRONG_REREGISTER
+        ) {
+            notificationListenerShellGuardianLastResult = decision.reason
+            return
+        }
+
+        val unhealthyFor =
+            (now - notificationListenerShellGuardianUnhealthySinceElapsed).coerceAtLeast(0L)
+        notificationListenerShellGuardianLastStrongRecoveryElapsed = now
+        notificationListenerShellGuardianStrongRecoveryCount += 1L
+        eventLocked(
+            "notification_listener_shell_guardian_strong_recovery_started",
+            "unhealthyForMs=$unhealthyFor " +
+                "count=$notificationListenerShellGuardianStrongRecoveryCount"
+        )
+
+        val disallow = runner.run(
+            "cmd",
+            "notification",
+            "disallow_listener",
+            NOTIFICATION_LISTENER_COMPONENT,
+            "0",
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+
+        runCatching { Thread.sleep(NOTIFICATION_LISTENER_REREGISTER_GAP_MS) }
+
+        var allow = runner.run(
+            "cmd",
+            "notification",
+            "allow_listener",
+            NOTIFICATION_LISTENER_COMPONENT,
+            "0",
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        var allowAttempts = 1
+        while (!allow.success && allowAttempts < NOTIFICATION_LISTENER_ALLOW_RETRY_COUNT) {
+            runCatching { Thread.sleep(NOTIFICATION_LISTENER_ALLOW_RETRY_DELAY_MS) }
+            allowAttempts += 1
+            allow = runner.run(
+                "cmd",
+                "notification",
+                "allow_listener",
+                NOTIFICATION_LISTENER_COMPONENT,
+                "0",
+                timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+            )
+        }
+
+        runCatching { Thread.sleep(NOTIFICATION_LISTENER_POST_ALLOW_VERIFY_MS) }
+        val after = readNotificationListenerDiagnosticLocked()
+        val recovered = allow.success && after?.healthy() == true
+        notificationListenerShellGuardianLastResult =
+            if (recovered) "strong_recovery_succeeded" else "strong_recovery_failed"
+
+        eventLocked(
+            "notification_listener_shell_guardian_strong_recovery_finished",
+            "success=$recovered disallowOk=${disallow.success} allowOk=${allow.success} " +
+                "allowAttempts=$allowAttempts persisted=${after?.persistedConnected} " +
+                "runtime=${after?.runtimeConnected} heartbeatAgeMs=${after?.heartbeatAgeMs}"
+        )
+
+        if (recovered) {
+            notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianLastNormalRebindElapsed = 0L
+        }
+    }
+
+    private fun readNotificationListenerDiagnosticLocked():
+        NotificationListenerDiagnosticSnapshot? {
+        val result = runner.run(
+            "am",
+            "broadcast",
+            "--include-stopped-packages",
+            "--receiver-foreground",
+            "-n",
+            NOTIFICATION_DIAGNOSTIC_RECEIVER,
+            "-a",
+            NOTIFICATION_STATUS_ACTION,
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        if (!result.success) return null
+
+        val payload = Regex("data=\\\"([^\\\"]*)\\\"")
+            .find(result.stdout)
+            ?.groupValues
+            ?.getOrNull(1)
+            ?: return null
+        val fields = payload
+            .split(';')
+            .mapNotNull { entry ->
+                val index = entry.indexOf('=')
+                if (index <= 0) null
+                else entry.substring(0, index) to entry.substring(index + 1)
+            }
+            .toMap()
+        if (fields["ok"] != "true") return null
+
+        return NotificationListenerDiagnosticSnapshot(
+            privacyAcknowledged = fields["privacyAcknowledged"] == "true",
+            persistedConnected = fields["listenerPersistedConnected"] == "true",
+            runtimeConnected = fields["listenerRuntimeConnected"] == "true",
+            heartbeatAgeMs = fields["heartbeatAgeMs"]?.toLongOrNull() ?: -1L
+        )
+    }
+
+    private fun notificationListenerSystemAuthorizationPresentLocked(): Boolean {
+        val result = runner.run(
+            "settings",
+            "get",
+            "secure",
+            "enabled_notification_listeners",
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        return result.success &&
+            result.stdout.contains(NOTIFICATION_LISTENER_COMPONENT)
+    }
+
+    private fun requestNotificationListenerOrdinaryRebindLocked(): Boolean {
+        val result = runner.run(
+            "am",
+            "broadcast",
+            "--include-stopped-packages",
+            "--receiver-foreground",
+            "-n",
+            NOTIFICATION_DIAGNOSTIC_RECEIVER,
+            "-a",
+            NOTIFICATION_SCAN_ACTIVE_ACTION,
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        return result.success
+    }
+
     private fun tunePackagesLocked() {
         reconcileTermuxRunCommandPermissionLocked(source = "scheduled_tune")
         applyBackgroundPolicyLocked(
@@ -8918,7 +9180,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             "source=$source before=${before.summary()} grant=$grantSummary after=${after.summary()} " +
                 "result=$termuxRunCommandPermissionLastResult"
         )
-    }
+            reconcileNotificationListenerShellGuardianLocked()
+}
 
     private fun tunePackageLocked(packageName: String) {
         if (!GuardianEngineConfig.isSafePackageName(packageName)) return
@@ -9782,6 +10045,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val generation: Long,
         val trigger: String,
         val startedElapsed: Long,
+        val outageSinceElapsed: Long,
         var lastBootstrapStartedElapsed: Long,
         var currentOutageSinceElapsed: Long,
         var socketHealthySinceElapsed: Long = 0L,
@@ -9807,6 +10071,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("generation", generation)
             .put("trigger", trigger)
             .put("startedElapsed", startedElapsed)
+            .put("outageSinceElapsed", outageSinceElapsed)
             .put("lastBootstrapStartedElapsed", lastBootstrapStartedElapsed)
             .put("currentOutageSinceElapsed", currentOutageSinceElapsed)
             .put("socketHealthySinceElapsed", socketHealthySinceElapsed)
@@ -10085,7 +10350,25 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 60
+        private const val STATUS_SCHEMA = 61
+        private const val GMS_CONTROLLED_DELIVERY_REOPEN_GRACE_MS = 60_000L
+
+        private const val NOTIFICATION_LISTENER_COMPONENT =
+            "com.yubegreen.luonnotar/com.yubegreen.luonnotar.notification.ArrivalNotificationListener"
+        private const val NOTIFICATION_DIAGNOSTIC_RECEIVER =
+            "com.yubegreen.luonnotar/.receiver.AdbNotificationDiagnosticsReceiver"
+        private const val NOTIFICATION_STATUS_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_NOTIFICATION_STATUS"
+        private const val NOTIFICATION_SCAN_ACTIVE_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_NOTIFICATION_SCAN_ACTIVE"
+        private const val NOTIFICATION_LISTENER_HEARTBEAT_STALE_MS = 390_000L
+        private const val NOTIFICATION_LISTENER_STRONG_RECOVERY_AFTER_MS = 120_000L
+        private const val NOTIFICATION_LISTENER_STRONG_RECOVERY_COOLDOWN_MS = 15 * 60_000L
+        private const val NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS = 10_000L
+        private const val NOTIFICATION_LISTENER_REREGISTER_GAP_MS = 1_500L
+        private const val NOTIFICATION_LISTENER_POST_ALLOW_VERIFY_MS = 5_000L
+        private const val NOTIFICATION_LISTENER_ALLOW_RETRY_DELAY_MS = 750L
+        private const val NOTIFICATION_LISTENER_ALLOW_RETRY_COUNT = 3
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
