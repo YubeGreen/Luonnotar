@@ -103,7 +103,21 @@ internal class EmbeddedEngineInstanceGuard private constructor(
 
     @Synchronized
     fun beginHandoffExclusion(expectedRevision: Int): Boolean {
-        if (handoffFileLock != null) return true
+        // A second handoff request handled by the same primary process must not
+        // be treated as re-entrant ownership of the first transaction's lock.
+        // Doing so lets the losing transaction release the winning transaction's
+        // exclusion in its failure cleanup. Reject it explicitly instead.
+        if (handoffFileLock?.isValid == true) {
+            appendLifecycle(
+                "handoff_exclusion_reentrant_rejected",
+                mapOf("expectedRevision" to expectedRevision)
+            )
+            return false
+        }
+        runCatching { handoffFileLock?.release() }
+        runCatching { handoffRandomAccessFile?.close() }
+        handoffFileLock = null
+        handoffRandomAccessFile = null
         val lockFile = File(HANDOFF_LOCK_PATH)
         lockFile.parentFile?.mkdirs()
         val raf = RandomAccessFile(lockFile, "rw")

@@ -417,6 +417,41 @@ class EmbeddedAdbService : Service() {
                 return@execute
             }
 
+            if (!EmbeddedGuardianManager.requiresAdbRestartFallback(attempt)) {
+                LogManager.event(
+                    this,
+                    "embedded_engine_restart_fallback_suppressed",
+                    mapOf(
+                        "source" to source,
+                        "generation" to generation,
+                        "reason" to attempt.reason,
+                        "oldRevision" to attempt.oldRevision
+                    )
+                )
+                // Transactional failure means the predecessor is expected to
+                // remain authoritative. Do not follow it with pidof -> kill.
+                // For an in-flight shell self-update, avoid even a configure RPC
+                // so the updater owns the control plane until it reaches a terminal state.
+                if (attempt.reason != "self_update_handoff_in_progress") {
+                    runCatching { EmbeddedGuardianManager.configure(this, generation) }
+                        .onFailure { error ->
+                            LogManager.event(
+                                this,
+                                "embedded_engine_restart_restore_failed",
+                                mapOf(
+                                    "source" to source,
+                                    "generation" to generation,
+                                    "reason" to attempt.reason,
+                                    "error" to error.toString()
+                                )
+                            )
+                        }
+                }
+                stopForeground(STOP_FOREGROUND_REMOVE)
+                stopSelf()
+                return@execute
+            }
+
             LogManager.event(
                 this,
                 "embedded_engine_restart_fallback_adb",

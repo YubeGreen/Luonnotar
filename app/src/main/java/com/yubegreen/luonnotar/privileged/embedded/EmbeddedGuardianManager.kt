@@ -456,7 +456,7 @@ object EmbeddedGuardianManager {
             connectTimeoutMs = FAST_PING_TIMEOUT_MS,
             readTimeoutMs = FAST_PING_TIMEOUT_MS
         )
-        val oldPing = runCatching { parsePing(client.ping(), requireCurrentRevision = false) }
+        var oldPing = runCatching { parsePing(client.ping(), requireCurrentRevision = false) }
             .getOrElse { error ->
                 LogManager.event(
                     app,
@@ -466,6 +466,61 @@ object EmbeddedGuardianManager {
                 )
                 return HandoffAttempt(false, "engine_unreachable")
             }
+        if (source == "package_replaced") {
+            var selfUpdateOwnsRestart = false
+            // MY_PACKAGE_REPLACED can race the shell-owned PackageInstaller callback.
+            // Give the old shell coordinator a short window to publish the just-installed
+            // version before deciding that this is an unrelated external replacement.
+            for (probe in 0 until PACKAGE_REPLACE_SELF_UPDATE_PROBES) {
+                if (packageReplaceSelfUpdateOwnsRestart(app, client)) {
+                    selfUpdateOwnsRestart = true
+                    break
+                }
+                if (probe + 1 < PACKAGE_REPLACE_SELF_UPDATE_PROBES) {
+                    Thread.sleep(PACKAGE_REPLACE_SELF_UPDATE_PROBE_DELAY_MS)
+                }
+            }
+            if (selfUpdateOwnsRestart) {
+                LogManager.event(
+                    app,
+                    "embedded_package_replace_restart_suppressed_self_update",
+                    EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                        mapOf(
+                            "oldRevision" to oldPing.engineRevision,
+                            "oldPid" to oldPing.pid,
+                            "expectedRevision" to EmbeddedGuardianProtocol.ENGINE_REVISION
+                        )
+                )
+                return HandoffAttempt(false, "self_update_handoff_in_progress", oldPing.engineRevision)
+            }
+
+            // The shell-owned transaction may have completed during the grace probes.
+            // Re-read the persisted endpoint before launching another candidate.
+            val refreshed = runCatching { parsePing(client.ping(), requireCurrentRevision = false) }.getOrNull()
+            if (refreshed != null) {
+                if (refreshed.engineRevision == EmbeddedGuardianProtocol.ENGINE_REVISION) {
+                    runCatching { configure(app, generation) }
+                    LogManager.event(
+                        app,
+                        "embedded_package_replace_restart_already_current",
+                        EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                            mapOf(
+                                "oldRevision" to oldPing.engineRevision,
+                                "currentRevision" to refreshed.engineRevision,
+                                "currentPid" to refreshed.pid
+                            )
+                    )
+                    return HandoffAttempt(
+                        true,
+                        "already_current_after_package_replace",
+                        oldPing.engineRevision,
+                        refreshed.engineRevision
+                    )
+                }
+                oldPing = refreshed
+            }
+        }
+
         if (
             oldPing.engineRevision < EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION ||
             !oldPing.handoffSupported
@@ -607,6 +662,23 @@ object EmbeddedGuardianManager {
         return HandoffAttempt(true, "hot_handoff", oldPing.engineRevision, newPing.engineRevision)
     }
 
+
+    private fun packageReplaceSelfUpdateOwnsRestart(
+        app: Context,
+        client: EmbeddedGuardianClient
+    ): Boolean {
+        val status = runCatching { JSONObject(client.selfUpdateStatus()) }.getOrNull() ?: return false
+        if (!status.optBoolean("running", false) && status.optString("state") != "running") return false
+        if (status.optString("installState") != "success") return false
+        if (status.optString("handoffState") != "running") return false
+        val installedVersion = status.optInt("versionCode", -1)
+        val currentVersion = runCatching {
+            app.packageManager.getPackageInfo(app.packageName, 0).longVersionCode.toInt()
+        }.getOrDefault(-1)
+        // Match the just-installed package version so an ancient stale journal
+        // cannot suppress an unrelated external package replacement.
+        return installedVersion > 0 && installedVersion == currentVersion
+    }
 
     private fun retireLegacyEngine(
         identity: EmbeddedGuardianStore.EndpointIdentity,
@@ -995,10 +1067,12 @@ object EmbeddedGuardianManager {
     private const val CONFIGURE_READ_TIMEOUT_MS = 30_000
     private const val OPERATION_READ_TIMEOUT_MS = 30_000
     private const val RECOVERY_REQUEST_TIMEOUT_MS = 10_000
-    private const val HANDOFF_REQUEST_TIMEOUT_MS = 25_000
+    private const val HANDOFF_REQUEST_TIMEOUT_MS = 55_000
     private const val HANDOFF_PING_TIMEOUT_MS = 750
     private const val HANDOFF_VERIFY_ATTEMPTS = 40
     private const val HANDOFF_VERIFY_DELAY_MS = 200L
+    private const val PACKAGE_REPLACE_SELF_UPDATE_PROBES = 13
+    private const val PACKAGE_REPLACE_SELF_UPDATE_PROBE_DELAY_MS = 250L
     private const val LEGACY_RETIRE_VERIFY_ATTEMPTS = 12
     private const val LEGACY_RETIRE_VERIFY_DELAY_MS = 150L
 }

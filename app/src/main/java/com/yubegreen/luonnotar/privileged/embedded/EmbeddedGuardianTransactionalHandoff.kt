@@ -167,12 +167,6 @@ internal object EmbeddedGuardianTransactionalHandoff {
                     candidatePid = activated.optInt("pid", candidatePid)
                 )
             }.onFailure { cleanupWarnings += "record:${it.javaClass.simpleName}" }
-            // Only now may the predecessor stop its watchdogs. The SSH daemon is
-            // a separate shell process and is explicitly preserved across this.
-            runCatching { engine.stopForHandoff() }
-                .onFailure { cleanupWarnings += "old_stop:${it.javaClass.simpleName}" }
-            runCatching { primaryGuard.finishHandoffExclusion("handoff_takeover_confirmed") }
-                .onFailure { cleanupWarnings += "exclusion_release:${it.javaClass.simpleName}" }
             val successOutcome = JSONObject()
                 .put("accepted", true)
                 .put("transactional", true)
@@ -183,10 +177,22 @@ internal object EmbeddedGuardianTransactionalHandoff {
                 .put("oldPid", android.os.Process.myPid())
                 .put("candidatePid", activated.optInt("pid", candidatePid))
                 .put("ssh", activated.optJSONObject("ssh") ?: JSONObject.NULL)
-                .put("cleanupWarnings", cleanupWarnings.joinToString(","))
+
+            // The promoted candidate is already the verified primary at this
+            // point. Persist the self-update terminal outcome before touching
+            // predecessor cleanup so an old-process crash cannot strand the
+            // journal forever at handoffState=running.
             if (request.optBoolean("selfUpdateHandoff", false)) {
                 EmbeddedSelfUpdateCoordinator.recordHandoffSuccess(successOutcome)
             }
+
+            // Only now may the predecessor stop its watchdogs. The SSH daemon is
+            // a separate shell process and is explicitly preserved across this.
+            runCatching { engine.stopForHandoff() }
+                .onFailure { cleanupWarnings += "old_stop:${it.javaClass.simpleName}" }
+            runCatching { primaryGuard.finishHandoffExclusion("handoff_takeover_confirmed") }
+                .onFailure { cleanupWarnings += "exclusion_release:${it.javaClass.simpleName}" }
+            successOutcome.put("cleanupWarnings", cleanupWarnings.joinToString(","))
             return successOutcome.toString()
 
         } catch (error: Throwable) {

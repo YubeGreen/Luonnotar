@@ -1,5 +1,6 @@
 package com.yubegreen.luonnotar.privileged.embedded
 
+import android.os.Process
 import org.json.JSONObject
 import java.io.File
 import java.util.concurrent.Executors
@@ -17,7 +18,7 @@ import java.util.concurrent.atomic.AtomicReference
  */
 internal object EmbeddedSelfUpdateCoordinator {
     private const val STATUS_PATH = "/data/local/tmp/luonnotar-self-update/last-self-update-status.json"
-    private const val SELF_HANDOFF_READ_TIMEOUT_MS = 30_000
+    private const val SELF_HANDOFF_READ_TIMEOUT_MS = 55_000
 
     private val executor = Executors.newSingleThreadExecutor { runnable ->
         Thread(runnable, "luonnotar-self-update").apply { isDaemon = true }
@@ -135,9 +136,36 @@ internal object EmbeddedSelfUpdateCoordinator {
     }
 
     fun status(): String {
+        if (!running.get()) reconcileOrphanedHandoffIfCurrentPrimary()
         val json = JSONObject(readPublished())
         val transactionRunning = running.get() || json.optString("state") == "running"
         return json.put("running", transactionRunning).toString()
+    }
+
+    @Synchronized
+    private fun reconcileOrphanedHandoffIfCurrentPrimary() {
+        val json = JSONObject(readPublished())
+        if (json.optString("state") != "running") return
+        if (json.optString("installState") != "success") return
+        if (json.optString("handoffState") != "running") return
+
+        val engineState = runCatching {
+            JSONObject(File(EmbeddedEngineInstanceGuard.STATE_PATH).readText())
+        }.getOrNull() ?: return
+        if (engineState.optInt("engineRevision", -1) != EmbeddedGuardianProtocol.ENGINE_REVISION) return
+        if (engineState.optInt("pid", -1) != Process.myPid()) return
+
+        val installMessage = json.optString("installMessage", json.optString("message"))
+        json.put("state", "success")
+            .put("ok", true)
+            .put("handoffState", "success")
+            .put("handoffReason", "orphaned_handoff_reconciled_current_primary")
+            .put("handoffExpectedRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
+            .put("handoffCandidateRevision", EmbeddedGuardianProtocol.ENGINE_REVISION)
+            .put("handoffCandidatePid", Process.myPid())
+            .put("handoffRecovered", true)
+            .put("message", (installMessage + "; HANDOFF_RECOVERED_CURRENT_PRIMARY").take(800))
+        publish(json)
     }
 
     @Synchronized
