@@ -22,8 +22,12 @@ start_out=$(adb "${adb_args[@]}" shell content call \
   --extra "apk_path:s:$remote" 2>&1 || true)
 
 field() {
-  local name="$1" text="$2"
-  printf '%s\n' "$text" | grep -oE "${name}=[^,;}]*" | tail -n 1 | sed -E "s/^${name}=//"
+  local name="$1" text="$2" value
+  # self_update_status fields appear progressively. Under `set -euo pipefail`,
+  # a grep miss must mean "field not present yet", not "abort the updater".
+  value=$(printf '%s\n' "$text" | grep -oE "${name}=[^,;}]*" | tail -n 1 | sed -E "s/^${name}=//" || true)
+  printf '%s' "$value"
+  return 0
 }
 
 summarize() {
