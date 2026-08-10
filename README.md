@@ -1,5 +1,18 @@
 # Luonnotar
 
+## 2.6.1 v133 / r296 OriginOS MCS refreeze debounce + bounded hard recovery
+
+Live v132 traces confirmed that OriginOS `fast_freezer` repeatedly creates sub-second `cgroup.freeze=1` edges after a healthy 5228 session. Most edges are already repaired by `vendor_bridge_mcs_rebuild` in roughly 3–8 seconds. r296 stops treating those transient samples as terminal freezer ownership, while adding one globally-budgeted hard transition for a genuinely stuck thawed-MCS outage.
+
+- Adds a **12-second continuous physical-refreeze gate** to the transport bootstrap. Short fast-freezer edges enter `freezer_settle` and no longer immediately finish as `refrozen` or get cancelled by `recoverGmsLocked()`; only a persistent freeze hands ownership back to the freezer/process campaign.
+- Fixes the inverted sustained-outage soft-reset condition where an old `lastMcsConnectAttempt` made the longest outage ineligible for the single stop-app tier.
+- Adds a thawed-transport hard-reset gate: only after three minutes in the same bootstrap and at least 60 seconds without any healthy transport sample may it request one `force-stop -> unstop -> Binder pulse/lease -> GCM_RECONNECT` transition. Execution still passes the existing global **10-minute minimum interval / 6-per-24h** force-stop budget.
+- Reuses the existing post-force-stop shield after a verified transition. Ordinary 3–8 second MCS rebuilds keep refreshing `lastHealthyObservedElapsed`, preventing accidental hard escalation.
+- Fixes `stable_transport_verified success=true ports=[]`: socket-based success now requires the final probe itself to remain healthy. A real controlled push delivery remains stronger success evidence.
+- Extends `gmsTransportBootstrap` telemetry with transient-refreeze and hard-reset gate state. Status schema advances to **59**, embedded engine to **r296**, and versionCode to **133**.
+
+> Current mainline candidate: **2.6.1 (versionCode 133)** — embedded engine **r296** — status schema **59**.
+
 ## 2.6.1 v132 / r295 thawed-transport recovery split
 
 2.6.1 stops treating “GMS is physically thawed” and “FCM/MCS is connected again” as the same success condition. The captured OriginOS failure showed both core GMS processes thawed, important and network-unblocked while MCS remained offline and `BAD_AUTHENTICATION` continued. r295 therefore separates freezer/process recovery from thawed transport/auth recovery.

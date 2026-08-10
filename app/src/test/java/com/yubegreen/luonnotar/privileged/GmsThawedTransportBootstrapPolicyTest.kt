@@ -235,4 +235,180 @@ class GmsThawedTransportBootstrapPolicyTest {
         assertFalse(late.refreshLease)
     }
 
+
+    @Test
+    fun sustainedMissingWithStaleMcsAttemptStillGetsBoundedEscalation() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideStart(
+            isVivo = true,
+            vendorEmergencyEnabled = true,
+            nowElapsed = 1_000_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            consecutiveMissing = 50,
+            missingSinceElapsed = 700_000L,
+            mainRunning = true,
+            persistentRunning = true,
+            physicallyFrozen = false,
+            recoveryCampaignActive = false,
+            bootstrapActive = false,
+            backoffUntilElapsed = 0L,
+            lastBadAuthenticationElapsed = 0L,
+            lastMcsConnectAttemptElapsed = 100_000L,
+            lastNetworkTransitionElapsed = 0L,
+            recentFastFreezerEvidence = false
+        )
+        assertTrue(decision.start)
+        assertTrue(decision.allowSoftReset)
+        assertTrue(decision.allowHardReset)
+        assertEquals("thawed_mcs_sustained_missing", decision.reason)
+    }
+
+    @Test
+    fun transientPhysicalRefreezeDoesNotEndBootstrap() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 200_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 500_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = true,
+            physicalFrozenSinceElapsed = 195_000L,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            lastReconnectElapsed = 190_000L,
+            lastLeaseRefreshElapsed = 190_000L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            softResetCount = 0,
+            postSoftResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals(GmsThawedTransportBootstrapPolicy.Phase.FREEZER_SETTLE, decision.phase)
+        assertEquals(null, decision.finishResult)
+        assertFalse(decision.softReset)
+        assertFalse(decision.hardReset)
+    }
+
+    @Test
+    fun continuousPhysicalRefreezeEventuallyHandsBackToFreezerCampaign() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 220_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 500_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = true,
+            physicalFrozenSinceElapsed = 200_000L,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            lastReconnectElapsed = 0L,
+            lastLeaseRefreshElapsed = 0L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            softResetCount = 0,
+            postSoftResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals("refrozen", decision.finishResult)
+        assertEquals("persistent_physical_refreeze", decision.reason)
+    }
+
+    @Test
+    fun longNoHealthyWindowRequestsOneHardResetGate() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 310_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 500_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            lastHealthyObservedElapsed = 0L,
+            lastReconnectElapsed = 300_000L,
+            lastLeaseRefreshElapsed = 300_000L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 0,
+            lastHardResetGateCheckElapsed = 0L,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertTrue(decision.hardReset)
+        assertFalse(decision.sendReconnect)
+        assertFalse(decision.refreshLease)
+    }
+
+    @Test
+    fun recentHealthyEdgePreventsHardResetEscalation() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 310_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 500_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            lastHealthyObservedElapsed = 280_000L,
+            lastReconnectElapsed = 300_000L,
+            lastLeaseRefreshElapsed = 300_000L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 0,
+            lastHardResetGateCheckElapsed = 0L,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertFalse(decision.hardReset)
+    }
+
+    @Test
+    fun finalSocketProbeCanVetoStaleStableResult() {
+        val finish = GmsThawedTransportBootstrapPolicy.decideFinish(
+            requestedResult = "stable_transport_verified",
+            frozen = false,
+            finalTransportObservable = true,
+            finalTransportHealthy = false,
+            deliveryObserved = false
+        )
+        assertFalse(finish.success)
+        assertEquals("final_transport_unhealthy", finish.result)
+    }
+
+    @Test
+    fun controlledDeliveryRemainsStrongerThanFinalSocketRace() {
+        val finish = GmsThawedTransportBootstrapPolicy.decideFinish(
+            requestedResult = "stable_transport_verified",
+            frozen = true,
+            finalTransportObservable = true,
+            finalTransportHealthy = false,
+            deliveryObserved = true
+        )
+        assertTrue(finish.success)
+        assertEquals("delivery_observed", finish.result)
+    }
+
 }

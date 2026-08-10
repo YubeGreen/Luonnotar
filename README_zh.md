@@ -1,5 +1,18 @@
 # 努昂诺塔（Luonnotar）
 
+## 2.6.1 v133 / r296 OriginOS MCS 防抖与有界硬恢复
+
+真机 v132 日志确认 OriginOS `fast_freezer` 会在健康 5228 建链后反复制造亚秒级 `cgroup.freeze=1`，随后 MCS 短暂掉线；绝大多数边缘由现有 `vendor_bridge_mcs_rebuild` 在约 3–8 秒内恢复。r296 不再把这种瞬时冻结误判成 freezer campaign 的终态，同时给真正持续数分钟的 thawed-MCS 死锁补上一档仍受全局 destructive budget 约束的恢复。
+
+- transport bootstrap 对物理回冻增加 **12 秒连续冻结门**：单次/短暂 `fast_freezer` 进入 `freezer_settle`，不再立即 `refrozen` 或被 `recoverGmsLocked()` 抢走所有权；只有连续冻结超过门限才交还 freezer/process campaign。
+- 修复长期 MCS outage 反而因 `lastMcsConnectAttempt` 过旧而拿不到 soft reset 的反向条件；持续缺失分支在 auth 安静时仍可获得一次 `stop-app`。
+- 新增 thawed-transport hard-reset gate：同一 bootstrap 已持续 3 分钟、且至少 60 秒没有任何健康 transport 样本时，才申请一次 `force-stop → unstop → Binder pulse/lease → GCM_RECONNECT`。真正执行前仍复用既有 **10 分钟最小间隔 / 24 小时 6 次**全局 force-stop budget；不会绕过 destructive safety gate。
+- hard reset 后复用既有 post-force-stop shield，避免新 PID 刚起来又被 OriginOS 立即冻结。普通 3–8 秒 MCS rebuild 成功会持续刷新 `lastHealthyObservedElapsed`，因此不会误触 hard reset。
+- 修复 `stable_transport_verified success=true ports=[]`：socket 型成功现在必须由 **final probe 自己仍为 healthy** 才成立；受控 push 实际到达仍保留为更强的成功证据。
+- `gmsTransportBootstrap` 新增 transient-refreeze / hard-reset gate 遥测；状态 schema 升为 **59**。embedded engine 升为 **r296**，versionCode 升为 **133**。
+
+> 当前主线候选：**2.6.1（versionCode 133）**；内置引擎 **r296**；状态 schema **59**。
+
 ## 2.6.1 v132 / r295 OriginOS 解冻后传输恢复分层
 
 2.6.1 不再把“GMS 已经从 freezer 中解冻”和“FCM/MCS 已恢复”当成同一个成功条件。真机故障现场证明 GMS main/persistent 可以同时 `cgroup.freeze=0`、保持高重要性并拥有有效网络，但 MCS 仍持续离线且伴随 `BAD_AUTHENTICATION`。r295 因此把恢复状态机拆成 freezer/process 层与 thawed-transport 层。

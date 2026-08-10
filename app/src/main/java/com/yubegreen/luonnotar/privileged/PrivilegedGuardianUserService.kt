@@ -315,6 +315,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsTransportBootstrapReconnectCount = 0L
     private var gmsTransportBootstrapLeaseRefreshCount = 0L
     private var gmsTransportBootstrapSoftResetCount = 0L
+    private var gmsTransportBootstrapHardResetCount = 0L
+    private var gmsTransportBootstrapHardResetBlockedCount = 0L
+    private var gmsTransportBootstrapTransientRefreezeCount = 0L
     private var gmsTransportBootstrapBackoffUntilElapsed = 0L
     private var gmsTransportBootstrapLastResult = "never"
     private var gmsTransportBootstrapLastCompletedElapsed = 0L
@@ -6170,14 +6173,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 !lastGmsTransportProbe.healthy &&
                 mainRunning && persistentRunning && !physicallyFrozen
             ) {
+                val authRecent = lastGmsBadAuthenticationElapsed > 0L &&
+                    now >= lastGmsBadAuthenticationElapsed &&
+                    now - lastGmsBadAuthenticationElapsed <=
+                        GmsThawedTransportBootstrapPolicy.BAD_AUTH_RECENT_MS
                 GmsThawedTransportBootstrapPolicy.StartDecision(
                     start = true,
                     reason = "freezer_campaign_handoff",
-                    authSuspected = lastGmsBadAuthenticationElapsed > 0L &&
-                        now >= lastGmsBadAuthenticationElapsed &&
-                        now - lastGmsBadAuthenticationElapsed <=
-                            GmsThawedTransportBootstrapPolicy.BAD_AUTH_RECENT_MS,
-                    allowSoftReset = false
+                    authSuspected = authRecent,
+                    // A short freezer handoff still begins non-destructively;
+                    // these flags only make the bounded late tiers eligible if
+                    // the same thawed outage survives for minutes.
+                    allowSoftReset = true,
+                    allowHardReset = true
                 )
             } else {
                 GmsThawedTransportBootstrapPolicy.StartDecision(false, "handoff_preconditions_failed")
@@ -6217,13 +6225,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             initialPids = currentPids,
             baselineBadAuthenticationCount = gmsBadAuthenticationCount,
             authSuspected = decision.authSuspected,
-            allowSoftReset = decision.allowSoftReset
+            allowSoftReset = decision.allowSoftReset,
+            allowHardReset = decision.allowHardReset
         )
         gmsTransportBootstrapStartedCount += 1
         eventLocked(
             "gms_transport_bootstrap_started",
             "generation=$generation trigger=${decision.reason} hint=$triggerHint " +
                 "authSuspected=${decision.authSuspected} allowSoftReset=${decision.allowSoftReset} " +
+                "allowHardReset=${decision.allowHardReset} " +
                 "missingForMs=${(now - gmsTransportMissingSinceElapsed).coerceAtLeast(0L)} " +
                 "missing=$gmsTransportConsecutiveMissing pids=${currentPids.sorted()}"
         )
@@ -6277,7 +6287,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             source = "transport_bootstrap"
         )
 
+        updateGmsTransportBootstrapFreezeStateLocked(
+            bootstrap = bootstrap,
+            physicallyFrozen = physicallyFrozen,
+            nowElapsed = now,
+            source = "tick"
+        )
+
         if (probe.healthy) {
+            bootstrap.lastHealthyObservedElapsed = now
             if (bootstrap.healthySinceElapsed <= 0L || bootstrap.healthySinceElapsed > now) {
                 bootstrap.healthySinceElapsed = now
                 eventLocked(
@@ -6296,9 +6314,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             transportObservable = probe.observable,
             transportHealthy = probe.healthy,
             physicallyFrozen = physicallyFrozen,
+            physicalFrozenSinceElapsed = bootstrap.physicalFrozenSinceElapsed,
             mainRunning = mainRunning,
             persistentRunning = persistentRunning,
             healthySinceElapsed = bootstrap.healthySinceElapsed,
+            lastHealthyObservedElapsed = bootstrap.lastHealthyObservedElapsed,
             lastReconnectElapsed = bootstrap.lastReconnectElapsed,
             lastLeaseRefreshElapsed = bootstrap.lastLeaseRefreshElapsed,
             lastBadAuthenticationElapsed = lastGmsBadAuthenticationElapsed,
@@ -6306,8 +6326,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             currentBadAuthenticationCount = gmsBadAuthenticationCount,
             authSuspected = bootstrap.authSuspected,
             allowSoftReset = bootstrap.allowSoftReset,
+            allowHardReset = bootstrap.allowHardReset,
             softResetCount = bootstrap.softResetCount,
+            hardResetCount = bootstrap.hardResetCount,
+            lastHardResetGateCheckElapsed = bootstrap.lastHardResetGateCheckElapsed,
             postSoftResetUntilElapsed = bootstrap.postSoftResetUntilElapsed,
+            postHardResetUntilElapsed = bootstrap.postHardResetUntilElapsed,
             deliveryObservedElapsed = lastGmsControlledDeliveryElapsed
         )
         if (bootstrap.phase != decision.phase) {
@@ -6353,6 +6377,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         if (decision.softReset) {
             runGmsThawedTransportSoftResetLocked(bootstrap)
         }
+        if (decision.hardReset) {
+            runGmsThawedTransportHardResetLocked(bootstrap)
+        }
         persistStatusLocked()
     }
 
@@ -6370,7 +6397,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     }
 
     private fun runGmsThawedTransportSoftResetLocked(bootstrap: GmsTransportBootstrap) {
-        if (!supportsStopApp || bootstrap.softResetCount > 0) return
+        if (bootstrap.softResetCount > 0) return
+        if (!supportsStopApp) {
+            // Consume the single soft tier so an unavailable stop-app capability
+            // cannot starve the later globally-budgeted hard-reset gate forever.
+            bootstrap.softResetCount = 1
+            bootstrap.commandDetails += "am_stop_app:unsupported"
+            eventLocked(
+                "gms_transport_bootstrap_soft_reset_skipped",
+                "generation=${bootstrap.generation} reason=stop_app_unavailable"
+            )
+            return
+        }
         val oldPids = listGmsProcessesLocked().mapTo(linkedSetOf()) { it.pid }
         val details = mutableListOf<String>()
         val stop = runner.run(
@@ -6413,6 +6451,163 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
     }
 
+    private fun updateGmsTransportBootstrapFreezeStateLocked(
+        bootstrap: GmsTransportBootstrap,
+        physicallyFrozen: Boolean,
+        nowElapsed: Long,
+        source: String
+    ) {
+        if (physicallyFrozen) {
+            if (
+                bootstrap.physicalFrozenSinceElapsed <= 0L ||
+                bootstrap.physicalFrozenSinceElapsed > nowElapsed
+            ) {
+                bootstrap.physicalFrozenSinceElapsed = nowElapsed
+                bootstrap.lastPhysicalFreezeElapsed = nowElapsed
+                bootstrap.transientRefreezeCount += 1
+                gmsTransportBootstrapTransientRefreezeCount += 1
+                eventLocked(
+                    "gms_transport_bootstrap_refreeze_observed",
+                    "generation=${bootstrap.generation} source=$source " +
+                        "count=${bootstrap.transientRefreezeCount} " +
+                        "handoffMs=${GmsThawedTransportBootstrapPolicy.PHYSICAL_REFREEZE_HANDOFF_MS}"
+                )
+            }
+            return
+        }
+
+        val frozenSince = bootstrap.physicalFrozenSinceElapsed
+        if (frozenSince > 0L && frozenSince <= nowElapsed) {
+            eventLocked(
+                "gms_transport_bootstrap_refreeze_cleared",
+                "generation=${bootstrap.generation} source=$source " +
+                    "durationMs=${(nowElapsed - frozenSince).coerceAtLeast(0L)}"
+            )
+        }
+        bootstrap.physicalFrozenSinceElapsed = 0L
+    }
+
+    private fun runGmsThawedTransportHardResetLocked(bootstrap: GmsTransportBootstrap) {
+        if (bootstrap.hardResetCount > 0) return
+        val now = SystemClock.elapsedRealtime()
+        bootstrap.lastHardResetGateCheckElapsed = now
+        val gate = RecoveryCampaignPolicy.decideGmsForceStop(
+            nowElapsed = now,
+            forceStopHistory = gmsForceStopHistory.toList()
+        )
+        if (!gate.allowed) {
+            bootstrap.hardResetBlockedCount += 1
+            bootstrap.hardResetBlockedReason = gate.reason
+            gmsTransportBootstrapHardResetBlockedCount += 1
+            eventLocked(
+                "gms_transport_bootstrap_hard_reset_blocked",
+                "generation=${bootstrap.generation} reason=${gate.reason} " +
+                    "missing=${gmsTransportConsecutiveMissing} " +
+                    "forceStopHistory=${gmsForceStopHistory.size}"
+            )
+            return
+        }
+
+        val oldPids = listGmsProcessesLocked().mapTo(linkedSetOf()) { it.pid }
+        val details = mutableListOf<String>()
+        if (!verifyPackageUnstopBeforeForceStopLocked(GMS_PACKAGE, details)) {
+            bootstrap.hardResetBlockedCount += 1
+            bootstrap.hardResetBlockedReason = "package_unstop_unavailable"
+            gmsTransportBootstrapHardResetBlockedCount += 1
+            bootstrap.commandDetails += details
+            eventLocked(
+                "gms_transport_bootstrap_hard_reset_blocked",
+                "generation=${bootstrap.generation} reason=package_unstop_unavailable"
+            )
+            return
+        }
+
+        bootstrap.hardResetCount += 1
+        bootstrap.hardResetBlockedReason = ""
+        gmsTransportBootstrapHardResetCount += 1
+        gmsForceStopHistory.addLast(now)
+        pruneGmsStateLocked(now)
+        eventLocked(
+            "gms_transport_bootstrap_hard_reset_started",
+            "generation=${bootstrap.generation} oldPids=${oldPids.sorted()} " +
+                "missingAgeMs=${(now - gmsTransportMissingSinceElapsed).coerceAtLeast(0L)}"
+        )
+
+        var remainingOldPids: Set<Int> = oldPids
+        var forceStopAccepted = false
+        for (attempt in 1..GMS_FORCE_STOP_MAX_ATTEMPTS) {
+            val forceResult = runner.run(
+                "am", "force-stop", "--user", "0", GMS_PACKAGE,
+                timeoutMs = GMS_FORCE_STOP_TIMEOUT_MS
+            )
+            actionCount += 1
+            gmsRecoveryForceStopCount += 1
+            details += "am_force_stop#$attempt:${forceResult.summary()}"
+            if (forceResult.success) {
+                forceStopAccepted = true
+            } else {
+                commandFailureCount += 1
+            }
+            remainingOldPids = waitForGmsOldPidsRemovedLocked(
+                oldPids,
+                GMS_STOP_VERIFY_WAIT_MS
+            )
+            if (remainingOldPids.isEmpty()) break
+            SystemClock.sleep(GMS_FORCE_STOP_RETRY_DELAY_MS)
+        }
+
+        SystemClock.sleep(GMS_FORCE_STOP_SETTLE_MS)
+        val unstop = runPackageUnstopWithRetryLocked(GMS_PACKAGE)
+        details += "package_unstop:${unstop.summary()}"
+        if (!unstop.success) {
+            commandFailureCount += 1
+            errorCount += 1
+        }
+
+        val transitionVerified =
+            forceStopAccepted && remainingOldPids.isEmpty() && unstop.success
+        if (
+            transitionVerified &&
+            currentVendorFamilyLocked() == BackgroundPolicyVendorFamily.VIVO
+        ) {
+            armGmsPostForceStopShieldLocked(
+                generation = bootstrap.generation,
+                nowElapsed = SystemClock.elapsedRealtime(),
+                reason = "thawed_transport_escalation"
+            )
+        }
+        if (unstop.success) {
+            SystemClock.sleep(GMS_POST_UNSTOP_SETTLE_MS)
+        }
+
+        val pulse = sendGmsBinderPulseLocked()
+        details += "binder_pulse:${pulse.summary()}"
+        tunePackageLocked(GMS_PACKAGE)
+        wakeGmsDependentsLocked()
+        val lease = sendGmsStabilizationLeaseLocked()
+        bootstrap.leaseRefreshCount += 1
+        gmsTransportBootstrapLeaseRefreshCount += 1
+        details += "stabilization_lease:${lease.summary()}"
+        val reconnect = sendGmsReconnectBroadcastLocked("bootstrap_hard_reset")
+        bootstrap.reconnectCount += 1
+        gmsTransportBootstrapReconnectCount += 1
+        details += "gcm_reconnect:${reconnect.summary()}"
+
+        val completed = SystemClock.elapsedRealtime()
+        bootstrap.postHardResetUntilElapsed =
+            completed + GmsThawedTransportBootstrapPolicy.POST_HARD_RESET_GRACE_MS
+        bootstrap.lastReconnectElapsed = completed
+        bootstrap.lastLeaseRefreshElapsed = completed
+        bootstrap.commandDetails += details
+        eventLocked(
+            "gms_transport_bootstrap_hard_reset_completed",
+            "generation=${bootstrap.generation} transitionVerified=$transitionVerified " +
+                "remainingOldPids=${remainingOldPids.sorted()} " +
+                "postGraceUntil=${bootstrap.postHardResetUntilElapsed} " +
+                "commands=${details.joinToString(" | ")}"
+        )
+    }
+
     private fun finishGmsThawedTransportBootstrapLocked(generation: Long, requestedResult: String) {
         val bootstrap = gmsTransportBootstrap ?: return
         if (bootstrap.generation != generation) return
@@ -6430,16 +6625,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         )
         val deliveryObserved = lastGmsControlledDeliveryElapsed >= bootstrap.startedElapsed &&
             lastGmsControlledDeliveryElapsed <= now
-        val success = !frozen && (
-            requestedResult == "stable_transport_verified" ||
-                requestedResult == "delivery_observed" ||
-                deliveryObserved
-            )
-        val finalResult = when {
-            success && deliveryObserved -> "delivery_observed"
-            success -> "stable_transport_verified"
-            else -> requestedResult
-        }
+        val finishDecision = GmsThawedTransportBootstrapPolicy.decideFinish(
+            requestedResult = requestedResult,
+            frozen = frozen,
+            finalTransportObservable = finalProbe.observable,
+            finalTransportHealthy = finalProbe.healthy,
+            deliveryObserved = deliveryObserved
+        )
+        val success = finishDecision.success
+        val finalResult = finishDecision.result
         gmsTransportBootstrap = null
         gmsTransportBootstrapLastResult = finalResult
         gmsTransportBootstrapLastCompletedElapsed = now
@@ -6460,10 +6654,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         eventLocked(
             "gms_transport_bootstrap_finished",
-            "generation=$generation result=$finalResult success=$success frozen=$frozen " +
+            "generation=$generation requested=$requestedResult result=$finalResult success=$success frozen=$frozen " +
                 "ports=${finalProbe.establishedPorts.sorted()} deliveryObserved=$deliveryObserved " +
                 "reconnects=${bootstrap.reconnectCount} leases=${bootstrap.leaseRefreshCount} " +
-                "softResets=${bootstrap.softResetCount} backoffMs=$backoffMs"
+                "softResets=${bootstrap.softResetCount} hardResets=${bootstrap.hardResetCount} " +
+                "backoffMs=$backoffMs"
         )
         ensureGmsVerifiedOutageDeadlineRecheckLocked(now)
         persistStatusLocked(force = true)
@@ -6549,17 +6744,51 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             return statusJsonLocked()
         }
         if (gmsTransportBootstrap != null) {
-            val bootstrapFrozen = listGmsProcessesLocked().any {
+            val bootstrap = gmsTransportBootstrap!!
+            val bootstrapProcesses = listGmsProcessesLocked()
+            val bootstrapFrozen = bootstrapProcesses.any {
                 readFreezeState(it.pid).frozen == true
             }
-            if (manual || bootstrapFrozen) {
-                cancelGmsThawedTransportBootstrapLocked(
-                    if (manual) "manual_recovery" else "physical_refreeze"
+            if (manual) {
+                cancelGmsThawedTransportBootstrapLocked("manual_recovery")
+            } else if (bootstrapFrozen) {
+                updateGmsTransportBootstrapFreezeStateLocked(
+                    bootstrap = bootstrap,
+                    physicallyFrozen = true,
+                    nowElapsed = now,
+                    source = "recovery_arbitration"
                 )
+                val frozenFor = if (
+                    bootstrap.physicalFrozenSinceElapsed > 0L &&
+                    bootstrap.physicalFrozenSinceElapsed <= now
+                ) {
+                    now - bootstrap.physicalFrozenSinceElapsed
+                } else {
+                    0L
+                }
+                if (
+                    frozenFor >=
+                    GmsThawedTransportBootstrapPolicy.PHYSICAL_REFREEZE_HANDOFF_MS
+                ) {
+                    cancelGmsThawedTransportBootstrapLocked("persistent_physical_refreeze")
+                } else {
+                    eventLocked(
+                        "gms_recovery_suppressed_transport_bootstrap_transient_refreeze",
+                        "source=$trigger generation=${bootstrap.generation} frozenForMs=$frozenFor " +
+                            "handoffMs=${GmsThawedTransportBootstrapPolicy.PHYSICAL_REFREEZE_HANDOFF_MS}"
+                    )
+                    return statusJsonLocked()
+                }
             } else {
+                updateGmsTransportBootstrapFreezeStateLocked(
+                    bootstrap = bootstrap,
+                    physicallyFrozen = false,
+                    nowElapsed = now,
+                    source = "recovery_arbitration"
+                )
                 eventLocked(
                     "gms_recovery_suppressed_transport_bootstrap_active",
-                    "source=$trigger generation=${gmsTransportBootstrap?.generation ?: 0L}"
+                    "source=$trigger generation=${bootstrap.generation}"
                 )
                 return statusJsonLocked()
             }
@@ -8765,6 +8994,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("reconnectCount", gmsTransportBootstrapReconnectCount)
             .put("leaseRefreshCount", gmsTransportBootstrapLeaseRefreshCount)
             .put("softResetCount", gmsTransportBootstrapSoftResetCount)
+            .put("hardResetCount", gmsTransportBootstrapHardResetCount)
+            .put("hardResetBlockedCount", gmsTransportBootstrapHardResetBlockedCount)
+            .put("transientRefreezeCount", gmsTransportBootstrapTransientRefreezeCount)
             .put("backoffUntilElapsed", gmsTransportBootstrapBackoffUntilElapsed)
             .put("lastResult", gmsTransportBootstrapLastResult)
             .put("lastCompletedElapsed", gmsTransportBootstrapLastCompletedElapsed)
@@ -9083,15 +9315,25 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val baselineBadAuthenticationCount: Long,
         val authSuspected: Boolean,
         val allowSoftReset: Boolean,
+        val allowHardReset: Boolean,
         var phase: GmsThawedTransportBootstrapPolicy.Phase =
             GmsThawedTransportBootstrapPolicy.Phase.RECONNECT,
         var healthySinceElapsed: Long = 0L,
+        var lastHealthyObservedElapsed: Long = 0L,
+        var physicalFrozenSinceElapsed: Long = 0L,
+        var lastPhysicalFreezeElapsed: Long = 0L,
+        var transientRefreezeCount: Int = 0,
         var lastReconnectElapsed: Long = 0L,
         var lastLeaseRefreshElapsed: Long = 0L,
         var reconnectCount: Int = 0,
         var leaseRefreshCount: Int = 0,
         var softResetCount: Int = 0,
+        var hardResetCount: Int = 0,
+        var hardResetBlockedCount: Int = 0,
+        var lastHardResetGateCheckElapsed: Long = 0L,
+        var hardResetBlockedReason: String = "",
         var postSoftResetUntilElapsed: Long = 0L,
+        var postHardResetUntilElapsed: Long = 0L,
         val commandDetails: MutableList<String> = mutableListOf()
     ) {
         fun toJson(): JSONObject = JSONObject()
@@ -9103,14 +9345,24 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("baselineBadAuthenticationCount", baselineBadAuthenticationCount)
             .put("authSuspected", authSuspected)
             .put("allowSoftReset", allowSoftReset)
+            .put("allowHardReset", allowHardReset)
             .put("phase", phase.wireName)
             .put("healthySinceElapsed", healthySinceElapsed)
+            .put("lastHealthyObservedElapsed", lastHealthyObservedElapsed)
+            .put("physicalFrozenSinceElapsed", physicalFrozenSinceElapsed)
+            .put("lastPhysicalFreezeElapsed", lastPhysicalFreezeElapsed)
+            .put("transientRefreezeCount", transientRefreezeCount)
             .put("lastReconnectElapsed", lastReconnectElapsed)
             .put("lastLeaseRefreshElapsed", lastLeaseRefreshElapsed)
             .put("reconnectCount", reconnectCount)
             .put("leaseRefreshCount", leaseRefreshCount)
             .put("softResetCount", softResetCount)
+            .put("hardResetCount", hardResetCount)
+            .put("hardResetBlockedCount", hardResetBlockedCount)
+            .put("lastHardResetGateCheckElapsed", lastHardResetGateCheckElapsed)
+            .put("hardResetBlockedReason", hardResetBlockedReason)
             .put("postSoftResetUntilElapsed", postSoftResetUntilElapsed)
+            .put("postHardResetUntilElapsed", postHardResetUntilElapsed)
             .put("commands", JSONArray(commandDetails))
     }
 
@@ -9308,7 +9560,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 58
+        private const val STATUS_SCHEMA = 59
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"

@@ -29,8 +29,8 @@ class EmbeddedGuardianProtocolTest {
         assertFalse(JSONObject(EmbeddedGuardianProtocol.failure("bad")).getBoolean("ok"))
     }
 
-    @Test fun engineRevisionMatches261ReleaseR295() {
-        assertEquals(295, EmbeddedGuardianProtocol.ENGINE_REVISION)
+    @Test fun engineRevisionMatches261ReleaseR296() {
+        assertEquals(296, EmbeddedGuardianProtocol.ENGINE_REVISION)
         assertEquals(260, EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION)
         assertEquals("handoff", EmbeddedGuardianProtocol.OP_HANDOFF)
         assertEquals("handoff_prepare", EmbeddedGuardianProtocol.OP_HANDOFF_PREPARE)
