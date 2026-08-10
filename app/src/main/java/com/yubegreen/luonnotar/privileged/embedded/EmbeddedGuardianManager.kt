@@ -673,7 +673,14 @@ object EmbeddedGuardianManager {
         if (status.optString("handoffState") != "running") return false
         val installedVersion = status.optInt("versionCode", -1)
         val currentVersion = runCatching {
-            app.packageManager.getPackageInfo(app.packageName, 0).longVersionCode.toInt()
+            val packageInfo =
+                app.packageManager.getPackageInfo(app.packageName, 0)
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.P) {
+                packageInfo.longVersionCode.toInt()
+            } else {
+                @Suppress("DEPRECATION")
+                packageInfo.versionCode
+            }
         }.getOrDefault(-1)
         // Match the just-installed package version so an ancient stale journal
         // cannot suppress an unrelated external package replacement.
