@@ -9080,17 +9080,32 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         }
 
+        val postAllowRebindRequested =
+            allow.success && requestNotificationListenerOrdinaryRebindLocked()
         runCatching { Thread.sleep(NOTIFICATION_LISTENER_POST_ALLOW_VERIFY_MS) }
-        val after = readNotificationListenerDiagnosticLocked()
-        val recovered = allow.success && after?.healthy() == true
+
+        var after = readNotificationListenerDiagnosticLocked()
+        var recovered = allow.success && after?.healthy() == true
+        var postAllowRebindRetryRequested = false
+
+        if (!recovered && allow.success) {
+            postAllowRebindRetryRequested =
+                requestNotificationListenerOrdinaryRebindLocked()
+            runCatching { Thread.sleep(NOTIFICATION_LISTENER_POST_ALLOW_VERIFY_MS) }
+            after = readNotificationListenerDiagnosticLocked()
+            recovered = after?.healthy() == true
+        }
+
         notificationListenerShellGuardianLastResult =
             if (recovered) "strong_recovery_succeeded" else "strong_recovery_failed"
 
         eventLocked(
             "notification_listener_shell_guardian_strong_recovery_finished",
             "success=$recovered disallowOk=${disallow.success} allowOk=${allow.success} " +
-                "allowAttempts=$allowAttempts persisted=${after?.persistedConnected} " +
-                "runtime=${after?.runtimeConnected} heartbeatAgeMs=${after?.heartbeatAgeMs}"
+                "allowAttempts=$allowAttempts postAllowRebind=$postAllowRebindRequested " +
+                "postAllowRebindRetry=$postAllowRebindRetryRequested " +
+                "persisted=${after?.persistedConnected} runtime=${after?.runtimeConnected} " +
+                "heartbeatAgeMs=${after?.heartbeatAgeMs}"
         )
 
         if (recovered) {
