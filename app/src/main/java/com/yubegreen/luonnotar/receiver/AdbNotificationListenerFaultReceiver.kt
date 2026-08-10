@@ -42,7 +42,7 @@ class AdbNotificationListenerFaultReceiver : BroadcastReceiver() {
 
             ACTION_TEST_STICKY_UNBIND -> {
                 val requestedDurationMs =
-                    intent.getLongExtra(EXTRA_DURATION_MS, 0L)
+                    intent?.getLongExtra(EXTRA_DURATION_MS, 0L) ?: 0L
                 val durationMs =
                     NotificationListenerFaultInjectionPolicy.boundedDurationMs(
                         requestedDurationMs

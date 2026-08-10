@@ -185,7 +185,6 @@ class ArrivalNotificationListener : NotificationListenerService() {
             rebindHandler.removeCallbacks(heartbeatRunnable)
             rebindRequestWatchdog?.let(rebindHandler::removeCallbacks)
             rebindRequestWatchdog = null
-            GmsBinderAnchorCoordinator.onNotificationListenerDisconnected()
             GuardianStatusClient.setNotificationListenerState(
                 this,
                 connected = false,
