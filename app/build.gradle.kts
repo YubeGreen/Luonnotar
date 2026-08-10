@@ -33,6 +33,7 @@ android {
         versionName = "2.6.1"
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         buildConfigField("String", "DEVELOPER_NAME", "\"YubeGreen\"")
+        buildConfigField("int", "LUONNOTAR_REVISION", "130")
     }
 
     signingConfigs {
