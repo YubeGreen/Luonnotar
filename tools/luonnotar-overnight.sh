@@ -515,9 +515,10 @@ from pathlib import Path
 log_path,send_path,out_path=map(Path,sys.argv[1:4])
 device,start_local,end_local=sys.argv[4:7]
 screen_path=Path(sys.argv[7]); guardian_path=Path(sys.argv[8]); batterystats_screen_path=Path(sys.argv[9])
+logcat_available=log_path.exists() and log_path.stat().st_size > 0
 field_re=re.compile(r'([A-Za-z][A-Za-z0-9_]*)=([^,}]+)')
 deliveries={}
-for line in log_path.read_text(encoding='utf-8',errors='replace').splitlines() if log_path.exists() else []:
+for line in log_path.read_text(encoding='utf-8',errors='replace').splitlines() if logcat_available else []:
     if 'push_test_arrival_observed' not in line:
         continue
     fields={k:v.strip() for k,v in field_re.findall(line)}
@@ -579,17 +580,20 @@ recovery_hits=sum(guardian.count(x) for x in ['gms_recovery_','gms_verified_outa
 lines=[
 '===== LUONNOTAR OVERNIGHT DELIVERY SUMMARY =====',
 f'Device: {device}',f'Started: {start_local}',f'Planned end: {end_local}','',
-f'SEND_RESULT records in window: {len(sends)}',f'Arrival evidence: {len(deliveries)}',f'Sender/arrival matched sequences: {len(matched)}',f'Missing arrival evidence: {len(missing)}',
+f'SEND_RESULT records in window: {len(sends)}',
+f'Arrival evidence: {len(deliveries) if logcat_available else "unavailable (final Logcat empty)"}',
+f'Sender/arrival matched sequences: {len(matched) if logcat_available else "not evaluated"}',
+f'Missing arrival evidence: {len(missing) if logcat_available else "not evaluated"}',
 f'Median delay: {fmt_ms(percentile(delays,.50))}',f'P95 delay: {fmt_ms(percentile(delays,.95))}',f'Maximum delay: {fmt_ms(max(delays) if delays else None)}',f'Delays >10s: {sum(x>=10000 for x in delays)}',f'Delays >60s: {sum(x>=60000 for x in delays)}',f'Delays >10min: {sum(x>=600000 for x in delays)}','',
 f'Screen/wake-related logcat lines captured: {len(screen_lines)}',f'Screen/wake-related batterystats lines captured: {len(batterystats_screen_lines)}',f'Guardian GMS/MCS/recovery marker hits: {recovery_hits}',
 ]
-if missing:
+if logcat_available and missing:
     lines += ['', 'Missing sequences:', ' '.join(map(str,missing[:200])) + (' ...' if len(missing)>200 else '')]
 if deliveries:
     lines += ['', 'Longest deliveries:']
     for item in sorted(deliveries.values(),key=lambda x:x['delay'],reverse=True)[:30]:
         lines.append(f"#{item['seq']}  {fmt_ms(item['delay']):>10}  sent={fmt_epoch(item['sender'])}  seen={fmt_epoch(item['seen'])}")
-lines += ['', 'Interpretation:', '- Delay uses Luonnotar push_test_arrival_observed sender/seen timestamps.', '- Missing means no arrival evidence in the captured log window; log rotation remains a possible cause.', '- Screen/wake lines are evidence only; absence of a line is not proof that the display never woke.', '- Both logcat and batterystats history are retained because OEM logging coverage differs.', '- The observation window intentionally used no periodic device polling or active GMS recovery.', '']
+lines += ['', 'Interpretation:', '- Delay uses Luonnotar push_test_arrival_observed sender/seen timestamps.', '- Missing is evaluated only when final Logcat evidence is non-empty; log rotation remains a possible cause.', '- Screen/wake lines are evidence only; absence of a line is not proof that the display never woke.', '- Both logcat and batterystats history are retained because OEM logging coverage differs.', '- The observation window intentionally used no periodic device polling or active GMS recovery.', '']
 out_path.write_text('\n'.join(lines),encoding='utf-8')
 PY
 }
@@ -611,18 +615,48 @@ finalize() {
 
   save_shell_end "$ROOT/20-power-end.txt" "dumpsys power"
 
-  # Prefer ADB's logcat command because -T parsing is host-side and reliable. Fall back to
-  # a complete dump or the shell rescue channel if needed.
+  # Timestamp filtering may legally return exit=0 with an empty file on some
+  # host/device combinations. Empty is not evidence. Retry the complete ring and
+  # finally the device-side logcat command before allowing analysis to continue.
+  LOGCAT_FINAL="$ROOT/21-logcat-ring-final.txt"
+  LOGCAT_ERR="$ROOT/21-logcat-ring-final.err"
+  LOGCAT_META="$ROOT/21-logcat-ring-final.meta"
+  : >"$LOGCAT_ERR"
+  : >"$LOGCAT_FINAL"
+  LOGCAT_CAPTURE_MODE="none"
   if adb_ready; then
     if [[ -n "$DEVICE_LOGCAT_START" ]]; then
-      adb -s "$SERIAL" logcat -d -v threadtime -T "$DEVICE_LOGCAT_START" >"$ROOT/21-logcat-ring-final.txt" 2>"$ROOT/21-logcat-ring-final.err" || \
-        adb -s "$SERIAL" logcat -d -v threadtime >"$ROOT/21-logcat-ring-final.txt" 2>"$ROOT/21-logcat-ring-final.err" || true
-    else
-      adb -s "$SERIAL" logcat -d -v threadtime >"$ROOT/21-logcat-ring-final.txt" 2>"$ROOT/21-logcat-ring-final.err" || true
+      adb -s "$SERIAL" logcat -d -v threadtime -T "$DEVICE_LOGCAT_START" \
+        >"$LOGCAT_FINAL" 2>>"$LOGCAT_ERR" || true
+      [[ -s "$LOGCAT_FINAL" ]] && LOGCAT_CAPTURE_MODE="adb_timestamped"
+    fi
+    if [[ ! -s "$LOGCAT_FINAL" ]]; then
+      log "WARNING: timestamped final logcat was empty; retrying complete ADB ring dump."
+      adb -s "$SERIAL" logcat -d -v threadtime \
+        >"$LOGCAT_FINAL" 2>>"$LOGCAT_ERR" || true
+      [[ -s "$LOGCAT_FINAL" ]] && LOGCAT_CAPTURE_MODE="adb_full_ring"
+    fi
+    if [[ ! -s "$LOGCAT_FINAL" ]]; then
+      log "WARNING: host ADB logcat was still empty; retrying device-side shell logcat."
+      adb -s "$SERIAL" shell 'logcat -d -v threadtime' \
+        >"$LOGCAT_FINAL" 2>>"$LOGCAT_ERR" || true
+      [[ -s "$LOGCAT_FINAL" ]] && LOGCAT_CAPTURE_MODE="adb_shell_full_ring"
     fi
   else
-    save_shell_end "$ROOT/21-logcat-ring-final.txt" "logcat -d -v threadtime"
+    save_shell_end "$LOGCAT_FINAL" "logcat -d -v threadtime"
+    if [[ -s "$LOGCAT_FINAL" ]] && ! grep -F 'ERROR: no read-only shell transport available' "$LOGCAT_FINAL" >/dev/null 2>&1; then
+      LOGCAT_CAPTURE_MODE="read_only_shell_fallback"
+    fi
   fi
+  if [[ ! -s "$LOGCAT_FINAL" ]]; then
+    LOGCAT_CAPTURE_MODE="unavailable"
+    log "ERROR: final Logcat capture is empty; delivery missing-count analysis will be marked unavailable."
+  fi
+  {
+    echo "mode=$LOGCAT_CAPTURE_MODE"
+    echo "bytes=$(wc -c <"$LOGCAT_FINAL" | tr -d ' ')"
+    echo "startMarker=${DEVICE_LOGCAT_START:-unknown}"
+  } >"$LOGCAT_META"
 
   save_shell_end "$ROOT/22-guardian-events-final.log" "cat /data/local/tmp/luonnotar-guardian-events.log 2>/dev/null || true"
   save_shell_end "$ROOT/23-guardian-status-end.json" "cat /data/local/tmp/luonnotar-guardian-status.json 2>/dev/null || true"

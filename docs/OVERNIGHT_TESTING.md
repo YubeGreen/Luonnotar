@@ -140,3 +140,8 @@ luoovn --iq -1600 --send-events /path/to/send-events.csv
 
 The source CSV is never tailed or held open by `luoovn`; this avoids the file
 locking/synchronization problems seen in older long-lived watcher workflows.
+
+
+## Final Logcat fallback
+
+The final capture treats a zero-byte Logcat dump as **unavailable evidence**, not as proof that every send was missing. If timestamped `adb logcat -T` returns an empty file, `luoovn` retries the complete ADB ring and then device-side `shell logcat`. The selected capture path and byte count are written to `21-logcat-ring-final.meta`. If all paths remain empty, `90-delay-summary.txt` reports arrival/missing evidence as unavailable instead of turning every `SEND_RESULT` into a false missing record.
