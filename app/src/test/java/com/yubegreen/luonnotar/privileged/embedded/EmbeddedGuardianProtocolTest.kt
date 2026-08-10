@@ -30,7 +30,7 @@ class EmbeddedGuardianProtocolTest {
     }
 
     @Test fun engineRevisionMatches261ReleaseR297() {
-        assertEquals(300, EmbeddedGuardianProtocol.ENGINE_REVISION)
+        assertEquals(301, EmbeddedGuardianProtocol.ENGINE_REVISION)
         assertEquals(260, EmbeddedGuardianProtocol.MIN_HANDOFF_ENGINE_REVISION)
         assertEquals("handoff", EmbeddedGuardianProtocol.OP_HANDOFF)
         assertEquals("handoff_prepare", EmbeddedGuardianProtocol.OP_HANDOFF_PREPARE)

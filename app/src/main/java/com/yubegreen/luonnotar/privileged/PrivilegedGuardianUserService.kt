@@ -329,6 +329,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var notificationListenerShellGuardianLastStrongRecoveryElapsed = 0L
     private var notificationListenerShellGuardianStrongRecoveryCount = 0L
     private var notificationListenerShellGuardianLastResult = "never"
+    private var notificationListenerShellGuardianTestStickyFaultActive = false
     private var gmsTransportIncidentGeneration = 0L
     private var gmsTransportIncidentStartedCount = 0L
     private var gmsTransportIncidentRecoveredCount = 0L
@@ -8943,20 +8944,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
             notificationListenerShellGuardianUnhealthySinceElapsed = 0L
             notificationListenerShellGuardianLastNormalRebindElapsed = 0L
+            notificationListenerShellGuardianTestStickyFaultActive = false
             notificationListenerShellGuardianLastResult = "healthy"
             return
         }
 
         if (!snapshot.privacyAcknowledged) {
             notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianTestStickyFaultActive = false
             notificationListenerShellGuardianLastResult = "privacy_not_acknowledged"
             return
         }
         if (!authorized) {
             notificationListenerShellGuardianUnhealthySinceElapsed = 0L
+            notificationListenerShellGuardianTestStickyFaultActive = false
             notificationListenerShellGuardianLastResult = "system_access_not_authorized"
             return
         }
+
+        val testStickyFaultActive =
+            notificationListenerStickyFaultActiveLocked()
+        notificationListenerShellGuardianTestStickyFaultActive =
+            testStickyFaultActive
 
         val episodeWasNew =
             notificationListenerShellGuardianUnhealthySinceElapsed <= 0L
@@ -8990,12 +8999,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             NotificationListenerShellGuardianPolicy.Action.ORDINARY_REBIND
         ) {
             notificationListenerShellGuardianLastNormalRebindElapsed = now
+            if (testStickyFaultActive) {
+                notificationListenerShellGuardianLastResult =
+                    "ordinary_rebind_suppressed_test_sticky"
+                eventLocked(
+                    "notification_listener_shell_guardian_rebind_requested",
+                    "requested=false testSticky=true heartbeatAgeMs=${snapshot.heartbeatAgeMs} " +
+                        "persistedConnected=${snapshot.persistedConnected}"
+                )
+                return
+            }
             val requested = requestNotificationListenerOrdinaryRebindLocked()
             notificationListenerShellGuardianLastResult =
                 if (requested) "ordinary_rebind_requested" else "ordinary_rebind_failed"
             eventLocked(
                 "notification_listener_shell_guardian_rebind_requested",
-                "requested=$requested heartbeatAgeMs=${snapshot.heartbeatAgeMs} " +
+                "requested=$requested testSticky=false heartbeatAgeMs=${snapshot.heartbeatAgeMs} " +
                     "persistedConnected=${snapshot.persistedConnected}"
             )
             return
@@ -9010,12 +9029,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val unhealthyFor =
             (now - notificationListenerShellGuardianUnhealthySinceElapsed).coerceAtLeast(0L)
+        val testStickyFaultReleased =
+            if (testStickyFaultActive) {
+                releaseNotificationListenerStickyFaultLocked()
+            } else {
+                false
+            }
+        if (testStickyFaultActive && testStickyFaultReleased) {
+            notificationListenerShellGuardianTestStickyFaultActive = false
+        }
         notificationListenerShellGuardianLastStrongRecoveryElapsed = now
         notificationListenerShellGuardianStrongRecoveryCount += 1L
         eventLocked(
             "notification_listener_shell_guardian_strong_recovery_started",
             "unhealthyForMs=$unhealthyFor " +
-                "count=$notificationListenerShellGuardianStrongRecoveryCount"
+                "count=$notificationListenerShellGuardianStrongRecoveryCount " +
+                "testSticky=$testStickyFaultActive testStickyReleased=$testStickyFaultReleased"
         )
 
         val disallow = runner.run(
@@ -9106,6 +9135,49 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             runtimeConnected = fields["listenerRuntimeConnected"] == "true",
             heartbeatAgeMs = fields["heartbeatAgeMs"]?.toLongOrNull() ?: -1L
         )
+    }
+
+    private fun notificationListenerStickyFaultActiveLocked(): Boolean {
+        val result = runner.run(
+            "am",
+            "broadcast",
+            "--include-stopped-packages",
+            "--receiver-foreground",
+            "-n",
+            NOTIFICATION_LISTENER_FAULT_RECEIVER,
+            "-a",
+            NOTIFICATION_LISTENER_FAULT_STATUS_ACTION,
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        if (!result.success) return false
+        val payload = Regex("data=\\\"([^\\\"]*)\\\"")
+            .find(result.stdout)
+            ?.groupValues
+            ?.getOrNull(1)
+            .orEmpty()
+        return payload.split(';').any { it == "stickyActive=true" }
+    }
+
+    private fun releaseNotificationListenerStickyFaultLocked(): Boolean {
+        val result = runner.run(
+            "am",
+            "broadcast",
+            "--include-stopped-packages",
+            "--receiver-foreground",
+            "-n",
+            NOTIFICATION_LISTENER_FAULT_RECEIVER,
+            "-a",
+            NOTIFICATION_LISTENER_FAULT_RELEASE_ACTION,
+            timeoutMs = NOTIFICATION_LISTENER_COMMAND_TIMEOUT_MS
+        )
+        val released =
+            result.success &&
+                result.stdout.contains("stickyReleased=true")
+        eventLocked(
+            "notification_listener_shell_guardian_test_sticky_release",
+            "released=$released"
+        )
+        return released
     }
 
     private fun notificationListenerSystemAuthorizationPresentLocked(): Boolean {
@@ -9939,6 +10011,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastOrdinaryRebindElapsed", notificationListenerShellGuardianLastNormalRebindElapsed)
             .put("lastStrongRecoveryElapsed", notificationListenerShellGuardianLastStrongRecoveryElapsed)
             .put("strongRecoveryCount", notificationListenerShellGuardianStrongRecoveryCount)
+            .put("testStickyFaultActive", notificationListenerShellGuardianTestStickyFaultActive)
             .put("lastResult", notificationListenerShellGuardianLastResult)
         )
         .put("protectionHealth", protectionHealthJsonLocked())
@@ -10388,13 +10461,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 62
+        private const val STATUS_SCHEMA = 63
         private const val GMS_CONTROLLED_DELIVERY_REOPEN_GRACE_MS = 60_000L
 
         private const val NOTIFICATION_LISTENER_COMPONENT =
             "com.yubegreen.luonnotar/com.yubegreen.luonnotar.notification.ArrivalNotificationListener"
         private const val NOTIFICATION_DIAGNOSTIC_RECEIVER =
             "com.yubegreen.luonnotar/.receiver.AdbNotificationDiagnosticsReceiver"
+        private const val NOTIFICATION_LISTENER_FAULT_RECEIVER =
+            "com.yubegreen.luonnotar/.receiver.AdbNotificationListenerFaultReceiver"
+        private const val NOTIFICATION_LISTENER_FAULT_STATUS_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_NOTIFICATION_TEST_STATUS"
+        private const val NOTIFICATION_LISTENER_FAULT_RELEASE_ACTION =
+            "com.yubegreen.luonnotar.action.ADB_NOTIFICATION_TEST_RELEASE"
         private const val NOTIFICATION_STATUS_ACTION =
             "com.yubegreen.luonnotar.action.ADB_NOTIFICATION_STATUS"
         private const val NOTIFICATION_SCAN_ACTIVE_ACTION =

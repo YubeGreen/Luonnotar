@@ -26,6 +26,9 @@ internal object ArrivalNotificationListenerFaultBridge {
     @Volatile
     private var activeInstance: ArrivalNotificationListener? = null
 
+    @Volatile
+    private var stickyFaultUntilElapsed = 0L
+
     fun connected(instance: ArrivalNotificationListener) {
         activeInstance = instance
     }
@@ -34,13 +37,54 @@ internal object ArrivalNotificationListenerFaultBridge {
         if (activeInstance === instance) activeInstance = null
     }
 
-    // Test-only: disconnect runtime listener without revoking notification access.
+    fun stickyFaultActive(
+        nowElapsed: Long = SystemClock.elapsedRealtime()
+    ): Boolean {
+        val active =
+            NotificationListenerFaultInjectionPolicy.isActive(
+                nowElapsed = nowElapsed,
+                untilElapsed = stickyFaultUntilElapsed
+            )
+        if (!active && stickyFaultUntilElapsed > 0L) {
+            stickyFaultUntilElapsed = 0L
+        }
+        return active
+    }
+
+    fun stickyFaultRemainingMs(
+        nowElapsed: Long = SystemClock.elapsedRealtime()
+    ): Long = NotificationListenerFaultInjectionPolicy.remainingMs(
+        nowElapsed = nowElapsed,
+        untilElapsed = stickyFaultUntilElapsed
+    )
+
     fun requestDiagnosticUnbind(): Boolean {
         val instance = activeInstance ?: return false
         return runCatching {
             instance.requestUnbind()
             true
         }.getOrDefault(false)
+    }
+
+    fun requestDiagnosticStickyUnbind(requestedDurationMs: Long): Boolean {
+        val instance = activeInstance ?: return false
+        val now = SystemClock.elapsedRealtime()
+        stickyFaultUntilElapsed =
+            now + NotificationListenerFaultInjectionPolicy.boundedDurationMs(
+                requestedDurationMs
+            )
+        val requested = runCatching {
+            instance.requestUnbind()
+            true
+        }.getOrDefault(false)
+        if (!requested) stickyFaultUntilElapsed = 0L
+        return requested
+    }
+
+    fun releaseStickyFault(): Boolean {
+        val wasActive = stickyFaultActive()
+        stickyFaultUntilElapsed = 0L
+        return wasActive
     }
 }
 
@@ -86,7 +130,8 @@ class ArrivalNotificationListener : NotificationListenerService() {
         if (
             !destroying &&
                 rebindAttempt in 1..MAX_REBIND_FAILURES &&
-                notificationAccessGranted()
+                notificationAccessGranted() &&
+            !ArrivalNotificationListenerFaultBridge.stickyFaultActive()
         ) {
             requestRebind(
                 ComponentName(
@@ -133,6 +178,30 @@ class ArrivalNotificationListener : NotificationListenerService() {
     override fun onListenerConnected() {
         super.onListenerConnected()
         ArrivalNotificationListenerFaultBridge.connected(this)
+        if (ArrivalNotificationListenerFaultBridge.stickyFaultActive()) {
+            listenerConnected = false
+            rebindHandler.removeCallbacks(rebindRunnable)
+            rebindScheduled = false
+            rebindHandler.removeCallbacks(heartbeatRunnable)
+            rebindRequestWatchdog?.let(rebindHandler::removeCallbacks)
+            rebindRequestWatchdog = null
+            GmsBinderAnchorCoordinator.onNotificationListenerDisconnected()
+            GuardianStatusClient.setNotificationListenerState(
+                this,
+                connected = false,
+                pid = 0
+            )
+            LogManager.event(
+                this,
+                "notification_listener_fault_sticky_reunbind",
+                mapOf(
+                    "remainingMs" to
+                        ArrivalNotificationListenerFaultBridge.stickyFaultRemainingMs()
+                )
+            )
+            runCatching { requestUnbind() }
+            return
+        }
         listenerConnected = true
         activeInstance = WeakReference(this)
         rebindHandler.removeCallbacks(rebindRunnable)
@@ -175,9 +244,21 @@ class ArrivalNotificationListener : NotificationListenerService() {
         rebindHandler.removeCallbacks(rebindRunnable)
         rebindScheduled = false
         rebindHandler.removeCallbacks(heartbeatRunnable)
-        if (notificationAccessGranted()) {
+        if (
+            notificationAccessGranted() &&
+            !ArrivalNotificationListenerFaultBridge.stickyFaultActive()
+        ) {
             if (rebindAttempt == 0) rebindAttempt = 1
             scheduleRebind()
+        } else if (ArrivalNotificationListenerFaultBridge.stickyFaultActive()) {
+            LogManager.event(
+                this,
+                "notification_listener_fault_sticky_local_rebind_suppressed",
+                mapOf(
+                    "remainingMs" to
+                        ArrivalNotificationListenerFaultBridge.stickyFaultRemainingMs()
+                )
+            )
         }
         super.onListenerDisconnected()
     }
