@@ -1,5 +1,18 @@
 # Luonnotar
 
+## 2.6.1 v134 / r297 transport incidents + vendor-bridge protocol watchdog
+
+The 16:10–20:00 unattended OriginOS soak exposed a lifecycle bug above the r296 recovery mechanics: an 8-second 5228 window could close one bootstrap generation, allowing later generations in the same real outage to spend another soft reset and another globally-budgeted force-stop. The same soak also caught a split-brain vendor bridge whose heartbeat file remained fresh while its protocol heartbeat was stale for roughly two hours. r297 moves destructive accounting and recovery acceptance to a persistent transport-incident layer.
+
+- Adds a **GMS transport incident** above bootstrap generations. A six-minute bootstrap may expire and be replaced, but the incident keeps one shared destructive ledger across freezer campaigns and thawed-transport bootstraps: at most one actual soft tier and one hard tier for the whole outage. Once hard escalation is consumed, the lower soft tier is closed as well.
+- Reclassifies 8 seconds of continuous 5228 as **socket recovered**, not outage success. The incident closes only after a **120-second recovery probation** with no transport collapse lasting 30 seconds or more, or immediately after a controlled delivery. A long collapse resets probation without resetting the destructive ledger.
+- Tracks hard-reset efficacy. If a verified hard transition fails to produce a socket recovery within the post-reset grace, or a >=30-second collapse invalidates its recovery probation, the incident records the hard reset as ineffective and cannot spend another hard reset in replacement bootstrap generations.
+- Makes the older freezer recovery campaign adopt the same incident before any transport-unhealthy GMS reset, preventing it from bypassing the bootstrap ledger.
+- Adds a **vendor-bridge protocol watchdog**. A fresh shell heartbeat file can no longer mask a stale protocol heartbeat: confirmed protocol stall revokes bridge command ownership, restarts the bridge, and leaves guardian fallback unsuppressed until a new identity-validated `READY` record restores ownership.
+- Extends status telemetry with `gmsTransportIncident` and bridge protocol-stall/restart/ownership fields. Status schema advances to **60**, embedded engine to **r297**, and versionCode to **134**.
+
+> Current mainline candidate: **2.6.1 (versionCode 134)** — embedded engine **r297** — status schema **60**.
+
 ## 2.6.1 v133 / r296 OriginOS MCS refreeze debounce + bounded hard recovery
 
 Live v132 traces confirmed that OriginOS `fast_freezer` repeatedly creates sub-second `cgroup.freeze=1` edges after a healthy 5228 session. Most edges are already repaired by `vendor_bridge_mcs_rebuild` in roughly 3–8 seconds. r296 stops treating those transient samples as terminal freezer ownership, while adding one globally-budgeted hard transition for a genuinely stuck thawed-MCS outage.

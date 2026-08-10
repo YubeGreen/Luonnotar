@@ -1,5 +1,18 @@
 # 努昂诺塔（Luonnotar）
 
+## 2.6.1 v134 / r297 Transport Incident 与 vendor bridge 协议看门狗
+
+16:10–20:00 的 OriginOS 无人值守长测证明，r296 的单次恢复机械已经能工作，但更上层的故障生命周期仍然划错了：5228 连续健康 8 秒就会结束一个 bootstrap generation，随后同一个真实 outage 又能在新 generation 里重新消费 soft reset 与全局 force-stop。同一轮长测还抓到 vendor bridge 的 split-brain：shell heartbeat 文件持续新鲜，但 protocol heartbeat 已停更约两小时。r297 因此把 destructive 额度与“恢复成功”的判定提升到跨 generation 持久的 transport incident 层。
+
+- 在 bootstrap 之上新增 **GMS transport incident**。单个 6 分钟 bootstrap 可以超时并重开，但同一个 outage 的 freezer campaign 与 thawed-transport bootstrap 共用一份 destructive ledger：整个 incident 最多实际执行一次 soft tier 和一次 hard tier；一旦 hard tier 已消费，后续也不会再降级补做 stop-app。
+- 8 秒连续 5228 只改判为 **socket recovered**，不再代表 outage 结束。incident 只有在 **120 秒 recovery probation** 内没有出现持续 30 秒及以上的 transport collapse，或观察到真实 controlled delivery，才正式关闭；长 collapse 只重置 probation，不重置 soft/hard 额度。
+- 增加 hard-reset 疗效遥测：verified hard transition 若在 post-reset grace 内始终没有恢复 socket，或之后 >=30 秒 collapse 击穿 probation，会记录为 ineffective；替换 bootstrap generation 仍不能再领第二次 hard reset。
+- 旧 freezer recovery campaign 在任何 transport-unhealthy 的 GMS reset 前也必须先创建/接管同一个 incident，不能绕过 bootstrap 的 destructive ledger。
+- 新增 **vendor bridge protocol watchdog**：shell heartbeat 文件新鲜不再能掩盖 protocol heartbeat 失联。确认 protocol stall 后立即撤销 bridge command ownership、重启 bridge，并保持 guardian fallback 不受 suppress；只有新的、身份校验通过的 `READY` 才恢复 bridge ownership。
+- 状态新增 `gmsTransportIncident` 以及 bridge protocol-stall/restart/ownership 遥测；status schema 升为 **60**，embedded engine 升为 **r297**，versionCode 升为 **134**。
+
+> 当前主线候选：**2.6.1（versionCode 134）**；内置引擎 **r297**；状态 schema **60**。
+
 ## 2.6.1 v133 / r296 OriginOS MCS 防抖与有界硬恢复
 
 真机 v132 日志确认 OriginOS `fast_freezer` 会在健康 5228 建链后反复制造亚秒级 `cgroup.freeze=1`，随后 MCS 短暂掉线；绝大多数边缘由现有 `vendor_bridge_mcs_rebuild` 在约 3–8 秒内恢复。r296 不再把这种瞬时冻结误判成 freezer campaign 的终态，同时给真正持续数分钟的 thawed-MCS 死锁补上一档仍受全局 destructive budget 约束的恢复。

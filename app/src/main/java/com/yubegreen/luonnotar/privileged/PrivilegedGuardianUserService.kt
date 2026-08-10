@@ -107,6 +107,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var vendorBridgeFailureCount = 0L
     private var vendorBridgeHeartbeatCount = 0L
     private var vendorBridgeLastHeartbeatElapsed = 0L
+    // r297: the file heartbeat is produced by a background shell and can stay
+    // fresh while the protocol/main-loop stdout path is wedged. Track that
+    // split-brain state explicitly and revoke command ownership during restart.
+    private var vendorBridgeProtocolStallCount = 0L
+    private var vendorBridgeProtocolRestartCount = 0L
+    private var vendorBridgeProtocolOwnershipRevoked = false
+    private var vendorBridgeProtocolOwnershipRevokedCount = 0L
+    private var vendorBridgeLastProtocolStallElapsed = 0L
     private var vendorBridgeFrozenCount = 0L
     private var vendorBridgeRecoveryAttemptCount = 0L
     private var vendorBridgePlainRecoveryCount = 0L
@@ -308,6 +316,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private var gmsTransportBootstrap: GmsTransportBootstrap? = null
     private var gmsTransportBootstrapFuture: ScheduledFuture<*>? = null
     private var gmsTransportBootstrapGeneration = 0L
+    // r297: destructive-tier usage and recovery probation belong to the entire
+    // outage incident, not to a six-minute bootstrap generation.
+    private var gmsTransportIncident: GmsTransportIncident? = null
+    private var gmsTransportIncidentGeneration = 0L
+    private var gmsTransportIncidentStartedCount = 0L
+    private var gmsTransportIncidentRecoveredCount = 0L
+    private var gmsTransportIncidentProbationResetCount = 0L
+    private var gmsTransportIncidentHardResetIneffectiveCount = 0L
     private var gmsTransportBootstrapStartedCount = 0L
     private var gmsTransportBootstrapSuccessCount = 0L
     private var gmsTransportBootstrapExhaustedCount = 0L
@@ -1241,9 +1257,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                         VendorFreezeSignalKind.XIAOMI_GREEZER_DENIAL,
                         VendorFreezeSignalKind.UID_FROZEN_WAKELOCK
                     )
-            // Ownership is policy-based. During bridge startup/restart we must
-            // still suppress every fallback unfreeze path; otherwise an event
-            // arriving inside that transition recreates a second command owner.
+            // Normally ownership is policy-based across startup/restart. r297
+            // adds one exception: a verified protocol stall revokes bridge
+            // ownership until a fresh READY record arrives, so the guardian is
+            // not suppressed behind a shell whose file heartbeat alone is alive.
             delegatedToVendorBridge =
                 running && bridgeOwnedFreezeSignal
             delegatedToFastLane =
@@ -1506,6 +1523,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 vendorBridgeLastState = "ready"
                 vendorBridgeLastHeartbeatElapsed = SystemClock.elapsedRealtime()
                 updateVendorBridgeFileHeartbeatLocked(vendorBridgeLastHeartbeatElapsed)
+                if (vendorBridgeProtocolOwnershipRevoked) {
+                    vendorBridgeProtocolOwnershipRevoked = false
+                    eventLocked(
+                        "vendor_bridge_protocol_ownership_restored",
+                        "shellPid=${record.shellPid} strategy=${record.strategy}"
+                    )
+                }
                 eventLocked(
                     "vendor_bridge_ready",
                     "strategy=${record.strategy} sticky=${record.sticky} " +
@@ -2326,6 +2350,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             GmsTransportLogSignalKind.CONTROLLED_DELIVERY -> {
                 lastGmsControlledDeliveryElapsed = now
                 eventLocked("gms_controlled_delivery_observed", "source=notification_listener")
+                val incident = gmsTransportIncident
+                if (
+                    incident != null &&
+                    now >= incident.startedElapsed &&
+                    gmsTransportBootstrap == null
+                ) {
+                    finishGmsTransportIncidentLocked(
+                        incident = incident,
+                        result = "delivery_observed",
+                        nowElapsed = now,
+                        source = "notification_listener"
+                    )
+                }
             }
         }
     }
@@ -4800,7 +4837,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     private fun vendorBridgeOwnerPackageLocked(processName: String): String? {
         val packageName = packageForProcess(processName) ?: processName
         return packageName.takeIf {
-            running && it in vendorBridgeTargetsLocked()
+            running && !vendorBridgeProtocolOwnershipRevoked && it in vendorBridgeTargetsLocked()
         }
     }
 
@@ -4810,7 +4847,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
      * would recreate the exact race this bridge exists to remove.
      */
     private fun vendorBridgeOwnsGmsCommandsLocked(): Boolean =
-        running && GMS_PACKAGE in vendorBridgeTargetsLocked()
+        running &&
+            GMS_PACKAGE in vendorBridgeTargetsLocked() &&
+            !vendorBridgeProtocolOwnershipRevoked
 
     private fun recordVendorBridgeSuppressedUnfreezeLocked(packageName: String, source: String) {
         vendorBridgeSuppressedInternalUnfreezeCount += 1
@@ -5076,7 +5115,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         GMS_PACKAGE in vendorBridgeTargetsLocked()
 
     private fun vendorBridgeOwnsPackageLocked(packageName: String?): Boolean =
-        packageName != null && packageName in vendorBridgeTargetsLocked()
+        packageName != null &&
+            !vendorBridgeProtocolOwnershipRevoked &&
+            packageName in vendorBridgeTargetsLocked()
 
     private fun vendorBridgeFamilyLocked(): BackgroundPolicyVendorFamily {
         vendorBridgeDeviceFamily?.let { return it }
@@ -5218,26 +5259,51 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             val protocolAgeMs = if (vendorBridgeLastHeartbeatElapsed > 0L &&
                 now >= vendorBridgeLastHeartbeatElapsed
             ) now - vendorBridgeLastHeartbeatElapsed else Long.MAX_VALUE
-            val protocolStale = vendorBridgeReady &&
-                protocolAgeMs > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
-            val fileStale = !vendorBridgeHeartbeatFileValid ||
-                vendorBridgeHeartbeatFileAgeMs > VENDOR_BRIDGE_STALE_HEARTBEAT_MS
-            val vendorBridgeHeartbeatStale = protocolStale && fileStale
-            if (!vendorBridgeAlive || vendorBridgeHeartbeatStale) {
-                if (vendorBridgeHeartbeatStale) {
+            val bridgeDecision = VendorBridgeHeartbeatPolicy.decide(
+                alive = vendorBridgeAlive,
+                ready = vendorBridgeReady,
+                protocolAgeMs = protocolAgeMs,
+                fileValid = vendorBridgeHeartbeatFileValid,
+                fileAgeMs = vendorBridgeHeartbeatFileAgeMs,
+                staleMs = VENDOR_BRIDGE_STALE_HEARTBEAT_MS
+            )
+
+            when (bridgeDecision.action) {
+                VendorBridgeHeartbeatPolicy.Action.START -> startVendorBridgeLocked()
+                VendorBridgeHeartbeatPolicy.Action.RESTART_PROTOCOL_STALLED -> {
+                    // The 16:10-20:00 soak proved that the background heartbeat
+                    // file can remain fresh for hours while protocol telemetry is
+                    // dead. Protocol staleness alone is therefore restart-worthy.
+                    vendorBridgeProtocolStallCount += 1
+                    vendorBridgeLastProtocolStallElapsed = now
+                    if (!vendorBridgeProtocolOwnershipRevoked) {
+                        vendorBridgeProtocolOwnershipRevoked = true
+                        vendorBridgeProtocolOwnershipRevokedCount += 1
+                    }
                     eventLocked(
-                        "vendor_bridge_heartbeat_stale",
-                        "protocolAgeMs=$protocolAgeMs fileAgeMs=$vendorBridgeHeartbeatFileAgeMs " +
-                            "fileValid=$vendorBridgeHeartbeatFileValid processAlive=${vendorBridgeProcess?.isAlive == true}"
+                        "vendor_bridge_protocol_stalled",
+                        "reason=${bridgeDecision.reason} protocolAgeMs=$protocolAgeMs " +
+                            "fileAgeMs=$vendorBridgeHeartbeatFileAgeMs " +
+                            "fileValid=$vendorBridgeHeartbeatFileValid " +
+                            "processAlive=${vendorBridgeProcess?.isAlive == true} " +
+                            "ownershipRevoked=true"
                     )
                     stopVendorBridgeLocked()
+                    vendorBridgeProtocolRestartCount += 1
+                    startVendorBridgeLocked()
                 }
-                startVendorBridgeLocked()
-            } else if (protocolStale && vendorBridgeHeartbeatFileValid) {
-                eventLocked(
-                    "vendor_bridge_protocol_heartbeat_delayed",
-                    "protocolAgeMs=$protocolAgeMs fileAgeMs=$vendorBridgeHeartbeatFileAgeMs"
-                )
+                VendorBridgeHeartbeatPolicy.Action.RESTART_FILE_STALE -> {
+                    eventLocked(
+                        "vendor_bridge_heartbeat_stale",
+                        "reason=${bridgeDecision.reason} protocolAgeMs=$protocolAgeMs " +
+                            "fileAgeMs=$vendorBridgeHeartbeatFileAgeMs " +
+                            "fileValid=$vendorBridgeHeartbeatFileValid " +
+                            "processAlive=${vendorBridgeProcess?.isAlive == true}"
+                    )
+                    stopVendorBridgeLocked()
+                    startVendorBridgeLocked()
+                }
+                VendorBridgeHeartbeatPolicy.Action.NONE -> Unit
             }
         } else if (vendorBridgeAlive || vendorBridgeProcess != null) {
             stopVendorBridgeLocked()
@@ -5547,6 +5613,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             }
             gmsTransportConsecutiveMissing += 1
         }
+        updateGmsTransportIncidentFromProbeLocked(
+            probe = probe,
+            nowElapsed = now,
+            source = source
+        )
+
         val changed = previous.observable != probe.observable || previous.healthy != probe.healthy
         if (
             changed || source == "campaign" ||
@@ -6144,6 +6216,271 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         postSuccessProtectionActive = gmsPostSuccessProtectionActiveLocked(nowElapsed)
     )
 
+    private fun ensureGmsTransportIncidentLocked(
+        trigger: String,
+        nowElapsed: Long
+    ): GmsTransportIncident {
+        // Incident ownership is broader than any one bootstrap or freezer
+        // campaign. Merely ensuring the incident must not count a bootstrap
+        // generation; the bootstrap caller records that explicitly.
+        gmsTransportIncident?.let { return it }
+
+        gmsTransportIncidentGeneration += 1
+        val start = gmsTransportMissingSinceElapsed
+            .takeIf { it > 0L && it <= nowElapsed }
+            ?: nowElapsed
+        val incident = GmsTransportIncident(
+            generation = gmsTransportIncidentGeneration,
+            trigger = trigger,
+            startedElapsed = start,
+            lastBootstrapStartedElapsed = 0L,
+            currentOutageSinceElapsed = start,
+            bootstrapGenerationCount = 0
+        )
+        gmsTransportIncident = incident
+        gmsTransportIncidentStartedCount += 1
+        eventLocked(
+            "gms_transport_incident_started",
+            "incident=${incident.generation} trigger=$trigger startedElapsed=$start " +
+                "missingAgeMs=${(nowElapsed - start).coerceAtLeast(0L)}"
+        )
+        return incident
+    }
+
+    private fun updateGmsTransportIncidentFromProbeLocked(
+        probe: GmsTransportProbe,
+        nowElapsed: Long,
+        source: String
+    ) {
+        val incident = gmsTransportIncident ?: return
+
+        if (!probe.observable) {
+            incident.socketHealthySinceElapsed = 0L
+            if (incident.currentOutageSinceElapsed <= 0L) {
+                incident.currentOutageSinceElapsed = nowElapsed
+            }
+            maybeInvalidateGmsTransportIncidentProbationLocked(
+                incident = incident,
+                nowElapsed = nowElapsed,
+                source = "$source:unobservable"
+            )
+            return
+        }
+
+        if (!probe.healthy) {
+            incident.socketHealthySinceElapsed = 0L
+            if (incident.currentOutageSinceElapsed <= 0L ||
+                incident.currentOutageSinceElapsed > nowElapsed
+            ) {
+                incident.currentOutageSinceElapsed = nowElapsed
+                if (incident.recoveryProbationStartedElapsed > 0L) {
+                    incident.collapseCount += 1
+                    eventLocked(
+                        "gms_transport_incident_probation_collapse",
+                        "incident=${incident.generation} source=$source " +
+                            "collapse=${incident.collapseCount} probationStarted=" +
+                            incident.recoveryProbationStartedElapsed
+                    )
+                }
+            }
+            maybeInvalidateGmsTransportIncidentProbationLocked(
+                incident = incident,
+                nowElapsed = nowElapsed,
+                source = source
+            )
+            return
+        }
+
+        val outageSince = incident.currentOutageSinceElapsed
+        if (outageSince > 0L && outageSince <= nowElapsed) {
+            val outageMs = (nowElapsed - outageSince).coerceAtLeast(0L)
+            incident.maxObservedOutageMs = maxOf(incident.maxObservedOutageMs, outageMs)
+            if (
+                incident.recoveryProbationStartedElapsed > 0L &&
+                outageMs >= GmsThawedTransportBootstrapPolicy.INCIDENT_MAX_TRANSIENT_COLLAPSE_MS
+            ) {
+                resetGmsTransportIncidentProbationLocked(
+                    incident = incident,
+                    nowElapsed = nowElapsed,
+                    source = "$source:recovered_after_long_collapse",
+                    collapseMs = outageMs
+                )
+            }
+        }
+        incident.currentOutageSinceElapsed = 0L
+        incident.lastHealthyObservedElapsed = nowElapsed
+
+        if (
+            incident.socketHealthySinceElapsed <= 0L ||
+            incident.socketHealthySinceElapsed > nowElapsed
+        ) {
+            incident.socketHealthySinceElapsed = nowElapsed
+        }
+        val socketStableFor =
+            (nowElapsed - incident.socketHealthySinceElapsed).coerceAtLeast(0L)
+        if (socketStableFor < GmsThawedTransportBootstrapPolicy.SOCKET_RECOVERED_STABLE_MS) {
+            return
+        }
+
+        if (incident.lastSocketRecoveredElapsed <= 0L) {
+            incident.lastSocketRecoveredElapsed = nowElapsed
+            eventLocked(
+                "gms_transport_incident_socket_recovered",
+                "incident=${incident.generation} source=$source stableForMs=$socketStableFor"
+            )
+        } else {
+            incident.lastSocketRecoveredElapsed = nowElapsed
+        }
+
+        if (
+            incident.hardResetUsed &&
+            incident.hardResetElapsed > 0L &&
+            incident.hardResetRecoveryObservedElapsed <= 0L
+        ) {
+            incident.hardResetRecoveryObservedElapsed = nowElapsed
+            eventLocked(
+                "gms_transport_incident_hard_reset_recovery_observed",
+                "incident=${incident.generation} hardResetElapsed=${incident.hardResetElapsed} " +
+                    "latencyMs=${(nowElapsed - incident.hardResetElapsed).coerceAtLeast(0L)}"
+            )
+        }
+
+        if (incident.recoveryProbationStartedElapsed <= 0L) {
+            incident.recoveryProbationStartedElapsed = nowElapsed
+            eventLocked(
+                "gms_transport_incident_probation_started",
+                "incident=${incident.generation} source=$source " +
+                    "probationMs=${GmsThawedTransportBootstrapPolicy.INCIDENT_RECOVERY_PROBATION_MS}"
+            )
+            return
+        }
+
+        if (
+            nowElapsed - incident.recoveryProbationStartedElapsed >=
+                GmsThawedTransportBootstrapPolicy.INCIDENT_RECOVERY_PROBATION_MS &&
+            gmsTransportBootstrap == null
+        ) {
+            finishGmsTransportIncidentLocked(
+                incident = incident,
+                result = "incident_recovered",
+                nowElapsed = nowElapsed,
+                source = "$source:scheduled_probe"
+            )
+        }
+    }
+
+    private fun maybeInvalidateGmsTransportIncidentProbationLocked(
+        incident: GmsTransportIncident,
+        nowElapsed: Long,
+        source: String
+    ) {
+        if (
+            incident.hardResetUsed &&
+            !incident.hardResetIneffective &&
+            incident.hardResetElapsed > 0L &&
+            incident.hardResetRecoveryObservedElapsed <= 0L &&
+            nowElapsed - incident.hardResetElapsed >=
+                GmsThawedTransportBootstrapPolicy.POST_HARD_RESET_GRACE_MS
+        ) {
+            markGmsTransportIncidentHardResetIneffectiveLocked(
+                incident = incident,
+                source = "$source:no_recovery_after_hard_reset",
+                collapseMs = (nowElapsed - incident.hardResetElapsed).coerceAtLeast(0L)
+            )
+        }
+
+        val probationStarted = incident.recoveryProbationStartedElapsed
+        val outageStarted = incident.currentOutageSinceElapsed
+        if (
+            probationStarted <= 0L ||
+            outageStarted <= 0L ||
+            outageStarted > nowElapsed
+        ) {
+            return
+        }
+        val outageMs = (nowElapsed - outageStarted).coerceAtLeast(0L)
+        if (outageMs < GmsThawedTransportBootstrapPolicy.INCIDENT_MAX_TRANSIENT_COLLAPSE_MS) {
+            return
+        }
+        resetGmsTransportIncidentProbationLocked(
+            incident = incident,
+            nowElapsed = nowElapsed,
+            source = source,
+            collapseMs = outageMs
+        )
+    }
+
+    private fun resetGmsTransportIncidentProbationLocked(
+        incident: GmsTransportIncident,
+        nowElapsed: Long,
+        source: String,
+        collapseMs: Long
+    ) {
+        if (incident.recoveryProbationStartedElapsed <= 0L) return
+        incident.recoveryProbationStartedElapsed = 0L
+        incident.socketHealthySinceElapsed = 0L
+        incident.probationResetCount += 1
+        incident.maxObservedOutageMs = maxOf(incident.maxObservedOutageMs, collapseMs)
+        gmsTransportIncidentProbationResetCount += 1
+
+        if (
+            incident.hardResetUsed &&
+            incident.hardResetRecoveryObservedElapsed > 0L &&
+            !incident.hardResetIneffective
+        ) {
+            markGmsTransportIncidentHardResetIneffectiveLocked(
+                incident = incident,
+                source = source,
+                collapseMs = collapseMs
+            )
+        }
+        eventLocked(
+            "gms_transport_incident_probation_reset",
+            "incident=${incident.generation} source=$source collapseMs=$collapseMs " +
+                "resetCount=${incident.probationResetCount} at=$nowElapsed"
+        )
+    }
+
+    private fun markGmsTransportIncidentHardResetIneffectiveLocked(
+        incident: GmsTransportIncident,
+        source: String,
+        collapseMs: Long
+    ) {
+        if (incident.hardResetIneffective) return
+        incident.hardResetIneffective = true
+        gmsTransportIncidentHardResetIneffectiveCount += 1
+        eventLocked(
+            "gms_transport_incident_hard_reset_ineffective",
+            "incident=${incident.generation} source=$source collapseMs=$collapseMs " +
+                "hardResetElapsed=${incident.hardResetElapsed} " +
+                "recoveredElapsed=${incident.hardResetRecoveryObservedElapsed}"
+        )
+    }
+
+    private fun finishGmsTransportIncidentLocked(
+        incident: GmsTransportIncident,
+        result: String,
+        nowElapsed: Long,
+        source: String
+    ) {
+        if (gmsTransportIncident !== incident) return
+        incident.lastResult = result
+        incident.completedElapsed = nowElapsed
+        if (result == "incident_recovered" || result == "delivery_observed") {
+            gmsTransportIncidentRecoveredCount += 1
+        }
+        eventLocked(
+            "gms_transport_incident_finished",
+            "incident=${incident.generation} result=$result source=$source " +
+                "durationMs=${(nowElapsed - incident.startedElapsed).coerceAtLeast(0L)} " +
+                "bootstraps=${incident.bootstrapGenerationCount} " +
+                "softUsed=${incident.softResetUsed} hardUsed=${incident.hardResetUsed} " +
+                "hardIneffective=${incident.hardResetIneffective} " +
+                "collapses=${incident.collapseCount} probationResets=${incident.probationResetCount}"
+        )
+        gmsTransportIncident = null
+    }
+
     private fun maybeStartThawedGmsTransportBootstrapLocked(
         triggerHint: String,
         forceFromFreezerHandoff: Boolean = false
@@ -6215,11 +6552,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         cancelGmsVerifiedOutageDeadlineRecheckLocked("thawed_transport_bootstrap_started")
         cancelGmsDeferredForceStopContinuationLocked("thawed_transport_bootstrap_started")
+        val incident = ensureGmsTransportIncidentLocked(
+            trigger = "${decision.reason}:$triggerHint",
+            nowElapsed = now
+        )
+        incident.bootstrapGenerationCount += 1
+        incident.lastBootstrapStartedElapsed = now
         gmsTransportBootstrapGeneration += 1
         val generation = gmsTransportBootstrapGeneration
         gmsTransportBootstrap = GmsTransportBootstrap(
             trigger = "${decision.reason}:$triggerHint",
             generation = generation,
+            incidentGeneration = incident.generation,
             startedElapsed = now,
             deadlineElapsed = now + GmsThawedTransportBootstrapPolicy.MAX_DURATION_MS,
             initialPids = currentPids,
@@ -6231,9 +6575,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         gmsTransportBootstrapStartedCount += 1
         eventLocked(
             "gms_transport_bootstrap_started",
-            "generation=$generation trigger=${decision.reason} hint=$triggerHint " +
+            "generation=$generation incident=${incident.generation} trigger=${decision.reason} hint=$triggerHint " +
                 "authSuspected=${decision.authSuspected} allowSoftReset=${decision.allowSoftReset} " +
-                "allowHardReset=${decision.allowHardReset} " +
+                "allowHardReset=${decision.allowHardReset} incidentSoftUsed=${incident.softResetUsed} " +
+                "incidentHardUsed=${incident.hardResetUsed} " +
+                "incidentAgeMs=${(now - incident.startedElapsed).coerceAtLeast(0L)} " +
                 "missingForMs=${(now - gmsTransportMissingSinceElapsed).coerceAtLeast(0L)} " +
                 "missing=$gmsTransportConsecutiveMissing pids=${currentPids.sorted()}"
         )
@@ -6274,6 +6620,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         val bootstrap = gmsTransportBootstrap ?: return
         if (bootstrap.generation != generation) return
+        val incident = gmsTransportIncident
+        if (incident == null || incident.generation != bootstrap.incidentGeneration) {
+            finishGmsThawedTransportBootstrapLocked(generation, "incident_missing")
+            return
+        }
         val now = SystemClock.elapsedRealtime()
         val processes = listGmsProcessesLocked()
         val mainRunning = processes.any { it.name == GMS_PACKAGE }
@@ -6309,7 +6660,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val decision = GmsThawedTransportBootstrapPolicy.decideTick(
             nowElapsed = now,
-            startedElapsed = bootstrap.startedElapsed,
+            startedElapsed = incident.startedElapsed,
             deadlineElapsed = bootstrap.deadlineElapsed,
             transportObservable = probe.observable,
             transportHealthy = probe.healthy,
@@ -6318,7 +6669,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             mainRunning = mainRunning,
             persistentRunning = persistentRunning,
             healthySinceElapsed = bootstrap.healthySinceElapsed,
-            lastHealthyObservedElapsed = bootstrap.lastHealthyObservedElapsed,
+            lastHealthyObservedElapsed = incident.lastHealthyObservedElapsed,
+            incidentProbationStartedElapsed = incident.recoveryProbationStartedElapsed,
+            incidentCurrentOutageSinceElapsed = incident.currentOutageSinceElapsed,
             lastReconnectElapsed = bootstrap.lastReconnectElapsed,
             lastLeaseRefreshElapsed = bootstrap.lastLeaseRefreshElapsed,
             lastBadAuthenticationElapsed = lastGmsBadAuthenticationElapsed,
@@ -6327,9 +6680,12 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             authSuspected = bootstrap.authSuspected,
             allowSoftReset = bootstrap.allowSoftReset,
             allowHardReset = bootstrap.allowHardReset,
-            softResetCount = bootstrap.softResetCount,
-            hardResetCount = bootstrap.hardResetCount,
-            lastHardResetGateCheckElapsed = bootstrap.lastHardResetGateCheckElapsed,
+            // Once the hard tier has been consumed the lower soft tier is
+            // permanently closed for this incident; never de-escalate to a
+            // later stop-app in a replacement bootstrap generation.
+            softResetCount = if (incident.softResetUsed || incident.hardResetUsed) 1 else 0,
+            hardResetCount = if (incident.hardResetUsed) 1 else 0,
+            lastHardResetGateCheckElapsed = incident.lastHardResetGateCheckElapsed,
             postSoftResetUntilElapsed = bootstrap.postSoftResetUntilElapsed,
             postHardResetUntilElapsed = bootstrap.postHardResetUntilElapsed,
             deliveryObservedElapsed = lastGmsControlledDeliveryElapsed
@@ -6375,10 +6731,10 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             )
         }
         if (decision.softReset) {
-            runGmsThawedTransportSoftResetLocked(bootstrap)
+            runGmsThawedTransportSoftResetLocked(bootstrap, incident)
         }
         if (decision.hardReset) {
-            runGmsThawedTransportHardResetLocked(bootstrap)
+            runGmsThawedTransportHardResetLocked(bootstrap, incident)
         }
         persistStatusLocked()
     }
@@ -6396,16 +6752,22 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         return result
     }
 
-    private fun runGmsThawedTransportSoftResetLocked(bootstrap: GmsTransportBootstrap) {
-        if (bootstrap.softResetCount > 0) return
+    private fun runGmsThawedTransportSoftResetLocked(
+        bootstrap: GmsTransportBootstrap,
+        incident: GmsTransportIncident
+    ) {
+        if (incident.softResetUsed || incident.hardResetUsed) return
+        // Consumption is incident-scoped and happens before the command so an
+        // exception/capability failure cannot reopen the tier in a new bootstrap.
+        incident.softResetUsed = true
+        incident.softResetElapsed = SystemClock.elapsedRealtime()
+        bootstrap.softResetCount += 1
         if (!supportsStopApp) {
-            // Consume the single soft tier so an unavailable stop-app capability
-            // cannot starve the later globally-budgeted hard-reset gate forever.
-            bootstrap.softResetCount = 1
             bootstrap.commandDetails += "am_stop_app:unsupported"
             eventLocked(
                 "gms_transport_bootstrap_soft_reset_skipped",
-                "generation=${bootstrap.generation} reason=stop_app_unavailable"
+                "generation=${bootstrap.generation} incident=${incident.generation} " +
+                    "reason=stop_app_unavailable"
             )
             return
         }
@@ -6418,7 +6780,6 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         actionCount += 1
         gmsRecoveryStopAppCount += 1
         gmsTransportBootstrapSoftResetCount += 1
-        bootstrap.softResetCount += 1
         details += "am_stop_app:${stop.summary()}"
         if (!stop.success) commandFailureCount += 1
         val remaining = waitForGmsOldPidsRemovedLocked(oldPids, GMS_STOP_VERIFY_WAIT_MS)
@@ -6445,8 +6806,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         bootstrap.commandDetails += details
         eventLocked(
             "gms_transport_bootstrap_soft_reset_completed",
-            "generation=${bootstrap.generation} oldPids=${oldPids.sorted()} " +
-                "postGraceUntil=${bootstrap.postSoftResetUntilElapsed} " +
+            "generation=${bootstrap.generation} incident=${incident.generation} " +
+                "oldPids=${oldPids.sorted()} postGraceUntil=${bootstrap.postSoftResetUntilElapsed} " +
                 "commands=${details.joinToString(" | ")}"
         )
     }
@@ -6487,9 +6848,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         bootstrap.physicalFrozenSinceElapsed = 0L
     }
 
-    private fun runGmsThawedTransportHardResetLocked(bootstrap: GmsTransportBootstrap) {
-        if (bootstrap.hardResetCount > 0) return
+    private fun runGmsThawedTransportHardResetLocked(
+        bootstrap: GmsTransportBootstrap,
+        incident: GmsTransportIncident
+    ) {
+        if (incident.hardResetUsed) return
         val now = SystemClock.elapsedRealtime()
+        incident.lastHardResetGateCheckElapsed = now
         bootstrap.lastHardResetGateCheckElapsed = now
         val gate = RecoveryCampaignPolicy.decideGmsForceStop(
             nowElapsed = now,
@@ -6501,7 +6866,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsTransportBootstrapHardResetBlockedCount += 1
             eventLocked(
                 "gms_transport_bootstrap_hard_reset_blocked",
-                "generation=${bootstrap.generation} reason=${gate.reason} " +
+                "generation=${bootstrap.generation} incident=${incident.generation} reason=${gate.reason} " +
                     "missing=${gmsTransportConsecutiveMissing} " +
                     "forceStopHistory=${gmsForceStopHistory.size}"
             )
@@ -6517,11 +6882,16 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             bootstrap.commandDetails += details
             eventLocked(
                 "gms_transport_bootstrap_hard_reset_blocked",
-                "generation=${bootstrap.generation} reason=package_unstop_unavailable"
+                "generation=${bootstrap.generation} incident=${incident.generation} " +
+                    "reason=package_unstop_unavailable"
             )
             return
         }
 
+        incident.hardResetUsed = true
+        incident.hardResetElapsed = now
+        incident.hardResetIneffective = false
+        incident.hardResetRecoveryObservedElapsed = 0L
         bootstrap.hardResetCount += 1
         bootstrap.hardResetBlockedReason = ""
         gmsTransportBootstrapHardResetCount += 1
@@ -6529,7 +6899,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         pruneGmsStateLocked(now)
         eventLocked(
             "gms_transport_bootstrap_hard_reset_started",
-            "generation=${bootstrap.generation} oldPids=${oldPids.sorted()} " +
+            "generation=${bootstrap.generation} incident=${incident.generation} oldPids=${oldPids.sorted()} " +
+                "incidentAgeMs=${(now - incident.startedElapsed).coerceAtLeast(0L)} " +
                 "missingAgeMs=${(now - gmsTransportMissingSinceElapsed).coerceAtLeast(0L)}"
         )
 
@@ -6566,6 +6937,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val transitionVerified =
             forceStopAccepted && remainingOldPids.isEmpty() && unstop.success
+        incident.hardResetTransitionVerified = transitionVerified
         if (
             transitionVerified &&
             currentVendorFamilyLocked() == BackgroundPolicyVendorFamily.VIVO
@@ -6601,8 +6973,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         bootstrap.commandDetails += details
         eventLocked(
             "gms_transport_bootstrap_hard_reset_completed",
-            "generation=${bootstrap.generation} transitionVerified=$transitionVerified " +
-                "remainingOldPids=${remainingOldPids.sorted()} " +
+            "generation=${bootstrap.generation} incident=${incident.generation} " +
+                "transitionVerified=$transitionVerified remainingOldPids=${remainingOldPids.sorted()} " +
                 "postGraceUntil=${bootstrap.postHardResetUntilElapsed} " +
                 "commands=${details.joinToString(" | ")}"
         )
@@ -6614,6 +6986,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         gmsTransportBootstrapFuture?.cancel(false)
         gmsTransportBootstrapFuture = null
         val now = SystemClock.elapsedRealtime()
+        val incident = gmsTransportIncident?.takeIf {
+            it.generation == bootstrap.incidentGeneration
+        }
         val processes = listGmsProcessesLocked()
         val frozen = processes.any { readFreezeState(it.pid).frozen == true }
         val finalProbe = probeGmsTransportLocked()
@@ -6623,7 +6998,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             persistentRunning = processes.any { it.name == "$GMS_PACKAGE.persistent" },
             source = "transport_bootstrap_final"
         )
-        val deliveryObserved = lastGmsControlledDeliveryElapsed >= bootstrap.startedElapsed &&
+        val deliveryOrigin = incident?.startedElapsed ?: bootstrap.startedElapsed
+        val deliveryObserved = lastGmsControlledDeliveryElapsed >= deliveryOrigin &&
             lastGmsControlledDeliveryElapsed <= now
         val finishDecision = GmsThawedTransportBootstrapPolicy.decideFinish(
             requestedResult = requestedResult,
@@ -6645,6 +7021,14 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             gmsConsecutiveCampaignFailures = 0
             gmsCooldownBypassMissingEpisodeElapsed = 0L
             gmsCooldownBypassPidGenerationKey = ""
+            if (incident != null) {
+                finishGmsTransportIncidentLocked(
+                    incident = incident,
+                    result = finalResult,
+                    nowElapsed = now,
+                    source = "bootstrap_final"
+                )
+            }
         } else {
             when (finalResult) {
                 "refrozen" -> gmsTransportBootstrapRefrozenCount += 1
@@ -6654,11 +7038,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
         eventLocked(
             "gms_transport_bootstrap_finished",
-            "generation=$generation requested=$requestedResult result=$finalResult success=$success frozen=$frozen " +
+            "generation=$generation incident=${bootstrap.incidentGeneration} requested=$requestedResult " +
+                "result=$finalResult success=$success frozen=$frozen " +
                 "ports=${finalProbe.establishedPorts.sorted()} deliveryObserved=$deliveryObserved " +
                 "reconnects=${bootstrap.reconnectCount} leases=${bootstrap.leaseRefreshCount} " +
                 "softResets=${bootstrap.softResetCount} hardResets=${bootstrap.hardResetCount} " +
-                "backoffMs=$backoffMs"
+                "incidentSoftUsed=${incident?.softResetUsed ?: false} " +
+                "incidentHardUsed=${incident?.hardResetUsed ?: false} backoffMs=$backoffMs"
         )
         ensureGmsVerifiedOutageDeadlineRecheckLocked(now)
         persistStatusLocked(force = true)
@@ -7499,6 +7885,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val vendorFamily = currentVendorFamilyLocked()
         val nextResetCount = campaign.resetCount + 1
         val hardResetRequested = campaign.hardResetRequested
+        val incident = if (transportProbe.observable && !transportProbe.healthy) {
+            // The older freezer recovery campaign may reach reset before the
+            // thawed-transport bootstrap. Create/adopt the same incident here
+            // so it cannot bypass the one-soft/one-hard destructive ledger.
+            ensureGmsTransportIncidentLocked(
+                trigger = "freezer_campaign_reset:${campaign.trigger}",
+                nowElapsed = now
+            )
+        } else {
+            gmsTransportIncident
+        }
+        val incidentHardResetUsed = incident?.hardResetUsed == true
+        val incidentSoftResetUsed = incident?.softResetUsed == true || incidentHardResetUsed
         val hardResetBudgetAvailable =
             campaign.forceStopCount <
                 RecoveryCampaignPolicy.gmsMaxForceStopsPerCampaign(vendorFamily)
@@ -7510,14 +7909,23 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
                 forceStopCount = campaign.forceStopCount
             )
         val campaignForceStopAllowed =
-            normalForceStopRequested ||
-                (hardResetRequested && hardResetBudgetAvailable)
+            !incidentHardResetUsed &&
+                (normalForceStopRequested ||
+                    (hardResetRequested && hardResetBudgetAvailable))
         val forceStopDecision = RecoveryCampaignPolicy.decideGmsForceStop(
             nowElapsed = now,
             forceStopHistory = gmsForceStopHistory.toList()
         )
 
-        if (hardResetRequested && !hardResetBudgetAvailable) {
+        if (hardResetRequested && incidentHardResetUsed) {
+            campaign.hardResetRequested = false
+            eventLocked(
+                "gms_recovery_hard_reset_rejected",
+                "generation=${campaign.generation} reason=incident_hard_reset_already_consumed " +
+                    "incident=${incident?.generation ?: 0L}"
+            )
+            return
+        } else if (hardResetRequested && !hardResetBudgetAvailable) {
             campaign.hardResetRequested = false
             eventLocked(
                 "gms_recovery_hard_reset_rejected",
@@ -7607,6 +8015,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         val forceStopAllowed = campaignForceStopAllowed && forceStopDecision.allowed
         val forceStopBlockReason = when {
             hardResetRequested && forceStopAllowed -> campaign.hardResetReason
+            incidentHardResetUsed -> "incident_hard_reset_already_consumed"
             !campaignForceStopAllowed -> "campaign_escalation_or_budget"
             !forceStopDecision.allowed -> forceStopDecision.reason
             else -> forceStopDecision.reason
@@ -7628,7 +8037,15 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         var remainingOldPids: Set<Int> = oldPids
         var stopAppSucceeded = false
-        if (!forceStopAllowed && supportsStopApp) {
+        if (!forceStopAllowed && supportsStopApp && !incidentSoftResetUsed) {
+            if (incident != null) {
+                incident.softResetUsed = true
+                incident.softResetElapsed = now
+                eventLocked(
+                    "gms_transport_incident_soft_reset_consumed_by_campaign",
+                    "incident=${incident.generation} campaign=${campaign.generation} reset=$nextResetCount"
+                )
+            }
             val stopResult = runner.run(
                 "am", "stop-app", "--user", "0", GMS_PACKAGE,
                 timeoutMs = GMS_STOP_APP_TIMEOUT_MS
@@ -7639,6 +8056,13 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             if (!stopResult.success) commandFailureCount += 1
             remainingOldPids = waitForGmsOldPidsRemovedLocked(oldPids, GMS_STOP_VERIFY_WAIT_MS)
             stopAppSucceeded = stopResult.success && remainingOldPids.isEmpty()
+        } else if (!forceStopAllowed && incidentSoftResetUsed) {
+            details += "am_stop_app:skipped_incident_soft_reset_consumed"
+            eventLocked(
+                "gms_recovery_stop_app_suppressed_by_transport_incident",
+                "generation=${campaign.generation} reset=$nextResetCount " +
+                    "incident=${incident?.generation ?: 0L}"
+            )
         }
 
         if (forceStopAllowed) {
@@ -7748,8 +8172,21 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             return oldPids
         }
 
+        val destructiveStarted = SystemClock.elapsedRealtime()
+        gmsTransportIncident?.let { incident ->
+            if (!incident.hardResetUsed) {
+                incident.hardResetUsed = true
+                incident.hardResetElapsed = destructiveStarted
+                incident.hardResetIneffective = false
+                incident.hardResetRecoveryObservedElapsed = 0L
+                eventLocked(
+                    "gms_transport_incident_hard_reset_consumed_by_campaign",
+                    "incident=${incident.generation} campaign=${campaign.generation} reason=$reason"
+                )
+            }
+        }
         campaign.forceStopCount += 1
-        gmsForceStopHistory.addLast(SystemClock.elapsedRealtime())
+        gmsForceStopHistory.addLast(destructiveStarted)
         pruneGmsStateLocked(SystemClock.elapsedRealtime())
         eventLocked(
             "gms_recovery_force_stop_started",
@@ -7803,6 +8240,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
 
         val transitionVerified =
             forceStopAccepted && remainingOldPids.isEmpty() && unstopResult.success
+        gmsTransportIncident?.let { incident ->
+            if (incident.hardResetUsed) {
+                incident.hardResetTransitionVerified = transitionVerified
+            }
+        }
         if (transitionVerified && currentVendorFamilyLocked() == BackgroundPolicyVendorFamily.VIVO) {
             // Arm before the post-unstop settle. The new GMS PIDs may not exist yet;
             // the bridge handles that with a bounded 200 ms absent-process poll.
@@ -8754,6 +9196,11 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("failureCount", vendorBridgeFailureCount)
             .put("heartbeatCount", vendorBridgeHeartbeatCount)
             .put("lastHeartbeatElapsed", vendorBridgeLastHeartbeatElapsed)
+            .put("protocolStallCount", vendorBridgeProtocolStallCount)
+            .put("protocolRestartCount", vendorBridgeProtocolRestartCount)
+            .put("protocolOwnershipRevoked", vendorBridgeProtocolOwnershipRevoked)
+            .put("protocolOwnershipRevokedCount", vendorBridgeProtocolOwnershipRevokedCount)
+            .put("lastProtocolStallElapsed", vendorBridgeLastProtocolStallElapsed)
             .put("heartbeatAgeMs", if (vendorBridgeLastHeartbeatElapsed > 0L) {
                 (SystemClock.elapsedRealtime() - vendorBridgeLastHeartbeatElapsed).coerceAtLeast(0L)
             } else {
@@ -8767,8 +9214,19 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("heartbeatFileAgeMs", vendorBridgeHeartbeatFileAgeMs)
             .put("ownerLeaseValid", vendorBridgeOwnerLeaseValid)
             .put("ownerPath", vendorBridgeOwnerPath)
-            .put("commandOwnerPolicy", "vendor_bridge")
-            .put("ownershipPolicyActive", running && isVendorBridgeTargetedLocked())
+            .put(
+                "commandOwnerPolicy",
+                if (vendorBridgeProtocolOwnershipRevoked) {
+                    "guardian_fallback_protocol_stall"
+                } else {
+                    "vendor_bridge"
+                }
+            )
+            .put(
+                "ownershipPolicyActive",
+                running && isVendorBridgeTargetedLocked() &&
+                    !vendorBridgeProtocolOwnershipRevoked
+            )
             .put("gmsFallbackSuppressed", vendorBridgeOwnsGmsCommandsLocked())
             .put("frozenCount", vendorBridgeFrozenCount)
             .put("recoveryAttemptCount", vendorBridgeRecoveryAttemptCount)
@@ -8983,6 +9441,18 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         .put("gmsRecoveryForceStopCount", gmsRecoveryForceStopCount)
         .put("gmsRecoverySuccessorRefreezeCount", gmsRecoverySuccessorRefreezeCount)
         .put("gmsRecoveryCampaign", gmsRecoveryCampaign?.toJson() ?: JSONObject.NULL)
+        .put("gmsTransportIncident", JSONObject()
+            .put("active", gmsTransportIncident != null)
+            .put("generation", gmsTransportIncidentGeneration)
+            .put("current", gmsTransportIncident?.toJson() ?: JSONObject.NULL)
+            .put("startedCount", gmsTransportIncidentStartedCount)
+            .put("recoveredCount", gmsTransportIncidentRecoveredCount)
+            .put("probationResetCount", gmsTransportIncidentProbationResetCount)
+            .put("hardResetIneffectiveCount", gmsTransportIncidentHardResetIneffectiveCount)
+            .put("socketRecoveredStableMs", GmsThawedTransportBootstrapPolicy.SOCKET_RECOVERED_STABLE_MS)
+            .put("recoveryProbationMs", GmsThawedTransportBootstrapPolicy.INCIDENT_RECOVERY_PROBATION_MS)
+            .put("maxTransientCollapseMs", GmsThawedTransportBootstrapPolicy.INCIDENT_MAX_TRANSIENT_COLLAPSE_MS)
+        )
         .put("gmsTransportBootstrap", JSONObject()
             .put("active", gmsTransportBootstrap != null)
             .put("generation", gmsTransportBootstrapGeneration)
@@ -9001,7 +9471,9 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("lastResult", gmsTransportBootstrapLastResult)
             .put("lastCompletedElapsed", gmsTransportBootstrapLastCompletedElapsed)
             .put("tickMs", GmsThawedTransportBootstrapPolicy.TICK_MS)
-            .put("healthyStableMs", GmsThawedTransportBootstrapPolicy.HEALTHY_STABLE_MS)
+            .put("healthyStableMs", GmsThawedTransportBootstrapPolicy.SOCKET_RECOVERED_STABLE_MS)
+            .put("socketRecoveredStableMs", GmsThawedTransportBootstrapPolicy.SOCKET_RECOVERED_STABLE_MS)
+            .put("incidentRecoveryProbationMs", GmsThawedTransportBootstrapPolicy.INCIDENT_RECOVERY_PROBATION_MS)
             .put("maxDurationMs", GmsThawedTransportBootstrapPolicy.MAX_DURATION_MS)
         )
         .put("gmsPidRestartCount", gmsPidRestartCount)
@@ -9186,7 +9658,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             !running -> "GRAY"
             frozen.isNotEmpty() || (transportDegraded && gmsTransportConsecutiveMissing >= 3) -> "RED"
             !eventWatcherAlive || gmsRecoveryInProgress || gmsTransportBootstrap != null ||
-                packageRebuildInProgress.isNotEmpty() ||
+                gmsTransportIncident != null || packageRebuildInProgress.isNotEmpty() ||
                 packageSuccessorGuardByPackage.isNotEmpty() ||
                 deliveryProtectionByPackage.isNotEmpty() || transportDegraded -> "YELLOW"
             else -> "GREEN"
@@ -9201,7 +9673,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put(
                 "recoveryInProgress",
                 gmsRecoveryInProgress || gmsTransportBootstrap != null ||
-                    packageRebuildInProgress.isNotEmpty() ||
+                    gmsTransportIncident != null || packageRebuildInProgress.isNotEmpty() ||
                     packageSuccessorGuardByPackage.isNotEmpty() ||
                     deliveryProtectionByPackage.isNotEmpty()
             )
@@ -9306,9 +9778,61 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
             .put("verifyAttempt", verifyAttempt)
     }
 
+    private data class GmsTransportIncident(
+        val generation: Long,
+        val trigger: String,
+        val startedElapsed: Long,
+        var lastBootstrapStartedElapsed: Long,
+        var currentOutageSinceElapsed: Long,
+        var socketHealthySinceElapsed: Long = 0L,
+        var lastHealthyObservedElapsed: Long = 0L,
+        var lastSocketRecoveredElapsed: Long = 0L,
+        var recoveryProbationStartedElapsed: Long = 0L,
+        var collapseCount: Int = 0,
+        var probationResetCount: Int = 0,
+        var maxObservedOutageMs: Long = 0L,
+        var bootstrapGenerationCount: Int = 0,
+        var softResetUsed: Boolean = false,
+        var softResetElapsed: Long = 0L,
+        var hardResetUsed: Boolean = false,
+        var hardResetElapsed: Long = 0L,
+        var hardResetTransitionVerified: Boolean = false,
+        var hardResetRecoveryObservedElapsed: Long = 0L,
+        var hardResetIneffective: Boolean = false,
+        var lastHardResetGateCheckElapsed: Long = 0L,
+        var completedElapsed: Long = 0L,
+        var lastResult: String = "active"
+    ) {
+        fun toJson(): JSONObject = JSONObject()
+            .put("generation", generation)
+            .put("trigger", trigger)
+            .put("startedElapsed", startedElapsed)
+            .put("lastBootstrapStartedElapsed", lastBootstrapStartedElapsed)
+            .put("currentOutageSinceElapsed", currentOutageSinceElapsed)
+            .put("socketHealthySinceElapsed", socketHealthySinceElapsed)
+            .put("lastHealthyObservedElapsed", lastHealthyObservedElapsed)
+            .put("lastSocketRecoveredElapsed", lastSocketRecoveredElapsed)
+            .put("recoveryProbationStartedElapsed", recoveryProbationStartedElapsed)
+            .put("collapseCount", collapseCount)
+            .put("probationResetCount", probationResetCount)
+            .put("maxObservedOutageMs", maxObservedOutageMs)
+            .put("bootstrapGenerationCount", bootstrapGenerationCount)
+            .put("softResetUsed", softResetUsed)
+            .put("softResetElapsed", softResetElapsed)
+            .put("hardResetUsed", hardResetUsed)
+            .put("hardResetElapsed", hardResetElapsed)
+            .put("hardResetTransitionVerified", hardResetTransitionVerified)
+            .put("hardResetRecoveryObservedElapsed", hardResetRecoveryObservedElapsed)
+            .put("hardResetIneffective", hardResetIneffective)
+            .put("lastHardResetGateCheckElapsed", lastHardResetGateCheckElapsed)
+            .put("completedElapsed", completedElapsed)
+            .put("lastResult", lastResult)
+    }
+
     private data class GmsTransportBootstrap(
         val trigger: String,
         val generation: Long,
+        val incidentGeneration: Long,
         val startedElapsed: Long,
         val deadlineElapsed: Long,
         val initialPids: Set<Int>,
@@ -9339,6 +9863,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         fun toJson(): JSONObject = JSONObject()
             .put("trigger", trigger)
             .put("generation", generation)
+            .put("incidentGeneration", incidentGeneration)
             .put("startedElapsed", startedElapsed)
             .put("deadlineElapsed", deadlineElapsed)
             .put("initialPids", JSONArray(initialPids.toList().sorted()))
@@ -9560,7 +10085,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
     )
 
     companion object {
-        private const val STATUS_SCHEMA = 59
+        private const val STATUS_SCHEMA = 60
         private const val SSH_GUARDIAN_INTERVAL_MS = 5_000L
         private const val GMS_PACKAGE = "com.google.android.gms"
         private const val WHATSAPP_PACKAGE = "com.whatsapp"

@@ -1,20 +1,22 @@
 package com.yubegreen.luonnotar.privileged
 
 /**
- * r296 keeps "make GMS runnable" separate from "make FCM/MCS connected", but
- * fixes two real-device ownership failures observed on OriginOS:
+ * r297 keeps the short-lived bootstrap worker separate from the longer-lived
+ * transport incident. A bootstrap generation may time out and restart; the
+ * incident owns destructive-tier consumption and recovery probation across all
+ * of those generations.
  *
- * 1. fast_freezer can flip cgroup.freeze to 1 for well under one scheduler tick.
- *    A single frozen sample is therefore not a terminal handoff signal.
- * 2. a physically-thawed MCS outage can survive reconnect + stop-app for minutes.
- *    After a long continuous no-healthy window, transport recovery may request one
- *    force-stop/unstop transition, but the service must still pass the existing
- *    global 10-minute / 24-hour force-stop budget before executing it.
+ * OriginOS repeatedly demonstrated that an 8-second 5228 window is only proof
+ * that the socket came back, not that the outage is over. r297 therefore uses
+ * three levels of evidence:
  *
- * The ordinary path remains non-destructive: Binder stabilization + bounded
- * GCM_RECONNECT, followed by at most one stop-app soft reset. BAD_AUTHENTICATION
- * keeps the bootstrap in an auth-settle window while it is recent; it is evidence
- * to wait, not an immediate reason to kill GMS.
+ * 1. 8 seconds of continuous 5228 health => socket_recovered only.
+ * 2. 120 seconds of recovery probation, tolerating collapses shorter than 30s
+ *    => incident_recovered.
+ * 3. A controlled delivery after incident start => strongest immediate proof.
+ *
+ * Soft/hard reset counts passed to this policy are incident-scoped. The service
+ * must not reset them merely because a new bootstrap generation starts.
  */
 object GmsThawedTransportBootstrapPolicy {
     enum class Phase(val wireName: String) {
@@ -23,6 +25,7 @@ object GmsThawedTransportBootstrapPolicy {
         FREEZER_SETTLE("freezer_settle"),
         POST_SOFT_RESET("post_soft_reset"),
         POST_HARD_RESET("post_hard_reset"),
+        RECOVERY_PROBATION("recovery_probation"),
         STABLE("stable")
     }
 
@@ -50,7 +53,18 @@ object GmsThawedTransportBootstrapPolicy {
     )
 
     const val TICK_MS = 3_000L
-    const val HEALTHY_STABLE_MS = 8_000L
+
+    // 8s is deliberately retained as a socket-level signal only. It is no
+    // longer sufficient to close the outage incident.
+    const val SOCKET_RECOVERED_STABLE_MS = 8_000L
+    @Deprecated("Use SOCKET_RECOVERED_STABLE_MS; this is not an incident success threshold")
+    const val HEALTHY_STABLE_MS = SOCKET_RECOVERED_STABLE_MS
+
+    // Long-run acceptance window. Short OriginOS fast_freezer collapses are
+    // allowed inside the probation, but a >=30s collapse invalidates it.
+    const val INCIDENT_RECOVERY_PROBATION_MS = 2 * 60_000L
+    const val INCIDENT_MAX_TRANSIENT_COLLAPSE_MS = 30_000L
+
     const val RECONNECT_INTERVAL_MS = 12_000L
     const val LEASE_REFRESH_MS = 30_000L
     const val MAX_DURATION_MS = 6 * 60_000L
@@ -62,18 +76,12 @@ object GmsThawedTransportBootstrapPolicy {
     const val NETWORK_TRANSITION_RECENT_MS = 60_000L
     const val FREEZER_HANDOFF_MISSING_MS = 6_000L
 
-    // fast_freezer edges observed on the target are normally cleared in well
-    // under a second. Require a genuinely continuous freeze before giving the
-    // transport bootstrap back to the freezer/process campaign.
+    // A single frozen sample is not a terminal ownership handoff.
     const val PHYSICAL_REFREEZE_HANDOFF_MS = 12_000L
 
     const val SOFT_RESET_AFTER_MS = 2 * 60_000L
     const val POST_SOFT_RESET_GRACE_MS = 45_000L
 
-    // A force-stop is deliberately much later than ordinary rebuilds. Real
-    // fast-freezer collapses usually rebuild 5228 in ~3-8 seconds; a hard reset
-    // is only requested after three minutes in the same bootstrap and at least
-    // one full minute without any healthy transport observation.
     const val HARD_RESET_AFTER_MS = 3 * 60_000L
     const val HARD_RESET_NO_HEALTHY_MS = 60_000L
     const val HARD_RESET_GATE_RETRY_MS = 30_000L
@@ -169,9 +177,6 @@ object GmsThawedTransportBootstrapPolicy {
                 start = true,
                 reason = "thawed_mcs_sustained_missing",
                 authSuspected = badAuthRecent,
-                // r295 incorrectly tied this to a *recent* connect attempt. The
-                // live eight-minute outage had a stale attempt timestamp, which
-                // made the longest outage the least eligible for escalation.
                 allowSoftReset = !badAuthRecent,
                 allowHardReset = true
             )
@@ -179,6 +184,10 @@ object GmsThawedTransportBootstrapPolicy {
         return StartDecision(false, "insufficient_thawed_transport_evidence")
     }
 
+    /**
+     * [startedElapsed] is the *incident* start, not the current bootstrap
+     * generation start. [deadlineElapsed] remains generation-scoped.
+     */
     fun decideTick(
         nowElapsed: Long,
         startedElapsed: Long,
@@ -191,6 +200,8 @@ object GmsThawedTransportBootstrapPolicy {
         persistentRunning: Boolean,
         healthySinceElapsed: Long,
         lastHealthyObservedElapsed: Long = 0L,
+        incidentProbationStartedElapsed: Long = 0L,
+        incidentCurrentOutageSinceElapsed: Long = 0L,
         lastReconnectElapsed: Long,
         lastLeaseRefreshElapsed: Long,
         lastBadAuthenticationElapsed: Long,
@@ -256,11 +267,34 @@ object GmsThawedTransportBootstrapPolicy {
             } else {
                 0L
             }
+            if (stableFor < SOCKET_RECOVERED_STABLE_MS) {
+                return TickDecision(
+                    phase = Phase.STABLE,
+                    refreshLease = due(lastLeaseRefreshElapsed, nowElapsed, LEASE_REFRESH_MS),
+                    reason = "socket_stability_window"
+                )
+            }
+            val probationFor = if (
+                incidentProbationStartedElapsed > 0L &&
+                incidentProbationStartedElapsed <= nowElapsed
+            ) {
+                nowElapsed - incidentProbationStartedElapsed
+            } else {
+                0L
+            }
             return TickDecision(
-                phase = Phase.STABLE,
+                phase = Phase.RECOVERY_PROBATION,
                 refreshLease = due(lastLeaseRefreshElapsed, nowElapsed, LEASE_REFRESH_MS),
-                finishResult = if (stableFor >= HEALTHY_STABLE_MS) "stable_transport_verified" else null,
-                reason = if (stableFor >= HEALTHY_STABLE_MS) "transport_stable" else "stability_window"
+                finishResult = if (probationFor >= INCIDENT_RECOVERY_PROBATION_MS) {
+                    "incident_recovered"
+                } else {
+                    null
+                },
+                reason = if (probationFor >= INCIDENT_RECOVERY_PROBATION_MS) {
+                    "incident_recovery_probation_satisfied"
+                } else {
+                    "socket_recovered_probation"
+                }
             )
         }
 
@@ -271,7 +305,17 @@ object GmsThawedTransportBootstrapPolicy {
             BAD_AUTH_QUIET_BEFORE_SOFT_RESET_MS
         )
         val authActive = badAuthActive && (observedNewBadAuth || authSuspected)
-        if (nowElapsed >= deadlineElapsed) {
+
+        // Once a recovery probation has begun, a short collapse is allowed to
+        // cross a bootstrap generation deadline. A >=30s collapse invalidates
+        // the probation in the service before this policy is called, so the
+        // ordinary deadline becomes active again.
+        val probationShortCollapse =
+            incidentProbationStartedElapsed > 0L &&
+                incidentCurrentOutageSinceElapsed > 0L &&
+                incidentCurrentOutageSinceElapsed <= nowElapsed &&
+                nowElapsed - incidentCurrentOutageSinceElapsed < INCIDENT_MAX_TRANSIENT_COLLAPSE_MS
+        if (nowElapsed >= deadlineElapsed && !probationShortCollapse) {
             return TickDecision(
                 phase = if (authActive) Phase.AUTH_SETTLE else Phase.RECONNECT,
                 finishResult = if (authActive) "auth_stalled" else "transport_stalled",
@@ -321,7 +365,7 @@ object GmsThawedTransportBootstrapPolicy {
             return TickDecision(
                 phase = Phase.RECONNECT,
                 softReset = true,
-                reason = "stalled_mcs_soft_reset_once"
+                reason = "incident_stalled_mcs_soft_reset_once"
             )
         }
 
@@ -344,7 +388,7 @@ object GmsThawedTransportBootstrapPolicy {
             return TickDecision(
                 phase = Phase.RECONNECT,
                 hardReset = true,
-                reason = "persistent_thawed_transport_hard_reset_gate"
+                reason = "incident_persistent_transport_hard_reset_gate"
             )
         }
 
@@ -357,11 +401,10 @@ object GmsThawedTransportBootstrapPolicy {
     }
 
     /**
-     * r295 trusted the *requested* stable result even when its final probe had
-     * already observed ports=[]; that produced `success=true ... ports=[]`.
-     * A socket-based success now requires the final probe itself to be healthy.
-     * A real controlled delivery remains stronger evidence and may succeed even
-     * if a point-in-time socket sample races a freezer edge.
+     * A socket-based incident success still requires the final probe to be
+     * healthy. Controlled delivery remains stronger than a point-in-time socket
+     * race and can close the incident even if a freezer edge wins the final
+     * sample.
      */
     fun decideFinish(
         requestedResult: String,
@@ -373,12 +416,12 @@ object GmsThawedTransportBootstrapPolicy {
         val deliveryProof = requestedResult == "delivery_observed" || deliveryObserved
         if (deliveryProof) return FinishDecision(true, "delivery_observed")
 
-        if (requestedResult == "stable_transport_verified") {
+        if (requestedResult == "incident_recovered" || requestedResult == "stable_transport_verified") {
             return when {
                 frozen -> FinishDecision(false, "final_refrozen")
                 !finalTransportObservable -> FinishDecision(false, "final_transport_unobservable")
                 !finalTransportHealthy -> FinishDecision(false, "final_transport_unhealthy")
-                else -> FinishDecision(true, "stable_transport_verified")
+                else -> FinishDecision(true, "incident_recovered")
             }
         }
         return FinishDecision(false, requestedResult)
@@ -388,7 +431,7 @@ object GmsThawedTransportBootstrapPolicy {
         "auth_stalled" -> AUTH_STALLED_BACKOFF_MS
         "refrozen", "final_refrozen" -> REFROZEN_BACKOFF_MS
         "process_missing" -> PROCESS_MISSING_BACKOFF_MS
-        "stable_transport_verified", "delivery_observed" -> 0L
+        "incident_recovered", "stable_transport_verified", "delivery_observed" -> 0L
         else -> TRANSPORT_STALLED_BACKOFF_MS
     }
 

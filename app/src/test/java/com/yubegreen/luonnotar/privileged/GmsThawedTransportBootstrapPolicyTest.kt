@@ -411,4 +411,128 @@ class GmsThawedTransportBootstrapPolicyTest {
         assertEquals("delivery_observed", finish.result)
     }
 
+    @Test
+    fun eightSecondSocketRecoveryDoesNotCloseIncident() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 210_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 500_000L,
+            transportObservable = true,
+            transportHealthy = true,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 200_000L,
+            incidentProbationStartedElapsed = 205_000L,
+            lastReconnectElapsed = 0L,
+            lastLeaseRefreshElapsed = 0L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 1,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals(GmsThawedTransportBootstrapPolicy.Phase.RECOVERY_PROBATION, decision.phase)
+        assertEquals(null, decision.finishResult)
+    }
+
+    @Test
+    fun probationClosesIncidentOnlyAfterTwoMinutes() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 330_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 300_000L,
+            transportObservable = true,
+            transportHealthy = true,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 300_000L,
+            incidentProbationStartedElapsed = 200_000L,
+            lastReconnectElapsed = 0L,
+            lastLeaseRefreshElapsed = 0L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 1,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals("incident_recovered", decision.finishResult)
+    }
+
+    @Test
+    fun shortCollapseInsideProbationMayCrossBootstrapDeadline() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 365_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 360_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            incidentProbationStartedElapsed = 300_000L,
+            incidentCurrentOutageSinceElapsed = 350_000L,
+            lastReconnectElapsed = 350_000L,
+            lastLeaseRefreshElapsed = 350_000L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 1,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals(null, decision.finishResult)
+        assertEquals(GmsThawedTransportBootstrapPolicy.Phase.RECONNECT, decision.phase)
+    }
+
+    @Test
+    fun longCollapseAfterProbationDoesNotReceiveDeadlineProtection() {
+        val decision = GmsThawedTransportBootstrapPolicy.decideTick(
+            nowElapsed = 390_000L,
+            startedElapsed = 100_000L,
+            deadlineElapsed = 360_000L,
+            transportObservable = true,
+            transportHealthy = false,
+            physicallyFrozen = false,
+            mainRunning = true,
+            persistentRunning = true,
+            healthySinceElapsed = 0L,
+            incidentProbationStartedElapsed = 300_000L,
+            incidentCurrentOutageSinceElapsed = 350_000L,
+            lastReconnectElapsed = 350_000L,
+            lastLeaseRefreshElapsed = 350_000L,
+            lastBadAuthenticationElapsed = 0L,
+            baselineBadAuthenticationCount = 0,
+            currentBadAuthenticationCount = 0,
+            authSuspected = false,
+            allowSoftReset = true,
+            allowHardReset = true,
+            softResetCount = 1,
+            hardResetCount = 1,
+            postSoftResetUntilElapsed = 0L,
+            postHardResetUntilElapsed = 0L,
+            deliveryObservedElapsed = 0L
+        )
+        assertEquals("transport_stalled", decision.finishResult)
+    }
+
 }
