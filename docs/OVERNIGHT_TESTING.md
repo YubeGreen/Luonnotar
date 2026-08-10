@@ -10,6 +10,7 @@ at the start and end of the window, not every few minutes.
 luoovn --iq -1600
 luoovn --pad -1600
 luoovn --iq -1600 --no-screen-check
+luoovn --iq --force-screen-off -1600
 ```
 
 `-1600` means the **next local 16:00 on the Mac**. If the time suffix is omitted,
@@ -35,6 +36,18 @@ startup. If `dumpsys power` reports an awake/interactive device, the run stops
 without sending a screen keyevent. This keeps the default experiment condition
 strict and avoids the observer itself turning the display off.
 
+When you explicitly want the observer to put the device to sleep during preflight, use:
+
+```bash
+luoovn --iq --force-screen-off -2000
+```
+
+`--force-screen-off` checks `dumpsys power` first. If the device is interactive, it
+sends Android `KEYCODE_SLEEP` (`223`) once through ADB and verifies that the device
+becomes non-interactive before continuing. If the device is already non-interactive,
+no keyevent is sent. The pre-action power dump is preserved separately, and no screen
+keyevents are sent after the unattended observation window starts.
+
 When that preflight confirmation is not wanted, append:
 
 ```bash
@@ -55,7 +68,7 @@ During the observation window the runner intentionally does **not**:
 
 - poll the device periodically;
 - stream Logcat over ADB;
-- send screen keyevents;
+- send screen keyevents after the observation window starts;
 - force-stop GMS or WhatsApp;
 - call Luonnotar `rescue_*` methods;
 - change VPN, freezer, guardian, or experiment configuration;

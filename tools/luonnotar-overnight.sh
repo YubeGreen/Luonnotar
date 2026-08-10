@@ -14,6 +14,7 @@ LOGCAT_RING_SIZE="${LUOOVN_LOGCAT_RING_SIZE:-64M}"
 DEFAULT_HHMM="${LUOOVN_DEFAULT_END_HHMM:-1600}"
 DETACH_ADB="${LUOOVN_DETACH_ADB:-1}"
 REQUIRE_SCREEN_OFF="${LUOOVN_REQUIRE_SCREEN_OFF:-1}"
+FORCE_SCREEN_OFF=0
 
 DEVICE_NAME=""
 HOST=""
@@ -48,6 +49,8 @@ Examples:
   luoovn --iq -1000       # stop at the next local 10:00
   luoovn --iq -1600 --no-screen-check
                             # skip only the startup screen-off gate
+  luoovn --iq --force-screen-off -1600
+                            # send Android KEYCODE_SLEEP once during preflight
 
 Device shortcuts:
   --iq    100.111.89.64:5555
@@ -65,6 +68,8 @@ Options:
                           (explicitly accepts the extra ADB-side interference)
   --no-screen-check      skip the startup screen-off confirmation gate
                           (the initial power state is still captured; no keyevent is sent)
+  --force-screen-off     during preflight only, send Android KEYCODE_SLEEP if interactive
+                          and verify the device becomes non-interactive before continuing
   --screen-check         explicitly require the default screen-off gate
   --dry-run              print resolved plan only; do not touch the device
   -h, --help             show this help
@@ -72,7 +77,7 @@ Options:
 Observation policy:
   * no periodic ADB polling
   * no live logcat streaming
-  * no screen keyevents
+  * no screen keyevents during the observation window
   * no GMS/WhatsApp force-stop
   * no VPN/freezer/Luonnotar config changes
   * no explicit rescue_* actions during the observation window
@@ -136,6 +141,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --no-screen-check|--skip-screen-check)
       REQUIRE_SCREEN_OFF=0
+      shift
+      ;;
+    --force-screen-off)
+      FORCE_SCREEN_OFF=1
       shift
       ;;
     --screen-check|--require-screen-off)
@@ -232,6 +241,7 @@ Send events : $SEND_EVENTS
 Output      : $ROOT
 ADB detach  : $DETACH_ADB
 Screen gate : $([[ $REQUIRE_SCREEN_OFF -eq 1 ]] && echo required || echo disabled)
+Screen action: $([[ $FORCE_SCREEN_OFF -eq 1 ]] && echo force-off-preflight || echo none)
 Logcat ring : $([[ $NO_RING_RESIZE -eq 1 ]] && echo unchanged || echo "$LOGCAT_RING_SIZE")
 EOF_PLAN
   exit 0
@@ -317,14 +327,53 @@ if ! adb_ready; then
   exit 4
 fi
 
-POWER_START_RAW="$(adb -s "$SERIAL" shell dumpsys power 2>/dev/null || true)"
+POWER_BEFORE_SCREEN_ACTION="$(adb -s "$SERIAL" shell dumpsys power 2>/dev/null || true)"
+SCREEN_STATE_BEFORE_ACTION="non_interactive_or_unknown"
+if grep -Eq 'mWakefulness=Awake|mInteractive=true' <<<"$POWER_BEFORE_SCREEN_ACTION"; then
+  SCREEN_STATE_BEFORE_ACTION="interactive"
+fi
+SCREEN_ACTION_RESULT="not_requested"
+
+if (( FORCE_SCREEN_OFF != 0 )); then
+  printf '%s\n' "$POWER_BEFORE_SCREEN_ACTION" >"$ROOT/04-power-before-screen-action.txt"
+  if [[ "$SCREEN_STATE_BEFORE_ACTION" == "interactive" ]]; then
+    log "Force-screen-off requested; sending Android KEYCODE_SLEEP (223) during preflight."
+    if ! adb -s "$SERIAL" shell input keyevent 223 >/dev/null 2>&1; then
+      log "ERROR: --force-screen-off failed to send KEYCODE_SLEEP."
+      exit 5
+    fi
+    SCREEN_ACTION_RESULT="keycode_sleep_sent"
+    POWER_START_RAW=""
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+      sleep 0.25
+      POWER_START_RAW="$(adb -s "$SERIAL" shell dumpsys power 2>/dev/null || true)"
+      if ! grep -Eq 'mWakefulness=Awake|mInteractive=true' <<<"$POWER_START_RAW"; then
+        SCREEN_ACTION_RESULT="keycode_sleep_verified"
+        break
+      fi
+    done
+    if [[ "$SCREEN_ACTION_RESULT" != "keycode_sleep_verified" ]]; then
+      printf '%s\n' "$POWER_START_RAW" >"$ROOT/04-power-start.txt"
+      log "ERROR: --force-screen-off sent KEYCODE_SLEEP but the target remained interactive."
+      exit 5
+    fi
+    log "Force-screen-off verified: target is non-interactive; continuing with normal startup capture."
+  else
+    SCREEN_ACTION_RESULT="already_non_interactive"
+    POWER_START_RAW="$POWER_BEFORE_SCREEN_ACTION"
+    log "Force-screen-off requested; target was already non-interactive, so no keyevent was sent."
+  fi
+else
+  POWER_START_RAW="$POWER_BEFORE_SCREEN_ACTION"
+fi
+
 START_SCREEN_STATE="non_interactive_or_unknown"
 if grep -Eq 'mWakefulness=Awake|mInteractive=true' <<<"$POWER_START_RAW"; then
   START_SCREEN_STATE="interactive"
 fi
 if (( REQUIRE_SCREEN_OFF != 0 )) && [[ "$START_SCREEN_STATE" == "interactive" ]]; then
   printf '%s\n' "$POWER_START_RAW" >"$ROOT/04-power-start.txt"
-  log "ERROR: target screen/device is interactive. Turn the screen off manually, then rerun; or append --no-screen-check to disable only this startup gate. luoovn will never send a screen keyevent."
+  log "ERROR: target screen/device is interactive. Turn the screen off manually, rerun with --force-screen-off, or append --no-screen-check to disable only this startup gate."
   exit 5
 fi
 if (( REQUIRE_SCREEN_OFF == 0 )); then
@@ -378,10 +427,12 @@ Output: $ROOT
 Control conditions:
 - low-interference unattended observation
 - startup screen-off gate: $([[ $REQUIRE_SCREEN_OFF -eq 1 ]] && echo required || echo disabled)
+- startup screen action: $SCREEN_ACTION_RESULT
+- screen state before action: $SCREEN_STATE_BEFORE_ACTION
 - startup screen state: $START_SCREEN_STATE
 - no periodic ADB polling
 - no live logcat stream
-- no screen keyevents
+- no screen keyevents during the observation window
 - no GMS/WhatsApp force-stop
 - no VPN/freezer/Luonnotar configuration writes
 - no explicit rescue_* calls during observation window
