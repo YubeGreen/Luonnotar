@@ -52,13 +52,13 @@ class EmbeddedGuardianHandoffCommandTest {
             mainClass = "com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianServerMain",
             port = 42345,
             token = "cd".repeat(32),
-            expectedRevision = 294,
+            expectedRevision = EmbeddedGuardianProtocol.ENGINE_REVISION,
             reason = "transaction_test"
         )
 
         assertTrue(command.contains("--port 42345"))
         assertTrue(command.contains("--role candidate"))
-        assertTrue(command.contains("transactional_candidate:transaction_test:expected_r294"))
+        assertTrue(command.contains("transactional_candidate:transaction_test:expected_r${EmbeddedGuardianProtocol.ENGINE_REVISION}"))
         assertFalse(command.contains("/proc/\$old_pid/stat"))
         assertFalse(command.contains("kill"))
     }
