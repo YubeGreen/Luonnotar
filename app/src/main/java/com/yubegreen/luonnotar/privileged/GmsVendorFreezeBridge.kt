@@ -601,7 +601,12 @@ pid_matches_target() {
     _identity_pid="${'$'}2"
     case "${'$'}_identity_pid" in ''|*[!0-9]*) return 1 ;; esac
     [ -r "/proc/${'$'}_identity_pid/cmdline" ] || return 1
-    _identity_name=${'$'}(tr '\000' '\n' < "/proc/${'$'}_identity_pid/cmdline" 2>/dev/null | head -n 1)
+    # r303: /system/bin/sh is Android mksh. Read argv[0] directly with the
+    # NUL delimiter and a hard timeout. The previous `tr \000 \n | head`
+    # pipeline could survive an engine generation and spin forever on
+    # OriginOS, leaving UID 2000 children behind after the bridge stopped.
+    _identity_name=""
+    IFS= read -r -t 0.25 -d '' _identity_name < "/proc/${'$'}_identity_pid/cmdline" 2>/dev/null || return 1
     [ "${'$'}_identity_name" = "${'$'}_identity_target" ]
 }
 

@@ -2129,6 +2129,28 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         }
     }
 
+    private fun terminateManagedProcessLocked(
+        process: java.lang.Process?,
+        label: String
+    ) {
+        if (process == null || !process.isAlive) return
+        process.destroy()
+        val graceful = runCatching {
+            process.waitFor(MANAGED_PROCESS_GRACEFUL_STOP_MS, TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (graceful) return
+
+        eventLocked("managed_process_force_stop", "label=$label")
+        process.destroyForcibly()
+        val forced = runCatching {
+            process.waitFor(MANAGED_PROCESS_FORCED_STOP_MS, TimeUnit.MILLISECONDS)
+        }.getOrDefault(false)
+        if (!forced) {
+            errorCount += 1
+            eventLocked("managed_process_stop_failed", "label=$label")
+        }
+    }
+
     private fun stopVendorBridgeLocked() {
         vendorBridgeRestartFuture?.cancel(false)
         vendorBridgeRestartFuture = null
@@ -2139,12 +2161,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         vendorBridgeTimeoutSupported = false
         val process = vendorBridgeProcess
         vendorBridgeProcess = null
-        process?.destroy()
-        if (process != null) {
-            runCatching {
-                if (!process.waitFor(500L, TimeUnit.MILLISECONDS)) process.destroyForcibly()
-            }
-        }
+        terminateManagedProcessLocked(process, "vendor_bridge")
         vendorBridgeThread?.interrupt()
         vendorBridgeThread = null
         vendorBridgeShellPid = 0
@@ -5173,6 +5190,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         eventWatcherRestartFuture = null
         eventFastLaneReadyTimeoutFuture?.cancel(false)
         eventFastLaneReadyTimeoutFuture = null
+        val stoppedMode = eventWatcherMode
         eventWatcherAlive = false
         eventFastLaneReady = false
         eventFastLaneBackend = "none"
@@ -5182,7 +5200,7 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         eventWatcherMode = "none"
         val process = eventWatcherProcess
         eventWatcherProcess = null
-        process?.destroy()
+        terminateManagedProcessLocked(process, "event_watcher:$stoppedMode")
         eventWatcherThread?.interrupt()
         eventWatcherThread = null
         eventFastLaneSignalElapsedBySequence.clear()
@@ -10506,6 +10524,8 @@ class PrivilegedGuardianUserService() : IPrivilegedGuardian.Stub() {
         private const val WHATSAPP_PACKAGE = "com.whatsapp"
         private const val SIGNAL_PACKAGE = "org.thoughtcrime.securesms"
         private const val EVENT_WATCHER_RESTART_DELAY_MS = 1_000L
+        private const val MANAGED_PROCESS_GRACEFUL_STOP_MS = 750L
+        private const val MANAGED_PROCESS_FORCED_STOP_MS = 1_500L
         private const val FAST_LANE_READY_TIMEOUT_MS = 3_000L
         private const val VENDOR_BRIDGE_RESTART_DELAY_MS = 1_000L
         private const val VENDOR_BRIDGE_READY_TIMEOUT_MS = 3_000L

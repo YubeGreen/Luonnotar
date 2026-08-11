@@ -136,6 +136,8 @@ class GmsVendorFreezeBridgeTest {
         assertTrue(script.contains("/cgroup.freeze"))
         assertTrue(script.contains("freezer.state"))
         assertTrue(script.contains("pid_matches_target"))
+        assertTrue(script.contains("IFS= read -r -t 0.25 -d '' _identity_name"))
+        assertFalse(script.contains("tr '\\000' '\\n' < \"/proc/${'$'}_identity_pid/cmdline\""))
         assertTrue(script.contains("cmd activity unfreeze \"${'$'}_pid\""))
         assertTrue(script.contains("cmd activity unfreeze --sticky \"${'$'}_pid\""))
         assertTrue(script.contains("cmd activity freeze \"${'$'}_pid\""))
