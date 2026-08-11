@@ -634,6 +634,38 @@ object EmbeddedGuardianManager {
 
         val configured = runCatching { configure(app, generation) }
         if (configured.isFailure) {
+            val configureError = configured.exceptionOrNull()
+            if (EmbeddedHandoffConfigureReconciliationPolicy.shouldAttemptLateReconcile(configureError)) {
+                val reconciledAttempt = reconcileTimedOutHandoffConfigure(
+                    app = app,
+                    generation = generation,
+                    identity = identity,
+                    expectedPing = newPing,
+                    source = source,
+                    originalError = configureError
+                )
+                if (reconciledAttempt > 0) {
+                    LogManager.event(
+                        app,
+                        "embedded_engine_handoff_succeeded",
+                        EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                            mapOf(
+                                "oldRevision" to oldPing.engineRevision,
+                                "newRevision" to newPing.engineRevision,
+                                "oldPid" to oldPing.pid,
+                                "newPid" to newPing.pid,
+                                "verifyAttempt" to verifiedAttempt,
+                                "configureLateReconcileAttempt" to reconciledAttempt
+                            )
+                    )
+                    return HandoffAttempt(
+                        true,
+                        "hot_handoff_late_configure",
+                        oldPing.engineRevision,
+                        newPing.engineRevision
+                    )
+                }
+            }
             LogManager.event(
                 app,
                 "embedded_engine_handoff_failed",
@@ -642,7 +674,7 @@ object EmbeddedGuardianManager {
                         "stage" to "configure",
                         "oldRevision" to oldPing.engineRevision,
                         "newRevision" to newPing.engineRevision,
-                        "error" to configured.exceptionOrNull().toString()
+                        "error" to configureError.toString()
                     )
             )
             return HandoffAttempt(false, "handoff_configure_failed", oldPing.engineRevision, newPing.engineRevision)
@@ -662,6 +694,115 @@ object EmbeddedGuardianManager {
         return HandoffAttempt(true, "hot_handoff", oldPing.engineRevision, newPing.engineRevision)
     }
 
+
+    private fun reconcileTimedOutHandoffConfigure(
+        app: Context,
+        generation: Long,
+        identity: EmbeddedGuardianStore.EndpointIdentity,
+        expectedPing: PingHandshake,
+        source: String,
+        originalError: Throwable?
+    ): Int {
+        val started = SystemClock.elapsedRealtime()
+        val deadline = started + HANDOFF_CONFIGURE_LATE_CONFIRM_WINDOW_MS
+        var attempt = 0
+        var lastError: Throwable? = originalError
+
+        // A read timeout is ambiguous: the server may still be executing the
+        // synchronized configureAndStart() after the client has stopped waiting.
+        // Prove the promoted successor is still the endpoint owner, preserve the
+        // app-side connection as result-unknown, then use only read-only status
+        // probes. Never enqueue a second configure while the first can still hold
+        // the engine lock.
+        runCatching {
+            val ping = validatePing(
+                EmbeddedGuardianClient(
+                    identity.port,
+                    identity.token,
+                    connectTimeoutMs = HANDOFF_CONFIGURE_RECONCILE_RPC_TIMEOUT_MS,
+                    readTimeoutMs = HANDOFF_CONFIGURE_RECONCILE_RPC_TIMEOUT_MS
+                ).ping()
+            )
+            check(ping.pid == expectedPing.pid && ping.engineRevision == expectedPing.engineRevision) {
+                "handoff successor changed while configure result was unknown"
+            }
+            EmbeddedGuardianStore.recordLivePing(
+                app,
+                generation,
+                ping.uid,
+                "configure RPC result unknown after ${originalError?.javaClass?.simpleName}: " +
+                    originalError?.message.orEmpty(),
+                "handoff_configure_timeout"
+            )
+        }.onFailure { lastError = it }
+
+        while (SystemClock.elapsedRealtime() < deadline) {
+            if (!EmbeddedGuardianStore.isGenerationActive(app, generation)) return 0
+            Thread.sleep(HANDOFF_CONFIGURE_LATE_CONFIRM_POLL_MS)
+            attempt += 1
+            val result = runCatching {
+                val client = EmbeddedGuardianClient(
+                    identity.port,
+                    identity.token,
+                    connectTimeoutMs = HANDOFF_CONFIGURE_RECONCILE_RPC_TIMEOUT_MS,
+                    readTimeoutMs = HANDOFF_CONFIGURE_RECONCILE_RPC_TIMEOUT_MS
+                )
+                val ping = validatePing(client.ping())
+                check(ping.pid == expectedPing.pid && ping.engineRevision == expectedPing.engineRevision) {
+                    "handoff successor changed during configure reconciliation"
+                }
+                val status = client.status()
+                check(EmbeddedHandoffConfigureReconciliationPolicy.isFullyConfiguredStatus(status)) {
+                    "handoff configure still pending"
+                }
+                val live = validateStatus(ping, status)
+                check(
+                    EmbeddedGuardianStore.recordLiveHandshake(
+                        app,
+                        generation,
+                        live.uid,
+                        live.status,
+                        "handoff_configure_reconciled"
+                    )
+                ) { "embedded setup superseded" }
+                EmbeddedBackgroundPolicyStore.recordFromEngineStatus(
+                    app,
+                    live.status,
+                    "handoff_configure_reconciled"
+                )
+                EmbeddedGuardianNotifier.cancelRebootReminder(app)
+                LogManager.event(
+                    app,
+                    "embedded_engine_handoff_configure_reconciled",
+                    EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                        mapOf(
+                            "attempt" to attempt,
+                            "lateMs" to (SystemClock.elapsedRealtime() - started),
+                            "pid" to ping.pid,
+                            "engineRevision" to ping.engineRevision,
+                            "statusBytes" to status.length,
+                            "originalError" to originalError.toString()
+                        )
+                )
+                true
+            }
+            if (result.getOrDefault(false)) return attempt
+            lastError = result.exceptionOrNull() ?: lastError
+        }
+
+        LogManager.event(
+            app,
+            "embedded_engine_handoff_configure_reconcile_timeout",
+            EmbeddedGuardianStore.eventFields(EmbeddedGuardianStore.snapshot(app), source) +
+                mapOf(
+                    "pid" to expectedPing.pid,
+                    "engineRevision" to expectedPing.engineRevision,
+                    "attempts" to attempt,
+                    "error" to lastError.toString()
+                )
+        )
+        return 0
+    }
 
     private fun packageReplaceSelfUpdateOwnsRestart(
         app: Context,
@@ -1071,13 +1212,16 @@ object EmbeddedGuardianManager {
     private const val FAST_PING_ATTEMPTS = 3
     private const val FAST_PING_RETRY_DELAY_MS = 150L
     private const val STATUS_READ_TIMEOUT_MS = 8_000
-    private const val CONFIGURE_READ_TIMEOUT_MS = 30_000
+    private const val CONFIGURE_READ_TIMEOUT_MS = 45_000
     private const val OPERATION_READ_TIMEOUT_MS = 30_000
     private const val RECOVERY_REQUEST_TIMEOUT_MS = 10_000
     private const val HANDOFF_REQUEST_TIMEOUT_MS = 55_000
     private const val HANDOFF_PING_TIMEOUT_MS = 750
     private const val HANDOFF_VERIFY_ATTEMPTS = 40
     private const val HANDOFF_VERIFY_DELAY_MS = 200L
+    private const val HANDOFF_CONFIGURE_LATE_CONFIRM_WINDOW_MS = 15_000L
+    private const val HANDOFF_CONFIGURE_LATE_CONFIRM_POLL_MS = 500L
+    private const val HANDOFF_CONFIGURE_RECONCILE_RPC_TIMEOUT_MS = 1_500
     private const val PACKAGE_REPLACE_SELF_UPDATE_PROBES = 13
     private const val PACKAGE_REPLACE_SELF_UPDATE_PROBE_DELAY_MS = 250L
     private const val LEGACY_RETIRE_VERIFY_ATTEMPTS = 12
