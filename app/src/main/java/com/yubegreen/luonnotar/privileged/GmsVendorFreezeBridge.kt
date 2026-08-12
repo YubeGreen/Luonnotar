@@ -286,6 +286,24 @@ internal object GmsVendorDefensePolicy {
     // release commands. The higher-level guardian then owns escalation.
     const val GENERATION_NO_THAW_FAILURE_LIMIT = 2
 
+    // r305: keep immediate recovery on a fresh WhatsApp / Signal freeze edge,
+    // but stop spending an equivalent burst every 15 seconds when OriginOS
+    // repeatedly refuses the same thaw. Backoff is scoped to one continuous
+    // frozen episode and resets immediately after an observed thaw.
+    const val SINGLE_TARGET_MIN_RETRY_CENTISECONDS = 150L
+    const val SINGLE_TARGET_FAILURES_PER_BURST = 2
+    val SINGLE_TARGET_BACKOFF_CENTISECONDS = longArrayOf(
+        3_000L,
+        6_000L,
+        12_000L,
+        30_000L
+    )
+
+    fun singleTargetBackoffCentiseconds(level: Int): Long =
+        SINGLE_TARGET_BACKOFF_CENTISECONDS[
+            level.coerceIn(1, SINGLE_TARGET_BACKOFF_CENTISECONDS.size) - 1
+        ]
+
     // r269: a physical thaw cannot preserve an MCS socket that OriginOS has
     // already removed. Rebuild transport at the freeze edge instead of waiting
     // 12 seconds for the legacy stable-hold pulse. The pulse itself is
@@ -351,6 +369,30 @@ internal object GmsVendorFreezeBridgeScript {
             .replace("@PERSISTENT@", shellQuote(if (monitorGms) "com.google.android.gms.persistent" else ""))
             .replace("@WHATSAPP@", shellQuote(if (monitorWhatsApp) "com.whatsapp" else ""))
             .replace("@SIGNAL@", shellQuote(if (monitorSignal) "org.thoughtcrime.securesms" else ""))
+            .replace(
+                "@SINGLE_MIN_RETRY_CS@",
+                GmsVendorDefensePolicy.SINGLE_TARGET_MIN_RETRY_CENTISECONDS.toString()
+            )
+            .replace(
+                "@SINGLE_FAILURE_LIMIT@",
+                GmsVendorDefensePolicy.SINGLE_TARGET_FAILURES_PER_BURST.toString()
+            )
+            .replace(
+                "@SINGLE_BACKOFF_1_CS@",
+                GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(1).toString()
+            )
+            .replace(
+                "@SINGLE_BACKOFF_2_CS@",
+                GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(2).toString()
+            )
+            .replace(
+                "@SINGLE_BACKOFF_3_CS@",
+                GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(3).toString()
+            )
+            .replace(
+                "@SINGLE_BACKOFF_4_CS@",
+                GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(4).toString()
+            )
             .trimIndent() + "\n"
     }
 
@@ -368,6 +410,12 @@ sticky_enabled=@STICKY@
 has_timeout_command=0
 sequence=0
 recovery_command_count=0
+single_recovery_min_interval_cs=@SINGLE_MIN_RETRY_CS@
+single_recovery_failure_limit=@SINGLE_FAILURE_LIMIT@
+single_recovery_backoff_1_cs=@SINGLE_BACKOFF_1_CS@
+single_recovery_backoff_2_cs=@SINGLE_BACKOFF_2_CS@
+single_recovery_backoff_3_cs=@SINGLE_BACKOFF_3_CS@
+single_recovery_backoff_4_cs=@SINGLE_BACKOFF_4_CS@
 heartbeat_due_cs=0
 storm_until_cs=0
 aux_due_cs=0
@@ -472,6 +520,7 @@ whatsapp_last_state="disabled"
 whatsapp_last_recovery_cs=0
 whatsapp_failures=0
 whatsapp_cooldown_until_cs=0
+whatsapp_backoff_level=0
 signal_pid=0
 signal_file=""
 signal_path=""
@@ -479,6 +528,7 @@ signal_last_state="disabled"
 signal_last_recovery_cs=0
 signal_failures=0
 signal_cooldown_until_cs=0
+signal_backoff_level=0
 
 rm -rf "${'$'}base"
 mkdir -p "${'$'}base" || exit 70
@@ -1852,34 +1902,57 @@ inspect_single() {
     eval '_last_recovery_cs=${'$'}'"${'$'}{_slot}"'_last_recovery_cs'
     eval '_failures=${'$'}'"${'$'}{_slot}"'_failures'
     eval '_cooldown_until_cs=${'$'}'"${'$'}{_slot}"'_cooldown_until_cs'
+    eval '_backoff_level=${'$'}'"${'$'}{_slot}"'_backoff_level'
     refresh_slot "${'$'}_slot" "${'$'}_target"
     eval '_pid=${'$'}'"${'$'}{_slot}"'_pid'; eval '_path=${'$'}'"${'$'}{_slot}"'_path'; eval '_state=${'$'}'"${'$'}{_slot}"'_state'
     CURRENT_STATE="${'$'}_state"
     if [ "${'$'}_state" = "frozen" ]; then
-        storm_until_cs=${'$'}((NOW_CS + 1000)); _consecutive=${'$'}((_failures + 1)); _due=0
-        if [ "${'$'}NOW_CS" -ge "${'$'}_cooldown_until_cs" ] && { [ "${'$'}_last_recovery_cs" -eq 0 ] || [ ${'$'}((NOW_CS - _last_recovery_cs)) -ge 80 ]; }; then _due=1; fi
+        # A newly observed physical freeze edge gets a fresh immediate burst.
+        # Adaptive backoff only applies while the same frozen episode persists.
         if [ "${'$'}_last_state" != "frozen" ]; then
+            _failures=0
+            _backoff_level=0
+            _cooldown_until_cs=0
+            _last_recovery_cs=0
             sequence=${'$'}((sequence + 1))
-            printf '__LUONNOTAR_VENDOR_BRIDGE_FROZEN__\tseq=%s\ttarget=%s\tpid=%s\tpath=%s\tconsecutive=%s\n' "${'$'}sequence" "${'$'}_target" "${'$'}_pid" "${'$'}_path" "${'$'}_consecutive"
+            printf '__LUONNOTAR_VENDOR_BRIDGE_FROZEN__\tseq=%s\ttarget=%s\tpid=%s\tpath=%s\tconsecutive=%s\n' "${'$'}sequence" "${'$'}_target" "${'$'}_pid" "${'$'}_path" 1
         fi
+        storm_until_cs=${'$'}((NOW_CS + 1000)); _consecutive=${'$'}((_failures + 1)); _due=0
+        if [ "${'$'}NOW_CS" -ge "${'$'}_cooldown_until_cs" ] && { [ "${'$'}_last_recovery_cs" -eq 0 ] || [ ${'$'}((NOW_CS - _last_recovery_cs)) -ge "${'$'}single_recovery_min_interval_cs" ]; }; then _due=1; fi
         if [ "${'$'}_due" -eq 1 ]; then
             recover_single "${'$'}_target" "${'$'}_pid" "${'$'}_path" "${'$'}_consecutive"
             read_uptime_cs; _last_recovery_cs="${'$'}NOW_CS"
-            if [ "${'$'}RECOVERY_VERIFIED" -eq 1 ]; then _failures=0; _last_state="thawed"; CURRENT_STATE="thawed"
+            if [ "${'$'}RECOVERY_VERIFIED" -eq 1 ]; then
+                _failures=0; _backoff_level=0; _cooldown_until_cs=0
+                _last_state="thawed"; CURRENT_STATE="thawed"
             else
                 _failures=${'$'}((_failures + 1)); _last_state="frozen"
-                if [ "${'$'}_failures" -ge 3 ]; then
-                    _cooldown_until_cs=${'$'}((NOW_CS + 1500))
-                    printf '__LUONNOTAR_VENDOR_BRIDGE_LOCK__\tseq=%s\ttarget=%s\tpid=%s\tfailures=%s\tcooldownCs=%s\n' "${'$'}sequence" "${'$'}_target" "${'$'}_pid" "${'$'}_failures" 1500
+                if [ "${'$'}_failures" -ge "${'$'}single_recovery_failure_limit" ]; then
+                    _backoff_level=${'$'}((_backoff_level + 1))
+                    [ "${'$'}_backoff_level" -le 4 ] || _backoff_level=4
+                    case "${'$'}_backoff_level" in
+                        1) _cooldown_cs="${'$'}single_recovery_backoff_1_cs" ;;
+                        2) _cooldown_cs="${'$'}single_recovery_backoff_2_cs" ;;
+                        3) _cooldown_cs="${'$'}single_recovery_backoff_3_cs" ;;
+                        *) _cooldown_cs="${'$'}single_recovery_backoff_4_cs" ;;
+                    esac
+                    _cooldown_until_cs=${'$'}((NOW_CS + _cooldown_cs))
+                    printf '__LUONNOTAR_VENDOR_BRIDGE_LOCK__\tseq=%s\ttarget=%s\tpid=%s\tfailures=%s\tcooldownCs=%s\n' "${'$'}sequence" "${'$'}_target" "${'$'}_pid" "${'$'}_failures" "${'$'}_cooldown_cs"
+                    printf '__LUONNOTAR_VENDOR_BRIDGE_DIAG__\ttype=single_recovery_backoff\tdetail=target_%s_pid_%s_level_%s_cooldownCs_%s\n' "${'$'}_target" "${'$'}_pid" "${'$'}_backoff_level" "${'$'}_cooldown_cs"
                     _failures=0
                 fi
             fi
         else _last_state="frozen"; fi
     else
-        [ "${'$'}_state" = "thawed" ] && _failures=0
+        if [ "${'$'}_state" = "thawed" ]; then
+            _failures=0
+            _backoff_level=0
+            _cooldown_until_cs=0
+            _last_recovery_cs=0
+        fi
         _last_state="${'$'}_state"
     fi
-    eval "${'$'}{_slot}_last_state='${'$'}_last_state'"; eval "${'$'}{_slot}_last_recovery_cs=${'$'}_last_recovery_cs"; eval "${'$'}{_slot}_failures=${'$'}_failures"; eval "${'$'}{_slot}_cooldown_until_cs=${'$'}_cooldown_until_cs"
+    eval "${'$'}{_slot}_last_state='${'$'}_last_state'"; eval "${'$'}{_slot}_last_recovery_cs=${'$'}_last_recovery_cs"; eval "${'$'}{_slot}_failures=${'$'}_failures"; eval "${'$'}{_slot}_cooldown_until_cs=${'$'}_cooldown_until_cs"; eval "${'$'}{_slot}_backoff_level=${'$'}_backoff_level"
 }
 
 write_heartbeat_once() {

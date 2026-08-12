@@ -262,4 +262,14 @@ class GmsVendorFreezeBridgeTest {
             baseRoot = "/tmp/x;rm -rf /"
         )
     }
+    @Test
+    fun `single target retry backoff grows and caps at five minutes`() {
+        assertEquals(3_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(1))
+        assertEquals(6_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(2))
+        assertEquals(12_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(3))
+        assertEquals(30_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(4))
+        assertEquals(30_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(99))
+        assertEquals(3_000L, GmsVendorDefensePolicy.singleTargetBackoffCentiseconds(0))
+    }
+
 }
