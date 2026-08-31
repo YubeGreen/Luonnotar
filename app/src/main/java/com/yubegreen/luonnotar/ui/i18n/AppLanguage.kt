@@ -475,7 +475,66 @@ private object EnglishCatalog {
         "功能已启用 · 引擎未运行" to "Feature enabled · engine not running",
         "内置特权引擎已连接" to "Embedded privileged engine connected",
         "停止并关闭内置特权引擎" to "Stop and disable embedded privileged engine",
-        "关闭内置特权引擎功能" to "Disable embedded privileged engine feature"
+        "关闭内置特权引擎功能" to "Disable embedded privileged engine feature",
+        "STALE · 会话绑定仍有效，但需重新核验目标 UID" to "STALE · session binding is still valid, but target UIDs must be re-verified",
+        "开启 · 全局阻断 · ADB 导入证据" to "On · global blocking · ADB-imported evidence",
+        "关闭 · 拆分隧道兼容 · ADB 导入证据" to "Off · split-tunnel compatible · ADB-imported evidence",
+        "状态机" to "State machine",
+        "支持的 VPN" to "Supported VPNs",
+        "当前 VPN Provider" to "Current VPN provider",
+        "未知 · 当前 Android 版本未公开受支持 Provider 所有者" to "Unknown · this Android version does not expose the supported provider owner",
+        "Tailscale 引擎" to "Tailscale engine",
+        " · Tailscale Exit Node 路径存在" to " · Tailscale Exit Node route present",
+        "IQOO_COOPERATIVE · 厂商协作策略 · 静默 120 秒" to "IQOO_COOPERATIVE · vendor-cooperative policy · 120 s quiet period",
+        "CPU / Wi-Fi 锁" to "CPU / Wi-Fi locks",
+        "正常" to "Healthy",
+        "需关注 / 尚未验证" to "Needs attention / unverified",
+        "暂无详细诊断数据" to "No detailed diagnostic data yet",
+        "停止指令发送失败；权威状态已关闭，服务将在 5 秒内自停" to "Stop command failed to send; authoritative state is disabled and the service will stop itself within 5 seconds",
+        "已应用 iQOO 自适应可靠性模式：默认启用息屏 CPU Guard，保留 120 秒网络静默；Wi-Fi Lock 与周期探测保持独立" to "Applied iQOO adaptive reliability mode: screen-off CPU Guard is enabled by default, with a 120-second network quiet period; Wi-Fi Lock and periodic probes remain independent",
+        "努昂诺塔会分别记录 Device Idle、PID 重建、CPU 挂起估算、定时器漂移、VPN/Wi-Fi 与开机广播证据。" to "Luonnotar separately records Device Idle, PID rebuilds, estimated CPU suspend time, timer drift, VPN/Wi-Fi evidence, and boot-broadcast evidence.",
+        "静态背景与主题切换只在界面进程生效，守护服务不受影响" to "Static backgrounds and theme changes affect only the UI process; the guardian service is unaffected",
+        "正在向 shell 引擎提交 GMS 深度恢复；引擎保持在线并在后台验证" to "Submitting GMS deep recovery to the shell engine; the engine remains online and verifies the result in the background",
+        "设置已保存，但内置 Shell 引擎同步失败：" to "Settings saved, but syncing to the embedded Shell engine failed:",
+        "设置已保存；当前没有可同步的特权引擎：" to "Settings saved; there is currently no privileged engine available to sync:",
+        "关闭 GMS Binder Anchor" to "Disable GMS Binder Anchor",
+        "开启极限保活，核心操作" to "Enable Extreme Keepalive, core control",
+        "核心守护默认启用息屏 CPU 保活；" to "The core guardian enables screen-off CPU keepalive by default;",
+        "Wi-Fi Lock 与网络探测仍可独立控制。" to "Wi-Fi Lock and network probes remain independently configurable.",
+        "ADB 一次性验证固定禁用持续锁和主动探测。" to "One-shot ADB verification always disables persistent locks and active probes.",
+        "深色，已选择，少偶背景固定主题" to "Dark, selected, fixed theme for the Shao Ou background",
+        "所选图片过大" to "Selected image is too large",
+        "所选图片为空" to "Selected image is empty",
+        "系统未授予所选图片的读取权限" to "The system did not grant read access to the selected image",
+        "无法识别所选图片" to "Could not recognize the selected image",
+        "图片解码失败" to "Image decoding failed",
+        "背景图片保存失败" to "Failed to save the background image",
+        "无法清理背景备份" to "Could not clean up the background backup",
+        "无法备份旧背景" to "Could not back up the previous background",
+        "Shizuku/Sui 未运行" to "Shizuku/Sui is not running",
+        "需要授予 Shizuku 权限" to "Shizuku permission is required",
+        "请先开启 Privileged Guardian" to "Enable Privileged Guardian first",
+        "Privileged Guardian 未连接" to "Privileged Guardian is not connected",
+        "Keeper 硬恢复已停止：旧进程仍存活且近端重试已达上限" to "Keeper hard recovery stopped: the old process is still alive and the short-term retry limit has been reached",
+        "当前是不精确闹钟；Android 12+ 需要点按通知才能恢复守护服务" to "The current alarm is inexact; on Android 12+ you must tap the notification to restore the guardian service",
+        "恢复链中断：下一次自检闹钟安排失败" to "Recovery chain interrupted: failed to schedule the next self-check alarm",
+        "HTTPS 探测已卡死，但系统无法可靠安排近端恢复；已取消 Keeper 自杀" to "The HTTPS probe is stuck, but the system cannot reliably schedule short-term recovery; Keeper self-termination was cancelled",
+        "无法安全重启 Keeper" to "Keeper cannot be restarted safely",
+        "HTTPS/DNS 探测已卡死，但精确近端恢复不可用；努昂诺塔已取消进程自杀，请打开应用检查精确闹钟与恢复设置。" to "HTTPS/DNS probes are stuck, but exact short-term recovery is unavailable; Luonnotar cancelled process self-termination. Open the app and check exact-alarm and recovery settings.",
+        "Google Play 服务可用 · 普通 APK 无权读取 WhatsApp/GMS 私有 token 或 socket" to "Google Play services available · a normal APK cannot read private WhatsApp/GMS tokens or sockets",
+        "未安装 Google Play 服务 · 无可用 Google FCM 环境" to "Google Play services not installed · no usable Google FCM environment",
+        "未知厂商" to "Unknown vendor",
+        " · ADB 白名单 " to " · ADB allowlist ",
+        " · 命令失败 " to " · command failed ",
+        " · 厂商私有层仍需确认" to " · vendor-private layer still requires confirmation",
+        " · 标准策略已验证" to " · standard policy verified",
+        "已尝试写入 HyperOS/MIUI 的隐藏开机广播、后台自启动 AppOp；HyperOS 3 还会合并 cloud_lowlatency_whitelist。若私有能力未验证，仍需在系统设置中手动开启“后台自启动”和“省电策略：无限制”。" to "Attempted to configure HyperOS/MIUI hidden boot broadcasts and background-autostart AppOps; HyperOS 3 also merges cloud_lowlatency_whitelist. If private capabilities cannot be verified, manually enable Background autostart and Battery saver: Unrestricted in system settings.",
+        "ADB 标准层已自动处理；OriginOS/iQOO 的后台高耗电、允许后台运行和自启动属于厂商私有层，需要在 i 管家或应用设置中确认。" to "The standard ADB layer has been handled automatically; OriginOS/iQOO background high-power use, background operation, and autostart are vendor-private controls that must be confirmed in iManager or app settings.",
+        "ADB 标准层已自动处理；ColorOS/OxygenOS/realme UI 的自启动、关联启动和后台耗电管理属于厂商私有层，需要在系统设置中确认。" to "The standard ADB layer has been handled automatically; ColorOS/OxygenOS/realme UI autostart, linked launch, and background power management are vendor-private controls that must be confirmed in system settings.",
+        "ADB 标准层已自动处理；EMUI/MagicOS 的应用启动管理属于厂商私有层，需要关闭自动管理并允许后台活动。" to "The standard ADB layer has been handled automatically; EMUI/MagicOS app launch management is vendor-private. Disable automatic management and allow background activity.",
+        "ADB 标准层已自动处理；One UI 的深度休眠应用和后台使用限制仍需在电池设置中确认。" to "The standard ADB layer has been handled automatically; One UI Deep sleeping apps and background-usage restrictions still need to be checked in battery settings.",
+        "设备未检测到额外厂商冻结层；以已验证的 Android 标准策略为准。" to "No additional vendor freeze layer was detected; use the verified standard Android policy.",
+        "已应用并验证 Android 标准策略；未识别到可安全写入的厂商私有白名单接口。" to "The standard Android policy has been applied and verified; no vendor-private allowlist interface that can be safely modified was identified."
     )
 
     private val dynamicRules = listOf(
@@ -485,7 +544,7 @@ private object EnglishCatalog {
         Regex("^上次成功 (.+) · 连续失败 (.+)$") to { m: MatchResult -> "Last success ${m.groupValues[1]} · Consecutive failures ${m.groupValues[2]}" },
         Regex("^最近成功 VPN-only 204：(.+)$") to { m: MatchResult -> "Most recent successful VPN-only 204: ${m.groupValues[1]}" },
         Regex("^默认 VPN：(.+)$") to { m: MatchResult -> "Default VPN: ${m.groupValues[1]}" },
-        Regex("^背景导入失败：(.+)$") to { m: MatchResult -> "Background import failed: ${m.groupValues[1]}" },
+        Regex("^背景导入失败：(.+)$") to { m: MatchResult -> "Background import failed: ${translate(m.groupValues[1])}" },
         Regex("^系统拒绝恢复守护服务：(.+)$") to { m: MatchResult -> "System refused to restore guardian service: ${m.groupValues[1]}" },
         Regex("^运行中 · PID (.+)$") to { m: MatchResult -> "Running · PID ${m.groupValues[1]}" },
         Regex("^(.+) · 服务心跳缺失$") to { m: MatchResult -> "${translate(m.groupValues[1])} · service heartbeat missing" },
@@ -558,11 +617,29 @@ private object EnglishCatalog {
         Regex("^(.+)。点击继续，开启无线调试后可在通知栏输入配对码。$") to { m: MatchResult -> "${translate(m.groupValues[1])}. Tap to continue; after enabling Wireless debugging, enter the pairing code from the notification." }
     )
 
+    private val partialEntries by lazy {
+        exact.entries.sortedByDescending { it.key.length }
+    }
+
     fun translate(source: String): String {
         exact[source]?.let { return it }
         dynamicRules.forEach { (regex, transform) ->
             regex.matchEntire(source)?.let { return transform(it) }
         }
-        return source
+
+        // Paragraphs in the current UI are often assembled from several Chinese
+        // fragments before localization. Translate known fragments longest-first
+        // so English mode does not leak joined Chinese text.
+        var translated = source
+        partialEntries.forEach { (zh, en) ->
+            if (translated.contains(zh)) {
+                val replacement = if (
+                    zh.lastOrNull() in setOf('，', '；', '。', '：', '！', '？') &&
+                    en.lastOrNull()?.isWhitespace() != true
+                ) "$en " else en
+                translated = translated.replace(zh, replacement)
+            }
+        }
+        return translated.trimEnd()
     }
 }

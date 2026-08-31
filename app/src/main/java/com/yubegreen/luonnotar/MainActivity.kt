@@ -3727,8 +3727,9 @@ class MainActivity : AppCompatActivity() {
             previous.animate().cancel()
             (previous.parent as? ViewGroup)?.removeView(previous)
         }
+        val localizedMessage = UiText.localize(this, message) ?: message
         val messageView = TextView(this).apply {
-            text = message
+            text = localizedMessage
             textSize = 14f
             setTextColor(palette().foreground)
             setPadding(dp(18), dp(14), dp(18), dp(14))
@@ -3754,7 +3755,7 @@ class MainActivity : AppCompatActivity() {
             scaleX = 0.97f
             scaleY = 0.97f
             importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_YES
-            contentDescription = message
+            contentDescription = localizedMessage
         }
         val navigationInset = ViewCompat.getRootWindowInsets(rootContainer)
             ?.getInsets(WindowInsetsCompat.Type.navigationBars())
@@ -3774,7 +3775,7 @@ class MainActivity : AppCompatActivity() {
         transientNotice = notice
         notice.post {
             notice.refreshBackdrop()
-            notice.announceForAccessibility(UiText.localize(this, message))
+            notice.announceForAccessibility(localizedMessage)
             notice.animate()
                 .alpha(1f)
                 .translationY(0f)
