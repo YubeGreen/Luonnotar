@@ -26,6 +26,9 @@ import com.yubegreen.luonnotar.R
 import com.yubegreen.luonnotar.service.FcmGuardianService
 import com.yubegreen.luonnotar.service.GuardianStatusClient
 import com.yubegreen.luonnotar.ui.motion.GuardianActionButton
+import com.yubegreen.luonnotar.ui.i18n.AppLanguage
+import com.yubegreen.luonnotar.ui.i18n.AppLanguageStore
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.ui.visual.AdaptiveLayout
 import com.yubegreen.luonnotar.ui.visual.AdaptiveMaxWidthLinearLayout
 import com.yubegreen.luonnotar.ui.visual.BackgroundPreference
@@ -81,6 +84,29 @@ class PolicyActivity : AppCompatActivity() {
             maximumWidthPx = AdaptiveLayout.contentMaximumWidthPx(this@PolicyActivity)
             setPadding(dp(contentEdge), dp(if (tablet) 28 else 16), dp(contentEdge), dp(18))
         }
+        column.addView(text("语言 / Language", if (tablet) 15f else 12f, colors.second, false).apply {
+            setPadding(dp(2), 0, dp(2), dp(6))
+        })
+        val languageRow = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+        val currentLanguage = AppLanguageStore.current(this)
+        val chineseButton = button("简体中文", colors.first) { changeLanguage(AppLanguage.CHINESE) }
+        val englishButton = button("English", colors.first) { changeLanguage(AppLanguage.ENGLISH) }
+        styleLanguageButton(chineseButton, currentLanguage == AppLanguage.CHINESE)
+        styleLanguageButton(englishButton, currentLanguage == AppLanguage.ENGLISH)
+        languageRow.addView(
+            chineseButton,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginEnd = dp(5) }
+        )
+        languageRow.addView(
+            englishButton,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { marginStart = dp(5) }
+        )
+        column.addView(
+            languageRow,
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply {
+                bottomMargin = dp(14)
+            }
+        )
         column.addView(LinearLayout(this).apply {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
@@ -90,10 +116,13 @@ class PolicyActivity : AppCompatActivity() {
             }, LinearLayout.LayoutParams(dp(54), dp(54)).apply { marginEnd = dp(14) })
             addView(LinearLayout(this@PolicyActivity).apply {
                 orientation = LinearLayout.VERTICAL
-                addView(text("努昂诺塔", if (tablet) 31f else 25f, colors.first, true))
+                addView(text(tr("努昂诺塔", "Luonnotar"), if (tablet) 31f else 25f, colors.first, true))
                 addView(
                     text(
-                        "首次启动政策告示 · v${PolicyManager.VERSION}",
+                        tr(
+                            "首次启动政策告示 · v${PolicyManager.VERSION}",
+                            "First-launch policy notice · v${PolicyManager.VERSION}"
+                        ),
                         if (tablet) 16f else 13f,
                         colors.second,
                         false
@@ -137,7 +166,10 @@ class PolicyActivity : AppCompatActivity() {
         column.addView(policyScroll, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f))
 
         readHint = text(
-            "请滑动阅读至末尾后确认。政策更新时会重新要求确认。",
+            tr(
+                "请滑动阅读至末尾后确认。政策更新时会重新要求确认。",
+                "Scroll to the end before confirming. You will be asked again when the policy changes."
+            ),
             if (tablet) 15f else 12f,
             colors.second,
             false
@@ -146,7 +178,7 @@ class PolicyActivity : AppCompatActivity() {
         }
         column.addView(readHint)
         check = AppCompatCheckBox(this).apply {
-            text = "我已阅读并同意《努昂诺塔使用政策与隐私说明》"
+            text = tr("我已阅读并同意《努昂诺塔使用政策与隐私说明》", "I have read and agree to the Luonnotar Terms of Use and Privacy Notice")
             textSize = if (tablet) 16f else 13f
             setTextColor(colors.first)
             isChecked = restoredChecked
@@ -154,10 +186,10 @@ class PolicyActivity : AppCompatActivity() {
         }
         column.addView(check)
         val actions = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
-        actions.addView(button("不同意并退出", colors.first) { rejectAndExit() }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
+        actions.addView(button(tr("不同意并退出", "Disagree and exit"), colors.first) { rejectAndExit() }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply {
             marginEnd = dp(5)
         })
-        agree = button("同意并继续", colors.first) {
+        agree = button(tr("同意并继续", "Agree and continue"), colors.first) {
             PolicyManager.accept(this)
             continueToMain()
         }
@@ -272,7 +304,7 @@ class PolicyActivity : AppCompatActivity() {
         readToEnd = readToEnd || reached
         if (newlyReached) {
             scrollView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
-            scrollView.announceForAccessibility("政策已阅读至末尾，现在可以勾选同意。")
+            scrollView.announceForAccessibility(tr("政策已阅读至末尾，现在可以勾选同意。", "You have reached the end of the policy. You can now tick the agreement box."))
         }
         refreshAgreement()
     }
@@ -282,13 +314,19 @@ class PolicyActivity : AppCompatActivity() {
         check.isEnabled = readToEnd
         agree.isEnabled = readToEnd && check.isChecked
         agree.alpha = if (agree.isEnabled) 1f else 0.42f
-        agree.contentDescription =
-            if (agree.isEnabled) "同意并继续" else "请先阅读至末尾并勾选同意"
+        agree.contentDescription = if (agree.isEnabled) {
+            tr("同意并继续", "Agree and continue")
+        } else {
+            tr("请先阅读至末尾并勾选同意", "Read to the end and tick the agreement box first")
+        }
         if (::readHint.isInitialized) {
             readHint.text = if (readToEnd) {
-                "已阅读至末尾，可以勾选确认。"
+                tr("已阅读至末尾，可以勾选确认。", "You have reached the end. You can now tick the agreement box.")
             } else {
-                "请滑动阅读至末尾后确认。政策更新时会重新要求确认。"
+                tr(
+                    "请滑动阅读至末尾后确认。政策更新时会重新要求确认。",
+                    "Scroll to the end before confirming. You will be asked again when the policy changes."
+                )
             }
         }
     }
@@ -331,14 +369,14 @@ class PolicyActivity : AppCompatActivity() {
     }
 
     private fun text(value: String, size: Float, color: Int, bold: Boolean) = TextView(this).apply {
-        text = value
+        text = UiText.localize(this@PolicyActivity, value)
         textSize = size
         setTextColor(color)
         if (bold) typeface = android.graphics.Typeface.DEFAULT_BOLD
     }
 
     private fun button(label: String, color: Int, action: () -> Unit) = GuardianActionButton(this).apply {
-        text = label
+        text = UiText.localize(this@PolicyActivity, label)
         isAllCaps = false
         textSize = if (AdaptiveLayout.isTablet(this@PolicyActivity)) 16.5f else 13f
         minHeight = dp(if (AdaptiveLayout.isTablet(this@PolicyActivity)) 56 else 48)
@@ -347,6 +385,26 @@ class PolicyActivity : AppCompatActivity() {
         background = LiquidGlassDrawable(this@PolicyActivity, dp(17).toFloat(), usesImageContrast())
         if (::visualBackground.isInitialized) bindGlassBackground(visualBackground)
         setOnClickListener { action() }
+    }
+
+    private fun tr(zh: String, en: String): String =
+        UiText.choose(this, zh, en).toString()
+
+    private fun changeLanguage(language: AppLanguage) {
+        if (AppLanguageStore.current(this) == language) return
+        AppLanguageStore.set(this, language)
+        recreate()
+    }
+
+    private fun styleLanguageButton(button: GuardianActionButton, selected: Boolean) {
+        button.isSelected = selected
+        button.typeface = if (selected) {
+            android.graphics.Typeface.DEFAULT_BOLD
+        } else {
+            android.graphics.Typeface.DEFAULT
+        }
+        (button.background as? LiquidGlassDrawable)?.setSelected(selected)
+        button.alpha = if (selected) 1f else 0.78f
     }
 
     private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()

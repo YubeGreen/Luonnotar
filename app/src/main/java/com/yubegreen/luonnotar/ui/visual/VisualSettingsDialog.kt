@@ -8,6 +8,9 @@ import android.view.View
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.yubegreen.luonnotar.ui.motion.GuardianActionButton
+import com.yubegreen.luonnotar.ui.i18n.AppLanguage
+import com.yubegreen.luonnotar.ui.i18n.AppLanguageStore
+import com.yubegreen.luonnotar.ui.i18n.UiText
 
 class VisualSettingsDialog(
     context: Context,
@@ -15,17 +18,19 @@ class VisualSettingsDialog(
     visualBackground: VisualBackgroundView?,
     anchorView: View?,
     private val onCustomRequested: (ThemePreference, BackgroundScale) -> Unit,
-    private val onApply: (ThemePreference, BackgroundPreference, BackgroundScale) -> Unit
+    private val onApply: (ThemePreference, BackgroundPreference, BackgroundScale, AppLanguage) -> Unit
 ) : GlassSheetDialog(context, current, visualBackground, anchorView) {
     private val tabletDialog = AdaptiveLayout.isTablet(context)
     private val dark = context.resources.configuration.uiMode and Configuration.UI_MODE_NIGHT_MASK ==
         Configuration.UI_MODE_NIGHT_YES
     private val foreground = palette.foreground
     private val secondary = palette.secondary
+    private val languageButtons = linkedMapOf<AppLanguage, GuardianActionButton>()
     private val themeButtons = linkedMapOf<ThemePreference, GuardianActionButton>()
     private val backgroundButtons = linkedMapOf<BackgroundPreference, GuardianActionButton>()
     private val scaleButtons = linkedMapOf<BackgroundScale, GuardianActionButton>()
     private lateinit var customHint: TextView
+    private var selectedLanguage = AppLanguageStore.current(context)
     private var selectedTheme =
         if (current.background == BackgroundPreference.SHAO_OU) ThemePreference.DARK else current.theme
     private var selectedBackground = current.background
@@ -39,6 +44,17 @@ class VisualSettingsDialog(
     private fun buildContent() {
         content.addView(label("外观", if (tabletDialog) 25f else 20f, true))
         content.addView(label("所有背景均保持静态，不影响后台守护", if (tabletDialog) 17f else 13f, false))
+        content.addView(sectionCaption("语言 / Language"))
+        content.addView(optionRow(
+            listOf(
+                AppLanguage.CHINESE to "简体中文",
+                AppLanguage.ENGLISH to "English"
+            ),
+            languageButtons
+        ) {
+            selectedLanguage = it
+            refreshSelection()
+        })
         content.addView(sectionCaption("界面主题"))
         content.addView(optionRow(
             listOf(
@@ -95,7 +111,7 @@ class VisualSettingsDialog(
         actions.addView(button("应用", emphasized = true).apply {
             setOnClickListener {
                 dismissThen {
-                    onApply(selectedTheme, selectedBackground, selectedScale)
+                    onApply(selectedTheme, selectedBackground, selectedScale, selectedLanguage)
                 }
             }
         }, weightedParams(false))
@@ -110,7 +126,7 @@ class VisualSettingsDialog(
         orientation = LinearLayout.HORIZONTAL
         options.forEachIndexed { index, (value, title) ->
             val option = optionButton(title).apply { setOnClickListener { onSelect(value) } }
-            option.tag = title
+            option.tag = UiText.localize(context, title).toString()
             target[value] = option
             addView(option, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply {
                 if (index > 0) marginStart = dp(4)
@@ -120,14 +136,20 @@ class VisualSettingsDialog(
     }
 
     private fun refreshSelection() {
+        languageButtons.forEach { (value, button) ->
+            styleButton(button, value == selectedLanguage)
+        }
         val themeEnabled = selectedBackground != BackgroundPreference.SHAO_OU
         themeButtons.forEach { (value, button) ->
             styleButton(button, value == selectedTheme)
             button.isEnabled = themeEnabled
             if (!themeEnabled) {
                 button.contentDescription =
-                    if (value == ThemePreference.DARK) "深色，已选择，少偶背景固定主题"
-                    else "${button.tag}，少偶背景下不可用"
+                    if (value == ThemePreference.DARK) {
+                        UiText.choose(context, "深色，已选择，少偶背景固定主题", "Dark, selected; Shao Ou uses a fixed theme")
+                    } else {
+                        UiText.choose(context, "${button.tag}，少偶背景下不可用", "${button.tag}, unavailable with Shao Ou background")
+                    }
             }
         }
         backgroundButtons.forEach { (value, button) -> styleButton(button, value == selectedBackground) }
@@ -149,7 +171,11 @@ class VisualSettingsDialog(
         val baseLabel = button.tag?.toString() ?: button.text.toString().removePrefix("✓ ")
         button.isSelected = selected
         button.contentDescription =
-            "$baseLabel，${if (selected) "已选择" else "未选择"}"
+            if (AppLanguageStore.isEnglish(context)) {
+                "$baseLabel, ${if (selected) "selected" else "not selected"}"
+            } else {
+                "$baseLabel，${if (selected) "已选择" else "未选择"}"
+            }
         button.text = if (selected) "✓ $baseLabel" else baseLabel
         button.typeface = if (selected) Typeface.DEFAULT_BOLD else Typeface.DEFAULT
         button.setTextColor(
@@ -167,7 +193,7 @@ class VisualSettingsDialog(
     }
 
     private fun label(text: String, size: Float, bold: Boolean) = TextView(context).apply {
-        this.text = text
+        this.text = UiText.localize(context, text)
         textSize = size
         setTextColor(
             if (size >= 18f) this@VisualSettingsDialog.foreground
@@ -185,7 +211,7 @@ class VisualSettingsDialog(
     }
 
     private fun optionButton(text: String) = GuardianActionButton(context).apply {
-        this.text = text
+        this.text = UiText.localize(context, text)
         isAllCaps = false
         textSize = if (tabletDialog) 16.5f else 13f
         minHeight = dp(if (tabletDialog) 56 else 46)

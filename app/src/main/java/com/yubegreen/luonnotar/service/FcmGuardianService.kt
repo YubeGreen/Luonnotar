@@ -62,6 +62,7 @@ import com.yubegreen.luonnotar.notification.NotificationListenerRecoveryCoordina
 import com.yubegreen.luonnotar.privileged.embedded.EmbeddedGuardianSupervisorReceiver
 import com.yubegreen.luonnotar.receiver.GuardianCleanupReceiver
 import com.yubegreen.luonnotar.receiver.LabAlarmScheduler
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
 import java.net.HttpURLConnection
@@ -4657,7 +4658,11 @@ class FcmGuardianService : Service() {
         )
         val paused = prefs.getBoolean(LuonnotarPreferences.KEY_PAUSED, false)
         val pauseAction = if (paused) ACTION_RESUME else ACTION_PAUSE
-        val pauseLabel = if (paused) "继续保活" else "暂停保活"
+        val pauseLabel = if (paused) {
+            UiText.choose(this, "继续保活", "Resume keepalive")
+        } else {
+            UiText.choose(this, "暂停保活", "Pause keepalive")
+        }
         val lockdownText =
             if (!prefs.getBoolean(LuonnotarPreferences.KEY_LOCKDOWN_KNOWN, false)) {
                 "未验证"
@@ -4667,37 +4672,40 @@ class FcmGuardianService : Service() {
                 "关闭（拆分隧道兼容）"
             }
         val style = NotificationCompat.InboxStyle()
-            .addLine("默认 VPN：${if (vpnEvidence.present) "已确认" else "未连接"} · VALIDATED：${yesNo(vpnEvidence.validated)}")
-            .addLine("Lockdown：$lockdownText")
+            .addLine(UiText.localize(this, "默认 VPN：${if (vpnEvidence.present) "已确认" else "未连接"} · VALIDATED：${yesNo(vpnEvidence.validated)}"))
+            .addLine(UiText.localize(this, "Lockdown：$lockdownText"))
             .addLine(
-                "CPU / Wi-Fi 锁：${
-                    yesNo(
-                        (::wakeLock.isInitialized && wakeLock.isHeld) ||
-                            (::scopedWakeLock.isInitialized &&
-                                scopedWakeLock.isHeld)
-                    )
-                } / ${yesNo(::wifiLock.isInitialized && wifiLock.isHeld)}"
+                UiText.localize(
+                    this,
+                    "CPU / Wi-Fi 锁：${
+                        yesNo(
+                            (::wakeLock.isInitialized && wakeLock.isHeld) ||
+                                (::scopedWakeLock.isInitialized &&
+                                    scopedWakeLock.isHeld)
+                        )
+                    } / ${yesNo(::wifiLock.isInitialized && wifiLock.isHeld)}"
+                )
             )
-            .addLine(detail)
-            .addLine("服务持续：${formatDuration(SystemClock.elapsedRealtime() - startedElapsed)} · PID ${Process.myPid()}")
+            .addLine(UiText.localize(this, detail))
+            .addLine(UiText.localize(this, "服务持续：${formatDuration(SystemClock.elapsedRealtime() - startedElapsed)} · PID ${Process.myPid()}"))
         return NotificationCompat.Builder(this, NotificationChannelManager.GUARDIAN_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_guardian)
             .setLargeIcon(notificationLargeIcon())
-            .setContentTitle("努昂诺塔 · ${state.name}")
-            .setContentText(detail)
+            .setContentTitle(UiText.choose(this, "努昂诺塔 · ${state.name}", "Luonnotar · ${state.name}"))
+            .setContentText(UiText.localize(this, detail))
             .setStyle(style)
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
             .addAction(0, pauseLabel, servicePendingIntent(2, pauseAction))
-            .addAction(0, "停止", servicePendingIntent(3, ACTION_STOP))
+            .addAction(0, UiText.choose(this, "停止", "Stop"), servicePendingIntent(3, ACTION_STOP))
             .addAction(
                 0,
-                "打开 VPN",
+                UiText.choose(this, "打开 VPN", "Open VPN"),
                 actionPendingIntent(4, ActionActivity.ACTION_OPEN_VPN_APP)
             )
-            .addAction(0, "VPN 设置", actionPendingIntent(5, ActionActivity.ACTION_OPEN_VPN_SETTINGS))
+            .addAction(0, UiText.choose(this, "VPN 设置", "VPN settings"), actionPendingIntent(5, ActionActivity.ACTION_OPEN_VPN_SETTINGS))
             .build()
     }
 
@@ -4770,9 +4778,9 @@ class FcmGuardianService : Service() {
     private fun showAlert(title: String, body: String) {
         val notification = NotificationCompat.Builder(this, NotificationChannelManager.ALERT_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_stat_guardian)
-            .setContentTitle(title)
-            .setContentText(body)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+            .setContentTitle(UiText.localize(this, title))
+            .setContentText(UiText.localize(this, body))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(UiText.localize(this, body)))
             .setAutoCancel(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setContentIntent(actionPendingIntent(20, ActionActivity.ACTION_OPEN_VPN_APP))

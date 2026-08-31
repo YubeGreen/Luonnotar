@@ -16,6 +16,7 @@ import com.yubegreen.luonnotar.ActionActivity
 import com.yubegreen.luonnotar.MainActivity
 import com.yubegreen.luonnotar.R
 import com.yubegreen.luonnotar.notification.NotificationChannelManager
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.util.LogManager
 
 internal object EmbeddedGuardianNotifier {
@@ -24,9 +25,9 @@ internal object EmbeddedGuardianNotifier {
     fun setupNotification(context: Context, title: String, text: String, waitingCode: Boolean) =
         NotificationCompat.Builder(context, NotificationChannelManager.PRIVILEGED_SETUP_CHANNEL_ID)
             .setSmallIcon(R.mipmap.ic_luonnotar)
-            .setContentTitle(title)
-            .setContentText(text)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(text))
+            .setContentTitle(UiText.localize(context, title))
+            .setContentText(UiText.localize(context, text))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(UiText.localize(context, text)))
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .setCategory(NotificationCompat.CATEGORY_SERVICE)
@@ -48,9 +49,17 @@ internal object EmbeddedGuardianNotifier {
             NotificationChannelManager.PRIVILEGED_REBOOT_CHANNEL_ID
         )
             .setSmallIcon(R.mipmap.ic_luonnotar)
-            .setContentTitle("努昂诺塔特权引擎尚未启动")
-            .setContentText(reason)
-            .setStyle(NotificationCompat.BigTextStyle().bigText("$reason。点击继续，开启无线调试后可在通知栏输入配对码。"))
+            .setContentTitle(UiText.choose(context, "努昂诺塔特权引擎尚未启动", "Luonnotar privileged engine has not started"))
+            .setContentText(UiText.localize(context, reason))
+            .setStyle(
+                NotificationCompat.BigTextStyle().bigText(
+                    UiText.choose(
+                        context,
+                        "$reason。点击继续，开启无线调试后可在通知栏输入配对码。",
+                        "${UiText.localize(context, reason)}. Tap to continue; after enabling Wireless debugging, you can enter the pairing code from the notification."
+                    )
+                )
+            )
             .setPriority(NotificationCompat.PRIORITY_MAX)
             .setCategory(NotificationCompat.CATEGORY_REMINDER)
             .setVisibility(NotificationCompat.VISIBILITY_PUBLIC)
@@ -63,7 +72,7 @@ internal object EmbeddedGuardianNotifier {
             .addAction(
                 NotificationCompat.Action(
                     0,
-                    "去启动",
+                    UiText.choose(context, "去启动", "Start"),
                     rebootStartPendingIntent(context, source, bootAction)
                 )
             )
@@ -138,11 +147,15 @@ internal object EmbeddedGuardianNotifier {
             NotificationChannelManager.PRIVILEGED_REBOOT_CHANNEL_ID
         )
             .setSmallIcon(R.mipmap.ic_luonnotar)
-            .setContentTitle("努昂诺塔重启横幅测试")
-            .setContentText("看到这条悬浮横幅，说明重启提醒配置成功")
+            .setContentTitle(UiText.choose(context, "努昂诺塔重启横幅测试", "Luonnotar reboot banner test"))
+            .setContentText(UiText.choose(context, "看到这条悬浮横幅，说明重启提醒配置成功", "If you can see this heads-up banner, the reboot reminder is configured correctly."))
             .setStyle(
                 NotificationCompat.BigTextStyle().bigText(
-                    "看到这条悬浮横幅，说明“特权引擎重启提醒”的悬浮通知已经开启。"
+                    UiText.choose(
+                        context,
+                        "看到这条悬浮横幅，说明“特权引擎重启提醒”的悬浮通知已经开启。",
+                        "Seeing this heads-up banner confirms that heads-up notifications are enabled for the privileged-engine reboot reminder."
+                    )
                 )
             )
             .setPriority(NotificationCompat.PRIORITY_MAX)
@@ -189,11 +202,11 @@ internal object EmbeddedGuardianNotifier {
 
     private fun pairingCodeAction(context: Context): NotificationCompat.Action {
         val input = RemoteInput.Builder(REMOTE_INPUT_KEY)
-            .setLabel("输入系统显示的 6 位配对码")
+            .setLabel(UiText.choose(context, "输入系统显示的 6 位配对码", "Enter the 6-digit code shown by the system"))
             .build()
         return NotificationCompat.Action.Builder(
             0,
-            "输入配对码",
+            UiText.choose(context, "输入配对码", "Enter pairing code"),
             servicePendingIntent(
                 context,
                 EmbeddedAdbService.ACTION_PAIR,
@@ -208,7 +221,7 @@ internal object EmbeddedGuardianNotifier {
 
     private fun retryAction(context: Context) = NotificationCompat.Action(
         0,
-        "重新检测",
+        UiText.choose(context, "重新检测", "Retry detection"),
         servicePendingIntent(
             context,
             EmbeddedAdbService.ACTION_RETRY,
@@ -218,7 +231,7 @@ internal object EmbeddedGuardianNotifier {
 
     private fun openWirelessAction(context: Context) = NotificationCompat.Action(
         0,
-        "无线调试",
+        UiText.choose(context, "无线调试", "Wireless debugging"),
         PendingIntent.getActivity(
             context,
             EmbeddedGuardianNotificationPolicy.WIRELESS_REQUEST_CODE,

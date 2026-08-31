@@ -6,6 +6,7 @@ import android.app.NotificationManager
 import android.content.Context
 import android.media.AudioAttributes
 import android.provider.Settings
+import com.yubegreen.luonnotar.ui.i18n.UiText
 
 object NotificationChannelManager {
     const val GUARDIAN_CHANNEL_ID = "luonnotar_guardian"
@@ -25,30 +26,42 @@ object NotificationChannelManager {
         manager.createNotificationChannel(
             NotificationChannel(
                 GUARDIAN_CHANNEL_ID,
-                GUARDIAN_CHANNEL_NAME,
+                UiText.choose(context, GUARDIAN_CHANNEL_NAME, "Luonnotar Guardian Service"),
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "显示 Proton VPN / Tailscale 依赖链、唤醒锁与保活证据"
+                description = UiText.choose(
+                    context,
+                    "显示 Proton VPN / Tailscale 依赖链、唤醒锁与保活证据",
+                    "Shows Proton VPN / Tailscale dependency, wake-lock, and keepalive evidence"
+                ).toString()
                 setShowBadge(false)
             }
         )
         manager.createNotificationChannel(
             NotificationChannel(
                 PRIVILEGED_SETUP_CHANNEL_ID,
-                "努昂诺塔特权引擎启动",
+                UiText.choose(context, "努昂诺塔特权引擎启动", "Luonnotar privileged engine startup"),
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "无线调试配对、启动进度与重启后恢复提醒"
+                description = UiText.choose(
+                    context,
+                    "无线调试配对、启动进度与重启后恢复提醒",
+                    "Wireless-debugging pairing, startup progress, and post-reboot recovery reminders"
+                ).toString()
                 setShowBadge(false)
             }
         )
         manager.createNotificationChannel(
             NotificationChannel(
                 PRIVILEGED_REBOOT_CHANNEL_ID,
-                "努昂诺塔特权引擎重启提醒",
+                UiText.choose(context, "努昂诺塔特权引擎重启提醒", "Luonnotar privileged-engine reboot reminder"),
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "手机重启后提醒重新启动 shell 特权进程"
+                description = UiText.choose(
+                    context,
+                    "手机重启后提醒重新启动 shell 特权进程",
+                    "Reminds you to restart the shell privileged process after reboot"
+                ).toString()
                 setShowBadge(false)
                 enableLights(true)
                 enableVibration(true)
@@ -66,10 +79,14 @@ object NotificationChannelManager {
         manager.createNotificationChannel(
             NotificationChannel(
                 ALERT_CHANNEL_ID,
-                "努昂诺塔异常提醒",
+                UiText.choose(context, "努昂诺塔异常提醒", "Luonnotar alerts"),
                 NotificationManager.IMPORTANCE_HIGH
             ).apply {
-                description = "VPN 丢失或 HTTPS 保活长期失败"
+                description = UiText.choose(
+                    context,
+                    "VPN 丢失或 HTTPS 保活长期失败",
+                    "VPN loss or prolonged HTTPS keepalive failures"
+                ).toString()
             }
         )
     }

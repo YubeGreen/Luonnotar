@@ -78,6 +78,9 @@ import com.yubegreen.luonnotar.service.GuardianRuntimeProfile
 import com.yubegreen.luonnotar.service.GuardianStatusClient
 import com.yubegreen.luonnotar.ui.motion.ElasticNestedScrollView
 import com.yubegreen.luonnotar.ui.motion.GuardianActionButton
+import com.yubegreen.luonnotar.ui.i18n.AppLanguage
+import com.yubegreen.luonnotar.ui.i18n.AppLanguageStore
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.ui.visual.BackgroundImageStore
 import com.yubegreen.luonnotar.ui.visual.AdaptiveLayout
 import com.yubegreen.luonnotar.ui.visual.AdaptiveMaxWidthLinearLayout
@@ -173,6 +176,7 @@ class MainActivity : AppCompatActivity() {
     private val refresh = object : Runnable {
         override fun run() {
             renderStatus()
+            if (::rootContainer.isInitialized) UiText.localizeTree(this@MainActivity, rootContainer)
             restorePendingScrollAfterStatusRows()
             mainHandler.postDelayed(this, 1_000)
         }
@@ -669,6 +673,7 @@ class MainActivity : AppCompatActivity() {
         }
         ViewCompat.requestApplyInsets(rootContainer)
         if (usesImageContrast()) applyImageBackgroundTextContrast(root)
+        UiText.localizeTree(this, rootContainer)
         rootContainer.post { visualBackground.invalidateSurfacePositions() }
         return rootContainer
     }
@@ -1620,10 +1625,16 @@ class MainActivity : AppCompatActivity() {
             .filterKeys { it !in CORE_STATUS_LABELS }
             .entries
             .joinToString("\n\n") { (label, detail) ->
-                val state = if (detail.good) "正常" else "需关注 / 尚未验证"
-                "$label\n$state · ${detail.value}"
+                val displayLabel = UiText.localize(this, label)
+                val state = if (detail.good) {
+                    UiText.choose(this, "正常", "Healthy")
+                } else {
+                    UiText.choose(this, "需关注 / 尚未验证", "Needs attention / unverified")
+                }
+                val displayValue = UiText.localize(this, detail.value)
+                "$displayLabel\n$state · $displayValue"
             }
-            .ifBlank { "暂无详细诊断数据" }
+            .ifBlank { UiText.choose(this, "暂无详细诊断数据", "No detailed diagnostic data yet") }
         GlassMessageDialog(
             context = this,
             preferences = VisualPreferences.load(this),
@@ -1637,12 +1648,14 @@ class MainActivity : AppCompatActivity() {
     private fun addStatus(label: String, value: String, good: Boolean) {
         statusDetails[label] = StatusDetail(value, good)
         if (label !in CORE_STATUS_LABELS) return
+        val displayLabel = UiText.localize(this, label).toString()
+        val displayValue = UiText.localize(this, value).toString()
         val palette = palette()
         statusRows[label]?.let { existing ->
             (existing.row as? LiquidGlassPanel)?.setGood(good)
             val targetColor = if (good) palette.good else palette.warning
-            if (existing.value.text.toString() == value || !animationsEnabled()) {
-                existing.value.text = value
+            if (existing.value.text.toString() == displayValue || !animationsEnabled()) {
+                existing.value.text = displayValue
                 existing.value.setTextColor(targetColor)
             } else {
                 existing.value.animate().cancel()
@@ -1652,7 +1665,7 @@ class MainActivity : AppCompatActivity() {
                     .setDuration(80L)
                     .setInterpolator(PathInterpolator(0.4f, 0f, 1f, 1f))
                     .withEndAction {
-                        existing.value.text = value
+                        existing.value.text = displayValue
                         existing.value.setTextColor(targetColor)
                         existing.value.translationY = dp(5).toFloat()
                         existing.value.animate()
@@ -1676,12 +1689,12 @@ class MainActivity : AppCompatActivity() {
             )
         }
         val labelView = TextView(this).apply {
-            text = label
+            text = displayLabel
             textSize = if (tabletLayout) 15.5f else 13f
             setTextColor(palette.secondary)
         }
         val valueView = TextView(this).apply {
-            text = value
+            text = displayValue
             textSize = if (tabletLayout) 19f else 16f
             setLineSpacing(0f, if (tabletLayout) 1.12f else 1f)
             setTextColor(if (good) palette.good else palette.warning)
@@ -1962,25 +1975,53 @@ class MainActivity : AppCompatActivity() {
         val vendor = "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL}"
         val steps = when {
             vendor.contains("vivo", true) || vendor.contains("iqoo", true) ->
-                "检测到 vivo/iQOO：\n• 默认使用自适应可靠性模式：守护开启且熄屏时持续持有 CPU WakeLock，亮屏立即释放；保留 120 秒网络静默，不长期占用 Wi‑Fi 高性能锁\n• 努昂诺塔和当前 VPN（Proton/Tailscale）：允许自启动、后台运行、电池不限制、最近任务锁定、常驻通知\n• i 管家不得自动清理\n• WhatsApp/GMS：允许后台数据与后台运行，GMS 保持 Doze 白名单\n• 实验室 L0–L4 仅用于逐项 A/B；强度升高后若冻结次数或推送延迟增加，应立即降级\n• 原生 Doze 关闭不代表 vivo PEM、QuickFrozen 或后台清理已关闭"
+                UiText.choose(
+                    this,
+                    "检测到 vivo/iQOO：\n• 默认使用自适应可靠性模式：守护开启且熄屏时持续持有 CPU WakeLock，亮屏立即释放；保留 120 秒网络静默，不长期占用 Wi‑Fi 高性能锁\n• 努昂诺塔和当前 VPN（Proton/Tailscale）：允许自启动、后台运行、电池不限制、最近任务锁定、常驻通知\n• i 管家不得自动清理\n• WhatsApp/GMS：允许后台数据与后台运行，GMS 保持 Doze 白名单\n• 实验室 L0–L4 仅用于逐项 A/B；强度升高后若冻结次数或推送延迟增加，应立即降级\n• 原生 Doze 关闭不代表 vivo PEM、QuickFrozen 或后台清理已关闭",
+                    "vivo/iQOO detected:\n• Adaptive reliability mode is used by default: while Guardian is active and the screen is off, the CPU WakeLock stays held and is released immediately when the screen turns on; the 120-second network quiet period remains, without holding a high-performance Wi‑Fi lock continuously\n• Luonnotar and the active VPN (Proton/Tailscale): allow autostart and background activity, set battery use to unrestricted, lock them in Recents, and keep persistent notifications enabled\n• iManager must not auto-clean them\n• WhatsApp/GMS: allow background data and background activity; keep GMS in the Doze allowlist\n• Lab L0–L4 is only for one-variable-at-a-time A/B testing; downgrade immediately if higher levels increase freezes or push latency\n• Disabling stock Doze does not mean vivo PEM, QuickFrozen, or vendor background cleanup is disabled"
+                )
             vendor.contains("xiaomi", true) || vendor.contains("redmi", true) ->
-                "检测到小米/红米：\n• 可在主界面手动开启“熄屏 CPU Guard”做单变量 A/B\n• 努昂诺塔、当前 VPN（Proton/Tailscale）、WhatsApp、GMS 分别开启自启动\n• 电池策略设为“无限制”，允许后台数据，最近任务锁定\n• HyperOS 更新后重新检查\n• millet_white 仅作高级实验，不由本应用修改"
+                UiText.choose(
+                    this,
+                    "检测到小米/红米：\n• 可在主界面手动开启“熄屏 CPU Guard”做单变量 A/B\n• 努昂诺塔、当前 VPN（Proton/Tailscale）、WhatsApp、GMS 分别开启自启动\n• 电池策略设为“无限制”，允许后台数据，最近任务锁定\n• HyperOS 更新后重新检查\n• millet_white 仅作高级实验，不由本应用修改",
+                    "Xiaomi/Redmi detected:\n• You can manually enable Screen-off CPU Guard on the main screen for one-variable A/B testing\n• Enable autostart separately for Luonnotar, the active VPN (Proton/Tailscale), WhatsApp, and GMS\n• Set battery policy to Unrestricted, allow background data, and lock them in Recents\n• Recheck these settings after HyperOS updates\n• millet_white is for advanced experiments only and is not modified by Luonnotar"
+                )
             vendor.contains("oppo", true) || vendor.contains("oneplus", true) || vendor.contains("realme", true) ->
-                "开启自启动、关联启动、后台运行、不优化，并锁定最近任务。"
+                UiText.choose(
+                    this,
+                    "开启自启动、关联启动、后台运行、不优化，并锁定最近任务。",
+                    "Enable autostart, linked launch, background activity, and no battery optimization, then lock the apps in Recents."
+                )
             vendor.contains("huawei", true) || vendor.contains("honor", true) ->
-                "应用启动管理改为手动，允许自启动、关联启动、后台活动。若无 GMS，本机不存在可用的 Google FCM 环境。"
+                UiText.choose(
+                    this,
+                    "应用启动管理改为手动，允许自启动、关联启动、后台活动。若无 GMS，本机不存在可用的 Google FCM 环境。",
+                    "Set App launch management to Manual and allow autostart, linked launch, and background activity. Without GMS, this device has no usable Google FCM environment."
+                )
             vendor.contains("samsung", true) ->
-                "不要加入深度睡眠应用；电池设为不受限制。"
-            else -> "请为努昂诺塔与当前 VPN（Proton/Tailscale）开启自启动、后台活动/高耗电、电池不限制，并锁定最近任务。"
+                UiText.choose(
+                    this,
+                    "不要加入深度睡眠应用；电池设为不受限制。",
+                    "Do not place the apps in Deep sleeping apps; set battery use to Unrestricted."
+                )
+            else -> UiText.choose(
+                this,
+                "请为努昂诺塔与当前 VPN（Proton/Tailscale）开启自启动、后台活动/高耗电、电池不限制，并锁定最近任务。",
+                "Enable autostart and background/high-power activity for Luonnotar and the active VPN (Proton/Tailscale), set battery use to Unrestricted, and lock them in Recents."
+            )
         }
+        val evidence = UiText.choose(
+            this,
+            "努昂诺塔会分别记录 Device Idle、PID 重建、CPU 挂起估算、定时器漂移、VPN/Wi-Fi 与开机广播证据。",
+            "Luonnotar records Device Idle, PID rebuilds, estimated CPU suspension, timer drift, VPN/Wi-Fi, and boot-broadcast evidence separately."
+        )
         GlassMessageDialog(
             context = this,
             preferences = VisualPreferences.load(this),
             visualBackground = visualBackground,
-            title = "厂商适配 · $vendor",
-            message = steps +
-                "\n\n努昂诺塔会分别记录 Device Idle、PID 重建、CPU 挂起估算、定时器漂移、VPN/Wi-Fi 与开机广播证据。",
-            primaryLabel = "尝试打开厂商设置",
+            title = UiText.choose(this, "厂商适配 · $vendor", "Vendor adaptation · $vendor"),
+            message = "$steps\n\n$evidence",
+            primaryLabel = UiText.choose(this, "尝试打开厂商设置", "Try opening vendor settings"),
             anchorView = anchorView,
             onPrimary = ::openOemSettingsCandidates
         ).show()
@@ -2007,33 +2048,54 @@ class MainActivity : AppCompatActivity() {
     private fun showAdvancedGuide(anchorView: View? = null) {
         val vendor = "${Build.MANUFACTURER} ${Build.BRAND} ${Build.MODEL}"
         val script = adbStabilityCommands()
-        val guide = """
-            当前机型：$vendor
+        val guide = UiText.choose(
+            this,
+            """
+                当前机型：$vendor
 
-            此 PowerShell 脚本只处理实际已安装的目标包，并在执行后打印 Device Idle、待机桶、AppOps、netpolicy 与 connectivity 核验结果。
+                此 PowerShell 脚本只处理实际已安装的目标包，并在执行后打印 Device Idle、待机桶、AppOps、netpolicy 与 connectivity 核验结果。
 
-            仍须在 vivo/iQOO 设置中人工确认：
-            • 自启动允许
-            • 关联启动允许
-            • 后台高耗电允许
-            • 电池策略不限制
-            • 后台网络允许
-            • 最近任务锁定
-            • GMS、WhatsApp、VPN 与努昂诺塔均加入厂商白名单
+                仍须在 vivo/iQOO 设置中人工确认：
+                • 自启动允许
+                • 关联启动允许
+                • 后台高耗电允许
+                • 电池策略不限制
+                • 后台网络允许
+                • 最近任务锁定
+                • GMS、WhatsApp、VPN 与努昂诺塔均加入厂商白名单
 
-            ADB 不能证明 GMS 私有 FCM socket 正常；HTTPS 204 只表示努昂诺塔自己的 VPN 路径活跃。
+                ADB 不能证明 GMS 私有 FCM socket 正常；HTTPS 204 只表示努昂诺塔自己的 VPN 路径活跃。
 
-            $script
-        """.trimIndent()
+                $script
+            """.trimIndent(),
+            """
+                Current device: $vendor
+
+                This PowerShell script only touches target packages that are actually installed. After execution it prints verification results for Device Idle, standby buckets, AppOps, netpolicy, and connectivity.
+
+                On vivo/iQOO, still confirm these manually in vendor settings:
+                • Autostart allowed
+                • Linked launch allowed
+                • High-power background activity allowed
+                • Battery policy set to Unrestricted
+                • Background network allowed
+                • App locked in Recents
+                • GMS, WhatsApp, the VPN, and Luonnotar all added to the vendor allowlist
+
+                ADB cannot prove that GMS's private FCM socket is healthy; HTTPS 204 only shows that Luonnotar's own VPN path is active.
+
+                $script
+            """.trimIndent()
+        )
         GlassMessageDialog(
             context = this,
             preferences = VisualPreferences.load(this),
             visualBackground = visualBackground,
-            title = "机型专用 ADB 建议",
+            title = UiText.choose(this, "机型专用 ADB 建议", "Device-specific ADB guidance"),
             message = guide,
             monospace = true,
-            primaryLabel = "复制安全脚本",
-            secondaryLabel = "A/B 诊断命令",
+            primaryLabel = UiText.choose(this, "复制安全脚本", "Copy safe script"),
+            secondaryLabel = UiText.choose(this, "A/B 诊断命令", "A/B diagnostic command"),
             anchorView = anchorView,
             onPrimary = { copyToClipboard("Luonnotar ADB PowerShell", script) },
             onSecondary = { showDozeAbDiagnosticCommand(anchorView) }
@@ -2109,11 +2171,14 @@ class MainActivity : AppCompatActivity() {
             context = this,
             preferences = VisualPreferences.load(this),
             visualBackground = visualBackground,
-            title = "仅用于 A/B 故障诊断",
-            message =
+            title = UiText.choose(this, "仅用于 A/B 故障诊断", "For A/B diagnostics only"),
+            message = UiText.choose(
+                this,
                 "此命令会全局禁用 Android Device Idle，仅用于比较熄屏推送延迟。努昂诺塔不会自动执行，也不建议长期作为默认配置。\n\n$command",
+                "This command globally disables Android Device Idle and is intended only for comparing screen-off push latency. Luonnotar never runs it automatically, and it is not recommended as a long-term default.\n\n$command"
+            ),
             monospace = true,
-            primaryLabel = "复制诊断命令",
+            primaryLabel = UiText.choose(this, "复制诊断命令", "Copy diagnostic command"),
             anchorView = anchorView,
             onPrimary = { copyToClipboard("Luonnotar Doze A/B", command) }
         ).show()
@@ -2139,7 +2204,7 @@ class MainActivity : AppCompatActivity() {
                     PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                 )
             },
-            onApply = ::applyVisualPreferences
+            onApply = ::applyVisualPreferencesAndLanguage
         ).show()
     }
 
@@ -2180,6 +2245,33 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    private fun applyVisualPreferencesAndLanguage(
+        theme: ThemePreference,
+        background: BackgroundPreference,
+        scale: BackgroundScale,
+        language: AppLanguage
+    ) {
+        val languageChanged = AppLanguageStore.current(this) != language
+        if (languageChanged) {
+            AppLanguageStore.set(this, language)
+        }
+        val currentVisual = VisualPreferences.load(this)
+        val effectiveScale =
+            if (background == BackgroundPreference.SHAO_OU) BackgroundScale.FILL_CROP else scale
+        val visualChanged = VisualPreferences(theme, background, effectiveScale) != currentVisual
+        if (visualChanged) {
+            applyVisualPreferences(theme, background, scale)
+        } else if (languageChanged) {
+            ThemeTransitionSnapshot.capture(rootContainer, scrollView.scrollY)
+            LogManager.event(
+                this,
+                "app_language_changed",
+                mapOf("language" to language.storedValue)
+            )
+            recreate()
+        }
+    }
+
     private fun applyVisualPreferences(
         theme: ThemePreference,
         background: BackgroundPreference,
@@ -2211,9 +2303,14 @@ class MainActivity : AppCompatActivity() {
     private fun refreshVisualSummary() {
         if (!::visualSummary.isInitialized) return
         val preferences = VisualPreferences.load(this)
-        visualSummary.text =
+        visualSummary.text = if (AppLanguageStore.isEnglish(this)) {
+            "Theme: ${UiText.localize(this, themeLabel(preferences.theme))}    " +
+                "Background: ${UiText.localize(this, backgroundLabel(preferences))}\n" +
+                "Static backgrounds and theme changes affect only the UI process; the guardian service is unaffected."
+        } else {
             "主题：${themeLabel(preferences.theme)}    背景：${backgroundLabel(preferences)}\n" +
                 "静态背景与主题切换只在界面进程生效，守护服务不受影响"
+        }
     }
 
     private fun installThemeTransitionOverlay() {
@@ -3677,7 +3774,7 @@ class MainActivity : AppCompatActivity() {
         transientNotice = notice
         notice.post {
             notice.refreshBackdrop()
-            notice.announceForAccessibility(message)
+            notice.announceForAccessibility(UiText.localize(this, message))
             notice.animate()
                 .alpha(1f)
                 .translationY(0f)
@@ -3705,7 +3802,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun actionButton(label: String, action: (View) -> Unit) = GuardianActionButton(this).apply {
-        text = label
+        text = UiText.localize(this@MainActivity, label)
         isAllCaps = false
         textSize = if (tabletLayout) 18f else 15f
         setTextColor(palette().foreground)
@@ -3741,11 +3838,11 @@ class MainActivity : AppCompatActivity() {
                 bottomMargin = dp(8)
             }
             isSelected = true
-            contentDescription = "开启极限保活，核心操作"
+            contentDescription = UiText.localize(this@MainActivity, "开启极限保活，核心操作")
         }
 
     private fun sectionTitle(label: String) = TextView(this).apply {
-        text = label
+        text = UiText.localize(this@MainActivity, label)
         textSize = if (tabletLayout) 23f else 18f
         setTextColor(palette().foreground)
         typeface = android.graphics.Typeface.DEFAULT_BOLD

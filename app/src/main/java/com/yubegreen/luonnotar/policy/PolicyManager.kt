@@ -2,6 +2,8 @@ package com.yubegreen.luonnotar.policy
 
 import android.content.Context
 import com.yubegreen.luonnotar.R
+import com.yubegreen.luonnotar.ui.i18n.AppLanguageStore
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import java.security.MessageDigest
 import java.time.Instant
 
@@ -13,21 +15,34 @@ object PolicyManager {
     private const val KEY_TIME = "accepted_at"
 
     fun text(context: Context): String =
-        context.resources.openRawResource(R.raw.luonnotar_policy_zh)
+        readPolicy(
+            context,
+            if (AppLanguageStore.isEnglish(context)) {
+                R.raw.luonnotar_policy_en
+            } else {
+                R.raw.luonnotar_policy_zh
+            }
+        )
+
+    private fun canonicalText(context: Context): String =
+        readPolicy(context, R.raw.luonnotar_policy_zh)
+
+    private fun readPolicy(context: Context, rawResource: Int): String =
+        context.resources.openRawResource(rawResource)
             .bufferedReader(Charsets.UTF_8)
             .use { it.readText().trim() }
 
     fun isAccepted(context: Context): Boolean {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
         return prefs.getString(KEY_VERSION, null) == VERSION &&
-            prefs.getString(KEY_HASH, null) == hash(text(context))
+            prefs.getString(KEY_HASH, null) == hash(canonicalText(context))
     }
 
     fun accept(context: Context) {
         context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
             .edit()
             .putString(KEY_VERSION, VERSION)
-            .putString(KEY_HASH, hash(text(context)))
+            .putString(KEY_HASH, hash(canonicalText(context)))
             .putString(KEY_TIME, Instant.now().toString())
             .apply()
     }
@@ -43,8 +58,13 @@ object PolicyManager {
 
     fun audit(context: Context): String {
         val prefs = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE)
-        return "政策 ${prefs.getString(KEY_VERSION, "未同意")} · " +
-            (prefs.getString(KEY_TIME, null) ?: "尚无确认记录")
+        val version = prefs.getString(KEY_VERSION, null)
+        val acceptedAt = prefs.getString(KEY_TIME, null)
+        return UiText.choose(
+            context,
+            "政策 ${version ?: "未同意"} · ${acceptedAt ?: "尚无确认记录"}",
+            "Policy ${version ?: "not accepted"} · ${acceptedAt ?: "no acceptance record"}"
+        ).toString()
     }
 
     private fun hash(value: String): String =

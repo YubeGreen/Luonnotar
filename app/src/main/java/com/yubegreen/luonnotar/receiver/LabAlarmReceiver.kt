@@ -18,6 +18,7 @@ import com.yubegreen.luonnotar.notification.RecoveryNotificationAvailability
 import com.yubegreen.luonnotar.service.FcmGuardianService
 import com.yubegreen.luonnotar.service.GuardianLiveness
 import com.yubegreen.luonnotar.service.GuardianStatusProvider
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.util.LogManager
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
 
@@ -310,15 +311,15 @@ class LabAlarmReceiver : BroadcastReceiver() {
             NotificationChannelManager.ALERT_CHANNEL_ID
         )
             .setSmallIcon(R.drawable.ic_stat_guardian)
-            .setContentTitle("努昂诺塔需要手动恢复")
-            .setContentText(detail)
-            .setStyle(NotificationCompat.BigTextStyle().bigText(detail))
+            .setContentTitle(UiText.choose(context, "努昂诺塔需要手动恢复", "Luonnotar needs manual recovery"))
+            .setContentText(UiText.localize(context, detail))
+            .setStyle(NotificationCompat.BigTextStyle().bigText(UiText.localize(context, detail)))
             .setContentIntent(userRecovery)
             .setAutoCancel(true)
             .setOnlyAlertOnce(true)
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_ERROR)
-            .addAction(0, "立即恢复", userRecovery)
+            .addAction(0, UiText.choose(context, "立即恢复", "Recover now"), userRecovery)
             .build()
         context.getSystemService(NotificationManager::class.java)
             .notify(NotificationChannelManager.RECOVERY_NOTIFICATION_ID, notification)

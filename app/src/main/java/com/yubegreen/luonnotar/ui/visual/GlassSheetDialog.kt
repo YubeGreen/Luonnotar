@@ -21,6 +21,7 @@ import android.widget.FrameLayout
 import android.widget.LinearLayout
 import android.widget.TextView
 import com.yubegreen.luonnotar.ui.motion.GuardianActionButton
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import kotlin.math.abs
 
 open class GlassSheetDialog(
@@ -77,7 +78,7 @@ open class GlassSheetDialog(
         val dragHandle = FrameLayout(context).apply {
             isFocusable = true
             isClickable = true
-            contentDescription = "下拉关闭弹窗"
+            contentDescription = UiText.localize(context, "下拉关闭弹窗")
             setOnTouchListener(::handleDragTouch)
             addView(
                 dragIndicator,
@@ -101,7 +102,7 @@ open class GlassSheetDialog(
     }
 
     protected fun title(text: CharSequence) = TextView(context).apply {
-        this.text = text
+        this.text = UiText.localize(context, text)
         textSize = if (tablet) 25f else 20f
         setTextColor(palette.foreground)
         typeface = android.graphics.Typeface.DEFAULT_BOLD
@@ -109,7 +110,7 @@ open class GlassSheetDialog(
     }
 
     protected fun body(text: CharSequence, monospace: Boolean = false) = TextView(context).apply {
-        this.text = text
+        this.text = UiText.localize(context, text)
         textSize = if (tablet) 17f else 14f
         setTextColor(palette.secondary)
         setLineSpacing(0f, if (tablet) 1.24f else 1.18f)
@@ -119,7 +120,7 @@ open class GlassSheetDialog(
     }
 
     protected fun caption(text: CharSequence) = TextView(context).apply {
-        this.text = text
+        this.text = UiText.localize(context, text)
         textSize = if (tablet) 15.5f else 13f
         setTextColor(palette.secondary)
         applyImageShadowIfNeeded()
@@ -130,7 +131,7 @@ open class GlassSheetDialog(
         emphasized: Boolean = false,
         danger: Boolean = false
     ) = GuardianActionButton(context).apply {
-        text = label
+        text = UiText.localize(context, label)
         isAllCaps = false
         textSize = if (tablet) 16.5f else 13f
         minHeight = dp(if (tablet) 56 else 48)

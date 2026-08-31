@@ -9,6 +9,7 @@ import com.yubegreen.luonnotar.service.GuardianExperimentSettings
 import com.yubegreen.luonnotar.service.GuardianProfilePolicy
 import com.yubegreen.luonnotar.service.GuardianRuntimeProfile
 import com.yubegreen.luonnotar.ui.motion.GuardianActionButton
+import com.yubegreen.luonnotar.ui.i18n.UiText
 import com.yubegreen.luonnotar.util.LuonnotarPreferences
 
 class GuardianExperimentDialog(
@@ -235,9 +236,17 @@ class GuardianExperimentDialog(
                                 GuardianRuntimeProfile.ADB_PASSIVE ||
                                 key !in passiveDisabledKeys
                             )
-                button.text = "$label：${if (enabled) "开" else "关"}"
-                button.contentDescription =
-                    "$label，当前${if (enabled) "开启" else "关闭"}"
+                val displayLabel = UiText.localize(context, label)
+                button.text = UiText.choose(
+                    context,
+                    "$displayLabel：${if (enabled) "开" else "关"}",
+                    "$displayLabel: ${if (enabled) "On" else "Off"}"
+                )
+                button.contentDescription = UiText.choose(
+                    context,
+                    "$displayLabel，当前${if (enabled) "开启" else "关闭"}",
+                    "$displayLabel, currently ${if (enabled) "on" else "off"}"
+                )
                 style(button, enabled)
             }
         }
